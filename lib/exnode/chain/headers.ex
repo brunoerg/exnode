@@ -4,7 +4,14 @@ defmodule Exnode.Chain.Headers do
   tables and persists every accepted header to the RocksDB `headers` column
   family, so a restart does not resync.
 
-  Readers call `index/1` once and then read the ETS tables directly.
+  Readers get the index with `index/1` and then read the ETS tables
+  directly. For a registered server, `index/1` and `best_header/1` do not
+  call this process: the index handle is published in `:persistent_term`
+  at init (as `Chain.State.view/1`), because this process can be blocked
+  for seconds (its KV writes queue behind a chain-state commit) and a 5 s
+  call timeout there used to crash callers such as `P2P.BlockDownload`.
+  The handle never changes while this process lives; a restart publishes
+  a new one before its dependents restart (`Exnode.Node` is `rest_for_one`).
 
   Persisted value: `<<height::32, status::8, raw_header::80-bytes>>`, keyed by hash.
   """
@@ -18,10 +25,22 @@ defmodule Exnode.Chain.Headers do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
-  @doc "Current index (ETS handles plus best header). Safe to read from any process."
+  @doc """
+  The index (ETS handles; `HeaderIndex.best/1` reads the best header). Safe
+  to read from any process. Without a call when `server` is a registered
+  name; a pid (tests) falls back to a call.
+  """
+  def index(server) when is_atom(server) do
+    case :persistent_term.get({__MODULE__, server}, nil) do
+      nil -> GenServer.call(server, :index)
+      idx -> idx
+    end
+  end
+
   def index(server), do: GenServer.call(server, :index)
 
-  def best_header(server), do: GenServer.call(server, :best)
+  @doc "The best header entry (Core `m_best_header`), without a call for a registered server."
+  def best_header(server), do: Index.best(index(server))
 
   def params(server), do: GenServer.call(server, :params)
 
@@ -51,12 +70,13 @@ defmodule Exnode.Chain.Headers do
 
     idx = Index.insert(Index.new(), Index.make_entry(p.genesis.header, nil))
     idx = if kv, do: load(idx, kv), else: idx
+    # Published only once loaded, so readers never see a half-loaded tree.
+    if name = opts[:name], do: :persistent_term.put({__MODULE__, name}, idx)
     {:ok, %{params: p, idx: idx, kv: kv, now: Keyword.get(opts, :now)}}
   end
 
   @impl true
   def handle_call(:index, _from, st), do: {:reply, st.idx, st}
-  def handle_call(:best, _from, st), do: {:reply, st.idx.best, st}
   def handle_call(:params, _from, st), do: {:reply, st.params, st}
 
   def handle_call({:invalidate, hash, fallback_hash}, _from, st) do

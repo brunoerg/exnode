@@ -794,7 +794,7 @@ defmodule Exnode.P2P.Peer do
       end)
 
     if Enum.any?(items, &(&1.type == :block and HeaderIndex.lookup(idx, &1.hash) == nil)),
-      do: {:ok, maybe_send_getheaders(st, HeaderIndex.locator(idx, idx.best))},
+      do: {:ok, maybe_send_getheaders(st, HeaderIndex.locator(idx, HeaderIndex.best(idx)))},
       else: {:ok, st}
   end
 
@@ -889,7 +889,7 @@ defmodule Exnode.P2P.Peer do
 
     if handshake_done?(st) and can_serve do
       idx = Headers.index(st.node.headers)
-      best = idx.best
+      best = HeaderIndex.best(idx)
       preferred = not st.inbound
       recent = best.time > t - 24 * 3600
 
@@ -992,7 +992,7 @@ defmodule Exnode.P2P.Peer do
     case HeaderIndex.lookup(idx, hd(headers).prev_hash) do
       nil ->
         # Core: HandleUnconnectingHeaders
-        {:ok, maybe_send_getheaders(st, HeaderIndex.locator(idx, idx.best))}
+        {:ok, maybe_send_getheaders(st, HeaderIndex.locator(idx, HeaderIndex.best(idx)))}
 
       chain_start ->
         st = %{st | last_getheaders_at: nil}
@@ -1000,7 +1000,8 @@ defmodule Exnode.P2P.Peer do
 
         already_validated =
           already_validated or
-            (last_received != nil and HeaderIndex.ancestor_of?(idx, last_received, idx.best))
+            (last_received != nil and
+               HeaderIndex.ancestor_of?(idx, last_received, HeaderIndex.best(idx)))
 
         case not already_validated &&
                try_low_work_headers_sync(st, idx, chain_start, headers, count) do
@@ -1278,7 +1279,7 @@ defmodule Exnode.P2P.Peer do
         {:ok,
          if(initial_block_download?(st),
            do: st,
-           else: maybe_send_getheaders(st, HeaderIndex.locator(idx, idx.best))
+           else: maybe_send_getheaders(st, HeaderIndex.locator(idx, HeaderIndex.best(idx)))
          )}
 
       # Core: "Ignoring low-work compact block" (net_processing.cpp), before

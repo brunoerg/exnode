@@ -29,7 +29,7 @@ defmodule Exnode.Validation.AssumeValid do
 
   def decide(av_hash, %Index{} = idx, %Index.Entry{} = entry, %ChainParams{} = p) do
     av = Index.lookup(idx, av_hash)
-    best = idx.best
+    best = Index.best(idx)
 
     cond do
       av == nil ->

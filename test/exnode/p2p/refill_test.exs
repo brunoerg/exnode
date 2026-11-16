@@ -201,7 +201,7 @@ defmodule Exnode.P2P.RefillTest do
         do: BlockDownload.received(t.bd, a, h, 1) && BlockDownload.checked(t.bd, a, h, false)
 
     {idx2, fork} = extend(idx, Enum.at(entries, 30), 100, 7)
-    assert idx2.best.hash == List.last(fork).hash
+    assert HeaderIndex.best(idx2).hash == List.last(fork).hash
     picks = BlockDownload.request(t.bd, a, List.last(fork).hash)
     fork_heights = Map.new(fork, &{&1.hash, &1.height})
     assert Enum.map(picks, &fork_heights[&1]) == Enum.to_list(31..46)
@@ -312,7 +312,7 @@ defmodule Exnode.P2P.RefillTest do
         k = rem(i, 2)
         other = tips[1 - k]
         {idx, ext} = extend(idx, tips[k], other.height - tips[k].height + 1, 1_000 + i)
-        assert idx.best.hash == List.last(ext).hash
+        assert HeaderIndex.best(idx).hash == List.last(ext).hash
         {idx, Map.put(tips, k, List.last(ext))}
       end)
 

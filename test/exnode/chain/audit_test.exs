@@ -216,13 +216,13 @@ defmodule Exnode.Chain.AuditTest do
     n = start(dir)
     chain = fork(List.last(n.bs), 151, 5, 2)
     {:ok, _} = Headers.process_headers(n.hs, Enum.map(chain, & &1.header))
-    assert Headers.index(n.hs).best.hash == List.last(chain).header.hash
+    assert HeaderIndex.best(Headers.index(n.hs)).hash == List.last(chain).header.hash
 
     for b <- Enum.take(chain, 2), do: State.submit_block(n.cs, b, requested: true)
     assert State.tip(n.cs).height == 151
     assert Enum.map(chain, &status(n, &1)) == [:valid_header, :failed, :failed, :failed, :failed]
     # The best header is back on the active tip (nothing else has more work).
-    assert Headers.index(n.hs).best.hash == hd(chain).header.hash
+    assert HeaderIndex.best(Headers.index(n.hs)).hash == hd(chain).header.hash
 
     # Persisted: a fresh index from the same store agrees.
     {:ok, hs2} = Headers.start_link(params: @p, kv: n.kv)
@@ -246,7 +246,7 @@ defmodule Exnode.Chain.AuditTest do
     b = fork(Enum.at(n.bs, 147), 149, 5)
     {:ok, _} = Headers.process_headers(n.hs, Enum.map(a, & &1.header))
     {:ok, _} = Headers.process_headers(n.hs, Enum.map(b, & &1.header))
-    assert Headers.index(n.hs).best.hash == List.last(a).header.hash
+    assert HeaderIndex.best(Headers.index(n.hs)).hash == List.last(a).header.hash
 
     assert {:error, {:consensus, "bad-cb-amount"}} =
              State.submit_block(n.cs, hd(a), requested: true)
@@ -254,14 +254,16 @@ defmodule Exnode.Chain.AuditTest do
     assert Enum.all?(a, &(status(n, &1) == :failed))
     # Core RecalculateBestHeader: B (153), not the active tip (150).
     idx = Headers.index(n.hs)
-    assert idx.best.hash == List.last(b).header.hash
+    assert HeaderIndex.best(idx).hash == List.last(b).header.hash
     assert HeaderIndex.hash_at(idx, 153) == List.last(b).header.hash
     assert HeaderIndex.hash_at(idx, 154) == nil
 
     # Restart: the failed A is still the most-work chain, but never the best header.
     {:ok, hs2} = Headers.start_link(params: @p, kv: n.kv)
     idx2 = Headers.index(hs2)
-    assert idx2.best.hash == List.last(b).header.hash
-    assert HeaderIndex.lookup(idx2, List.last(a).header.hash).chain_work > idx2.best.chain_work
+    assert HeaderIndex.best(idx2).hash == List.last(b).header.hash
+
+    assert HeaderIndex.lookup(idx2, List.last(a).header.hash).chain_work >
+             HeaderIndex.best(idx2).chain_work
   end
 end

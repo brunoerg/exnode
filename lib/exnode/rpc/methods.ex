@@ -159,7 +159,7 @@ defmodule Exnode.RPC.Methods do
        [
          {"chain", chain_name(p.network)},
          {"blocks", t.height},
-         {"headers", idx.best.height},
+         {"headers", HeaderIndex.best(idx).height},
          {"bestblockhash", hash_hex(t.hash)},
          {"bits", bits_hex(t.bits)},
          {"target", target_hex(t.bits, p)},
@@ -187,7 +187,7 @@ defmodule Exnode.RPC.Methods do
       n when is_integer(n) and n > 0 ->
         {data_time, data_count, rate} = ctx.params.chain_tx_data
         now = now(ctx)
-        best = idx.best
+        best = HeaderIndex.best(idx)
 
         # Near the tip, a height-based time (Core: so the value is quantized
         # close to 1.0, and less dependent on miners' timestamps).

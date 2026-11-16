@@ -82,7 +82,7 @@ defmodule Exnode.Chain.HeadersTest do
 
     test "time-too-old: timestamp equal to median-time-past", %{hs: hs, tip: tip} do
       idx = Headers.index(hs)
-      mtp = HeaderIndex.median_time_past(idx, idx.best)
+      mtp = HeaderIndex.median_time_past(idx, HeaderIndex.best(idx))
 
       assert {:error, {:invalid_header, "time-too-old"}, nil} =
                Headers.process_headers(hs, [BB.next_header(tip, time: mtp)])
@@ -161,13 +161,15 @@ defmodule Exnode.Chain.HeadersTest do
     f3 = BB.next_header(f2)
     assert {:ok, %{height: 151}} = Headers.process_headers(hs, [f3])
     idx = Headers.index(hs)
-    assert idx.best.hash == f3.hash
+    assert HeaderIndex.best(idx).hash == f3.hash
     assert HeaderIndex.hash_at(idx, 149) == f1.hash
     assert HeaderIndex.hash_at(idx, 148) == fork_base.hash
     # The old tip stays in the tree as a side chain; ancestor walks still work.
     old = HeaderIndex.lookup(idx, tip.hash)
     assert HeaderIndex.ancestor(idx, old, 148).hash == fork_base.hash
-    assert HeaderIndex.last_common_ancestor(idx, old, idx.best).hash == fork_base.hash
+
+    assert HeaderIndex.last_common_ancestor(idx, old, HeaderIndex.best(idx)).hash ==
+             fork_base.hash
   end
 
   @tag :tmp_dir
