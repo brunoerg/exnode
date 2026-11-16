@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned Bitcoin Core (see README "Building").
+  CORE_TAG: v32.1
+  CORE_COMMIT: f0de87f040621468b956f01f526a43a010310501
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+      - run: mix format --check-formatted
+
+  test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libboost-dev libevent-dev liblz4-dev
+
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: .tool-versions
+          version-type: strict
+
+      # Core's kernel library (for the NIFs) and bitcoind (for :interop tests).
+      - name: Cache Bitcoin Core build
+        id: core-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/bitcoin
+          key: core-${{ runner.os }}-ubuntu-24.04-${{ env.CORE_COMMIT }}-v1
+
+      - name: Build Bitcoin Core
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$CORE_TAG" https://github.com/bitcoin/bitcoin vendor/bitcoin
+          test "$(git -C vendor/bitcoin rev-parse HEAD)" = "$CORE_COMMIT"
+          cd vendor/bitcoin
+          cmake -B build-kernel -DBUILD_KERNEL_LIB=ON -DBUILD_SHARED_LIBS=ON \
+                -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TESTS=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF
+          cmake --build build-kernel -j"$(nproc)"
+          cmake -B build -DBUILD_KERNEL_LIB=ON -DBUILD_TESTS=OFF -DENABLE_WALLET=OFF -DENABLE_IPC=OFF
+          cmake --build build -j"$(nproc)"
+
+      - name: Cache Mix deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ hashFiles('.tool-versions') }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-${{ hashFiles('.tool-versions') }}-
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix test --warnings-as-errors
