@@ -18,7 +18,8 @@ defmodule Exnode.Chain.State do
 
   Batching (Core `FlushStateToDisk` role): connected blocks stay in the
   archive's in-memory batch and are committed together (`commit/1`) when the
-  batch reaches `@batch_blocks` blocks or `@batch_bytes`, when the oldest is
+  batch reaches `@batch_blocks` blocks or `@batch_bytes` (options
+  `:batch_blocks` / `:batch_bytes`), when the oldest is
   `@batch_ms` old (`@batch_ms_behind` while the tip is at least
   `@batch_blocks` behind the best header), when the tip reaches the best
   header, before any
@@ -188,6 +189,9 @@ defmodule Exnode.Chain.State do
 
   @doc "Blocks prefetched ahead when the caller does not set `prefetch_depth`."
   def default_prefetch_depth, do: @prefetch_depth
+
+  @doc "Default commit batch limits: `{blocks, bytes}`."
+  def default_batch_limits, do: {@batch_blocks, @batch_bytes}
 
   @doc """
   The node's chain-state minimum heap (words, 16 MiB). The activation plan
@@ -391,6 +395,7 @@ defmodule Exnode.Chain.State do
       # Connected, not yet committed: [{hash, raw}], newest first.
       uncommitted: [],
       batch_blocks: Keyword.get(opts, :batch_blocks, @batch_blocks),
+      batch_bytes: Keyword.get(opts, :batch_bytes, @batch_bytes),
       batch_ms: Keyword.get(opts, :batch_ms, @batch_ms),
       batch_ms_behind: Keyword.get(opts, :batch_ms_behind, @batch_ms_behind),
       # Blocks prepared ahead by Chain.Prefetch (0 disables it).
@@ -621,7 +626,7 @@ defmodule Exnode.Chain.State do
     max_age =
       if best.height - tip.height >= st.batch_blocks, do: st.batch_ms_behind, else: st.batch_ms
 
-    if n >= st.batch_blocks or bytes >= @batch_bytes or age >= max_age or caught_up or
+    if n >= st.batch_blocks or bytes >= st.batch_bytes or age >= max_age or caught_up or
          st.halted != false,
        do: commit(st),
        else: st
@@ -2672,7 +2677,7 @@ defmodule Exnode.Chain.State do
     }
 
     {n, bytes} = Archive.batch_size(a)
-    if n >= st.batch_blocks or bytes >= @batch_bytes, do: commit(st), else: st
+    if n >= st.batch_blocks or bytes >= st.batch_bytes, do: commit(st), else: st
   end
 
   defp fail_block(st, entry, block, {:error, {result_kind, reason} = r}) do

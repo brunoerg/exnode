@@ -20,7 +20,9 @@ defmodule Mix.Tasks.Exnode.Node do
   Storage options: `--datadir-cold <dir>` (inputs and witness segments, which
   are rarely read), `--prune-witness` (keep witness data for the last 288
   blocks only), `--dbcache <MiB>` (coin cache budget, default 450 as Core's
-  `DEFAULT_KERNEL_CACHE`).
+  `DEFAULT_KERNEL_CACHE`), `--batch-blocks <n>` / `--batch-mib <MiB>` (commit
+  batch limits, default 128 blocks / 64 MiB; larger values cut sync overhead
+  during IBD at the cost of memory and crash replay).
 
   `--status-file` also writes the latest status as JSON (best header height
   and hash, peer count), for scripts that compare against bitcoind.
@@ -47,6 +49,8 @@ defmodule Mix.Tasks.Exnode.Node do
     dbcache: :integer,
     commit_at_tip: :boolean,
     prefetch: :integer,
+    batch_blocks: :integer,
+    batch_mib: :integer,
     rpcport: :integer,
     rpcuser: :string,
     rpcpassword: :string,
@@ -92,6 +96,16 @@ defmodule Mix.Tasks.Exnode.Node do
         cache_bytes: Keyword.get(opts, :dbcache, 450) * 1024 * 1024,
         # Test only: --no-commit-at-tip keeps blocks batched at the tip (crash tests).
         commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
+        # Commit batch limits: a batch is committed (segment sync + one synced
+        # KV write) once it reaches either. Larger batches amortize the syncs
+        # during IBD at the cost of memory and more blocks to replay after a crash.
+        batch_blocks:
+          Keyword.get(opts, :batch_blocks, elem(Exnode.Chain.State.default_batch_limits(), 0)),
+        batch_bytes:
+          if(opts[:batch_mib],
+            do: opts[:batch_mib] * 1024 * 1024,
+            else: elem(Exnode.Chain.State.default_batch_limits(), 1)
+          ),
         # Blocks the prefetch stage prepares ahead (--prefetch 0 turns it off).
         prefetch_depth: Keyword.get(opts, :prefetch, Exnode.Chain.State.default_prefetch_depth()),
         rpc_port:
