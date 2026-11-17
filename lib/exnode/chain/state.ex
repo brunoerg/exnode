@@ -765,13 +765,15 @@ defmodule Exnode.Chain.State do
   end
 
   @impl true
-  def handle_call(:tip, _from, st), do: {:reply, Archive.tip(st.a), st}
-  def handle_call({:set_monitor, m}, _from, st), do: {:reply, :ok, %{st | monitor: m}}
+  def handle_call(msg, from, st), do: timed_cb(msg, fn -> do_handle_call(msg, from, st) end)
 
-  def handle_call(:script_stats, _from, st), do: {:reply, st.script_stats, st}
-  def handle_call(:prefetch_stats, _from, st), do: {:reply, st.pf_stats, st}
+  defp do_handle_call(:tip, _from, st), do: {:reply, Archive.tip(st.a), st}
+  defp do_handle_call({:set_monitor, m}, _from, st), do: {:reply, :ok, %{st | monitor: m}}
 
-  def handle_call(:work_stats, _from, st) do
+  defp do_handle_call(:script_stats, _from, st), do: {:reply, st.script_stats, st}
+  defp do_handle_call(:prefetch_stats, _from, st), do: {:reply, st.pf_stats, st}
+
+  defp do_handle_call(:work_stats, _from, st) do
     st = take_cs_work(st)
 
     {:reply,
@@ -783,7 +785,7 @@ defmodule Exnode.Chain.State do
      }, st}
   end
 
-  def handle_call(:debug, _from, st) do
+  defp do_handle_call(:debug, _from, st) do
     idx = Headers.index(st.headers)
     held = for h <- st.blocks, e = HeaderIndex.lookup(idx, h), do: {e.height, e.status}
 
@@ -799,7 +801,7 @@ defmodule Exnode.Chain.State do
   # each part of the state (`:erts_debug.size/1`, sharing within a part
   # counted once; parts may share), with the process's own heap figures.
   # Walks the whole state: never on a production path.
-  def handle_call(:debug_live, _from, st) do
+  defp do_handle_call(:debug_live, _from, st) do
     w = &:erts_debug.size/1
     a = st.a
     items = if st.plan, do: :queue.to_list(st.plan.items), else: []
@@ -833,24 +835,24 @@ defmodule Exnode.Chain.State do
     {:reply, Map.merge(parts, Map.new(info)), st}
   end
 
-  def handle_call({:have?, hash}, _from, st), do: {:reply, have?(st, hash), st}
+  defp do_handle_call({:have?, hash}, _from, st), do: {:reply, have?(st, hash), st}
 
-  def handle_call({:have_many, hashes}, _from, st),
+  defp do_handle_call({:have_many, hashes}, _from, st),
     do:
       {:reply,
        MapSet.new(Enum.filter(hashes, &(have?(st, &1) or MapSet.member?(st.poisoned, &1)))), st}
 
-  def handle_call({:with_archive, fun}, _from, st) do
+  defp do_handle_call({:with_archive, fun}, _from, st) do
     st = commit(st)
     {:reply, fun.(st.a), st}
   end
 
-  def handle_call({:peek_archive, fun}, _from, st), do: {:reply, fun.(st.a), st}
+  defp do_handle_call({:peek_archive, fun}, _from, st), do: {:reply, fun.(st.a), st}
 
-  def handle_call({:mempool_view, ops}, _from, st),
+  defp do_handle_call({:mempool_view, ops}, _from, st),
     do: {:reply, {Archive.tip(st.a), Archive.resolve_many(st.a, ops)}, st}
 
-  def handle_call({:precheck_block, header, requested}, _from, st) do
+  defp do_handle_call({:precheck_block, header, requested}, _from, st) do
     reply =
       case submission_entry(st, header, requested) do
         {:ok, _, _} -> :check
@@ -860,9 +862,9 @@ defmodule Exnode.Chain.State do
     {:reply, reply, st}
   end
 
-  def handle_call(:commit, _from, st), do: {:reply, :ok, st |> commit() |> flush_round()}
+  defp do_handle_call(:commit, _from, st), do: {:reply, :ok, st |> commit() |> flush_round()}
 
-  def handle_call({:submit, %Block{} = b, opts}, from, st) do
+  defp do_handle_call({:submit, %Block{} = b, opts}, from, st) do
     t0 = System.monotonic_time(:microsecond)
     {reply, st} = do_submit(st, b, opts)
 
@@ -912,20 +914,20 @@ defmodule Exnode.Chain.State do
     if reply == :connect, do: {:noreply, st}, else: {:reply, reply, st}
   end
 
-  def handle_call(:halted, _from, st), do: {:reply, st.halted, st}
+  defp do_handle_call(:halted, _from, st), do: {:reply, st.halted, st}
 
-  def handle_call(:clear_halt, _from, %{halted: false} = st), do: {:reply, :not_halted, st}
+  defp do_handle_call(:clear_halt, _from, %{halted: false} = st), do: {:reply, :not_halted, st}
 
-  def handle_call(:clear_halt, _from, st) do
+  defp do_handle_call(:clear_halt, _from, st) do
     :ok = Exnode.Store.KV.write(st.kv, [{:delete, :meta, @halt_key}], sync: true)
     :ets.insert(st.view, {:halted, false})
     Logger.warning("block connection halt cleared (was #{inspect(st.halted)})")
     {:reply, st.halted, queue_drive(%{st | halted: false, retarget: true})}
   end
 
-  def handle_call(:poisoned, _from, st), do: {:reply, MapSet.to_list(st.poisoned), st}
+  defp do_handle_call(:poisoned, _from, st), do: {:reply, MapSet.to_list(st.poisoned), st}
 
-  def handle_call({:reconsider_poisoned, which}, from, st) do
+  defp do_handle_call({:reconsider_poisoned, which}, from, st) do
     hashes =
       if which == :all,
         do: MapSet.to_list(st.poisoned),
@@ -966,36 +968,38 @@ defmodule Exnode.Chain.State do
   @impl true
   # One activation turn (coalesced); it queues the next only if it stopped
   # on a budget, never to wait for a completion.
-  def handle_info(:drive, st), do: {:noreply, drive(%{st | drive_queued: false})}
+  def handle_info(msg, st), do: timed_cb(msg, fn -> do_handle_info(msg, st) end)
 
-  def handle_info({:script_exec, tag, outcome, wstats}, st),
+  defp do_handle_info(:drive, st), do: {:noreply, drive(%{st | drive_queued: false})}
+
+  defp do_handle_info({:script_exec, tag, outcome, wstats}, st),
     do: {:noreply, script_result(st, tag, outcome, wstats)}
 
-  def handle_info({:prefetch_done, tag, result}, st),
+  defp do_handle_info({:prefetch_done, tag, result}, st),
     do: {:noreply, prefetch_result(st, tag, result)}
 
-  def handle_info({:prep_done, tag, result, wstats}, st),
+  defp do_handle_info({:prep_done, tag, result, wstats}, st),
     do: {:noreply, prep_result(st, tag, result, wstats)}
 
-  def handle_info({:archive_prep_done, tag, result}, st),
+  defp do_handle_info({:archive_prep_done, tag, result}, st),
     do: {:noreply, archive_prep_result(st, tag, result)}
 
-  def handle_info({:DOWN, mref, :process, _, reason}, %{prep_worker: {_, mref}} = st),
+  defp do_handle_info({:DOWN, mref, :process, _, reason}, %{prep_worker: {_, mref}} = st),
     do: {:noreply, prep_worker_down(st, reason)}
 
   # The private executor went: outstanding script work is lost.
-  def handle_info({:DOWN, mref, :process, _, reason}, %{exec_private: {_, mref}} = st),
+  defp do_handle_info({:DOWN, mref, :process, _, reason}, %{exec_private: {_, mref}} = st),
     do: {:stop, {:script_exec_down, reason}, st}
 
-  def handle_info({:DOWN, mref, :process, _, _} = down, st),
+  defp do_handle_info({:DOWN, mref, :process, _, _} = down, st),
     do: {:noreply, elem(handle_down(st, mref, down), 1)}
 
-  def handle_info(:commit_tick, st) do
+  defp do_handle_info(:commit_tick, st) do
     Process.send_after(self(), :commit_tick, @batch_ms)
     {:noreply, st |> maybe_commit() |> flush_round()}
   end
 
-  def handle_info({:EXIT, _pid, reason}, st) do
+  defp do_handle_info({:EXIT, _pid, reason}, st) do
     cond do
       reason in [:normal, :shutdown] -> {:noreply, st}
       match?({:shutdown, _}, reason) -> {:noreply, st}
@@ -1003,7 +1007,7 @@ defmodule Exnode.Chain.State do
     end
   end
 
-  def handle_info(_msg, st), do: {:noreply, st}
+  defp do_handle_info(_msg, st), do: {:noreply, st}
 
   # Commit what is connected (Core flushes on shutdown). Provisional items
   # are dropped (their pending copies remain for the next start); a private
@@ -1052,7 +1056,9 @@ defmodule Exnode.Chain.State do
   end
 
   @impl true
-  def handle_cast({:halt, reason}, %{halted: false} = st) do
+  def handle_cast(msg, st), do: timed_cb(msg, fn -> do_handle_cast(msg, st) end)
+
+  defp do_handle_cast({:halt, reason}, %{halted: false} = st) do
     Logger.error("block connection halted: #{inspect(reason)}")
     # Durable first (CS-2): a restart, with or without the shadow, must not
     # replay `pending` past the divergence. Cleared only by clear_halt/1 or
@@ -1072,7 +1078,7 @@ defmodule Exnode.Chain.State do
   end
 
   # Already halted: the first reason (and its mark) stands.
-  def handle_cast({:halt, _reason}, st),
+  defp do_handle_cast({:halt, _reason}, st),
     do:
       (
         ack_halt(st)
@@ -1293,9 +1299,13 @@ defmodule Exnode.Chain.State do
     t0 = System.monotonic_time(:microsecond)
     {st, state} = turn(Map.put(st, :turn_retired, 0))
     st = hwm(st, :turn_retired_max, st.turn_retired)
+    t1 = System.monotonic_time(:microsecond)
+    cs_time(:turn, t1 - t0)
 
     st =
       st |> maybe_commit() |> publish() |> publish_pipeline() |> flush_round() |> flush_mempool()
+
+    cs_time(:epilogue, System.monotonic_time(:microsecond) - t1)
 
     st = note_turn(st, System.monotonic_time(:microsecond) - t0)
 
@@ -1425,12 +1435,14 @@ defmodule Exnode.Chain.State do
   # The next action on the plan: retire the head if complete, else prepare
   # the next block if admitted and its data is in, else extend, else wait.
   defp step(st) do
+    t0 = System.monotonic_time(:microsecond)
     st = dispatch_archive_preps(st)
+    cs_time(:dispatch, System.monotonic_time(:microsecond) - t0)
 
     case :queue.peek(st.plan.items) do
       {:value, %{state: s} = head} when s in [:ready, :failed] ->
         case await_archive_prep(st, head) do
-          {:ok, st, head} -> retire(st, head)
+          {:ok, st, head} -> cs_timed(:retire, fn -> retire(st, head) end)
           :pending -> advance(st)
         end
 
@@ -1444,7 +1456,7 @@ defmodule Exnode.Chain.State do
 
     cond do
       plan.todo != [] and not plan.final and admitted?(st) and prep_free?(st) ->
-        case prepare_next(st) do
+        case cs_timed(:prepare, fn -> prepare_next(st) end) do
           {:wait, st} -> {:waiting, st}
           {:ok, st} -> {:prepared, st}
         end
@@ -1868,6 +1880,51 @@ defmodule Exnode.Chain.State do
             {:ok, add_item(st, entry, rest, block, other, validate_us)}
         end
     end
+  end
+
+  # --- chain-state time accounting (the perf line's `chain-state:` part) ---
+  #
+  # Per window: the time in each callback, by message (a call by its
+  # request, an info by its message), and within `:drive` the turn's parts.
+  # What no callback took is idle (waiting for a message).
+
+  defp timed_cb(msg, fun) do
+    t0 = System.monotonic_time(:microsecond)
+    r = fun.()
+    key = if is_tuple(msg) and tuple_size(msg) > 0, do: elem(msg, 0), else: msg
+    key = if is_atom(key), do: key, else: :other
+    cs_time({:cb, key}, System.monotonic_time(:microsecond) - t0)
+    r
+  end
+
+  defp cs_timed(key, fun) do
+    t0 = System.monotonic_time(:microsecond)
+    r = fun.()
+    cs_time(key, System.monotonic_time(:microsecond) - t0)
+    r
+  end
+
+  defp cs_time(key, us) do
+    m = Process.get(:perf_cs) || %{}
+    {n, t} = Map.get(m, key, {0, 0})
+    Process.put(:perf_cs, Map.put(m, key, {n + 1, t + us}))
+  end
+
+  # Busy and idle time, the turn's parts, and each message's time/count,
+  # largest first.
+  defp cs_line(m, window_us) do
+    cbs = for {{:cb, k}, {n, us}} <- m, do: {k, n, us}
+    busy = Enum.reduce(cbs, 0, fn {_, _, us}, acc -> acc + us end)
+    g = fn k -> m |> Map.get(k, {0, 0}) |> elem(1) |> div(1000) end
+
+    calls =
+      cbs
+      |> Enum.sort_by(&(-elem(&1, 2)))
+      |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
+
+    "chain-state: busy #{div(busy, 1000)}ms idle #{div(max(window_us - busy, 0), 1000)}ms " <>
+      "(turn #{g.(:turn)}ms: prepare #{g.(:prepare)}ms retire #{g.(:retire)}ms " <>
+      "dispatch #{g.(:dispatch)}ms; epilogue #{g.(:epilogue)}ms; by message: #{calls})"
   end
 
   defp add_us(key, t0),
@@ -2915,7 +2972,9 @@ defmodule Exnode.Chain.State do
           "validation: check_block #{ms(g.(v, :checkblock))}ms contextual #{ms(g.(v, :contextual))}ms " <>
           "connect #{ms(g.(v, :connect))}ms (resolve #{ms(p.resolve)}ms, per tx: inputs #{ms(g.(v, :inputs))}ms " <>
           "amounts #{ms(g.(v, :amounts))}ms locks #{ms(g.(v, :locks))}ms sigops #{ms(g.(v, :sigops))}ms " <>
-          "coins #{ms(g.(v, :coins))}ms)"
+          "coins #{ms(g.(v, :coins))}ms; loop #{ms(g.(v, :txloop))}ms ages #{ms(g.(v, :ages))}ms " <>
+          "finish #{ms(g.(v, :finish))}ms); " <>
+          cs_line(Process.delete(:perf_cs) || %{}, round(secs * 1_000_000))
       )
 
       %{st | pf_stats: %{used: 0, stale: 0, none: 0}, pf_window: %{}}

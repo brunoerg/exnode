@@ -79,7 +79,7 @@ defmodule Exnode.Validation.Connect do
         Archive.labeled(:inputs, fn -> resolve_view(a, ops, view, committed) end)
       end)
 
-    count_ages(prefetch, height)
+    timed(:perf_v_ages_us, fn -> count_ages(prefetch, height) end)
 
     with :ok <- bip30(a, view, block, entry, prev, p, idx, committed) do
       lock_flags_csv = height >= p.csv_height
@@ -103,46 +103,55 @@ defmodule Exnode.Validation.Connect do
       }
 
       result =
-        block.txs
-        |> Enum.with_index()
-        |> Enum.reduce_while({:ok, st}, fn {tx, pos}, {:ok, st} ->
-          case connect_tx(a, tx, pos, st, entry, {prev, prev_mtp}, idx, flags, lock_flags_csv) do
-            {:ok, st} -> {:cont, {:ok, st}}
-            {:error, _} = e -> {:halt, e}
-          end
+        timed(:perf_v_txloop_us, fn ->
+          block.txs
+          |> Enum.with_index()
+          |> Enum.reduce_while({:ok, st}, fn {tx, pos}, {:ok, st} ->
+            case connect_tx(a, tx, pos, st, entry, {prev, prev_mtp}, idx, flags, lock_flags_csv) do
+              {:ok, st} -> {:cont, {:ok, st}}
+              {:error, _} = e -> {:halt, e}
+            end
+          end)
         end)
 
-      with {:ok, st} <- result do
-        reward = st.fees + subsidy(height, p)
-        value_out = Enum.reduce(hd(block.txs).outputs, 0, &(&2 + &1.value))
+      timed(:perf_v_finish_us, fn ->
+        finish(result, block, height, p, scripts?, flags, base_out)
+      end)
+    end
+  end
 
-        cond do
-          value_out > reward ->
-            {:error, {:consensus, "bad-cb-amount"}}
+  # The block-level checks after the per-tx loop, and the result.
+  defp finish(result, block, height, p, scripts?, flags, base_out) do
+    with {:ok, st} <- result do
+      reward = st.fees + subsidy(height, p)
+      value_out = Enum.reduce(hd(block.txs).outputs, 0, &(&2 + &1.value))
 
-          scripts? == true and
-              timed(:perf_scripts_us, fn ->
-                Exnode.Validation.Scripts.verify_all(st.checks, flags)
-              end) != :ok ->
-            {:error, {:consensus, "block-script-verify-flag-failed"}}
+      cond do
+        value_out > reward ->
+          {:error, {:consensus, "bad-cb-amount"}}
 
-          true ->
-            {:ok,
-             %{
-               spent: Enum.reverse(st.spent),
-               fees: st.fees,
-               sigops: st.sigops,
-               scripts_checked: scripts? != false,
-               checks: if(scripts? == :defer, do: st.checks, else: nil),
-               flags: flags,
-               n_outputs: st.next_out - base_out,
-               delta: %{
-                 created: st.overlay,
-                 spent: st.spent_in_block,
-                 txids: MapSet.new(block.txs, & &1.txid)
-               }
-             }}
-        end
+        scripts? == true and
+            timed(:perf_scripts_us, fn ->
+              Exnode.Validation.Scripts.verify_all(st.checks, flags)
+            end) != :ok ->
+          {:error, {:consensus, "block-script-verify-flag-failed"}}
+
+        true ->
+          {:ok,
+           %{
+             spent: Enum.reverse(st.spent),
+             fees: st.fees,
+             sigops: st.sigops,
+             scripts_checked: scripts? != false,
+             checks: if(scripts? == :defer, do: st.checks, else: nil),
+             flags: flags,
+             n_outputs: st.next_out - base_out,
+             delta: %{
+               created: st.overlay,
+               spent: st.spent_in_block,
+               txids: MapSet.new(block.txs, & &1.txid)
+             }
+           }}
       end
     end
   end
@@ -199,7 +208,9 @@ defmodule Exnode.Validation.Connect do
   Time spent in each per-tx step of `connect_block/6` in this process since
   the last call, in µs (the perf log's validation split): `inputs` (finding
   the spent coins), `amounts` (CheckTxInputs), `locks` (sequence locks),
-  `sigops` (sigop cost) and `coins` (updating the block's coin view).
+  `sigops` (sigop cost), `coins` (updating the block's coin view), `txloop`
+  (the whole per-tx loop, the five above included), `ages` (the prevout
+  age histogram) and `finish` (the coinbase amount check and the result).
   """
   def take_split do
     for {k, key} <- [
@@ -207,7 +218,10 @@ defmodule Exnode.Validation.Connect do
           amounts: :perf_v_amounts_us,
           locks: :perf_v_locks_us,
           sigops: :perf_v_sigops_us,
-          coins: :perf_v_coins_us
+          coins: :perf_v_coins_us,
+          txloop: :perf_v_txloop_us,
+          ages: :perf_v_ages_us,
+          finish: :perf_v_finish_us
         ],
         into: %{},
         do: {k, Process.delete(key) || 0}
