@@ -388,6 +388,10 @@ defmodule Exnode.Node do
             assume_valid: Keyword.get(opts, :assume_valid),
             prune_witness: Keyword.get(opts, :prune_witness, false),
             commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
+            batch_blocks:
+              Keyword.get(opts, :batch_blocks, elem(ChainState.default_batch_limits(), 0)),
+            batch_bytes:
+              Keyword.get(opts, :batch_bytes, elem(ChainState.default_batch_limits(), 1)),
             prefetch_depth:
               Keyword.get(opts, :prefetch_depth, Exnode.Chain.State.default_prefetch_depth()),
             mempool: n.mempool,

@@ -96,33 +96,45 @@ defmodule Exnode.Archive.Overlay do
   its block: only larger binaries are copied. The mask and the coins each
   go in with one insert per block.
   """
-  def apply_block(%__MODULE__{} = ov, gen, created, spent) do
-    t0 = System.monotonic_time(:microsecond)
+  def apply_block(%__MODULE__{} = ov, gen, created, spent),
+    do: apply_prepared(ov, prepare_block(gen, created, spent))
 
-    mask =
-      for op <- spent do
-        :ets.delete(ov.coins, op)
-        {own_op(op)}
-      end
-
-    :ets.insert(ov.spent, mask)
-    t1 = System.monotonic_time(:microsecond)
+  @doc """
+  The table-independent part of `apply_block/4`: the mask rows, the coin
+  rows (owned binaries, see above) and the packed outpoints of generation
+  `gen`. Pure, so any process may build it; `apply_prepared/2` applies it.
+  """
+  def prepare_block(gen, created, spent) do
+    mask = for op <- spent, do: {own_op(op)}
 
     {entries, ops} =
       Enum.reduce(created, {[], []}, fn {op, coin}, {es, os} ->
-        :ets.delete(ov.spent, op)
         op = own_op(op)
         {[{op, gen, own_script(coin)} | es], [op | os]}
       end)
 
+    %{gen: gen, mask: mask, entries: entries, n: length(ops), packed: pack_ops(ops)}
+  end
+
+  @doc "Applies a `prepare_block/3` result: the same effect as `apply_block/4`."
+  def apply_prepared(%__MODULE__{} = ov, %{
+        gen: gen,
+        mask: mask,
+        entries: entries,
+        n: n,
+        packed: packed
+      }) do
+    t0 = System.monotonic_time(:microsecond)
+    for {op} <- mask, do: :ets.delete(ov.coins, op)
+    :ets.insert(ov.spent, mask)
+    t1 = System.monotonic_time(:microsecond)
+    for {op, _, _} <- entries, do: :ets.delete(ov.spent, op)
     :ets.insert(ov.coins, entries)
     t2 = System.monotonic_time(:microsecond)
-    n = length(ops)
     bump(:ov_spent_us, t1 - t0)
     bump(:ov_created_us, t2 - t1)
     bump(:ov_spent_n, length(mask))
     bump(:ov_created_n, n)
-    packed = pack_ops(ops)
 
     %{
       ov
