@@ -22,7 +22,9 @@ defmodule Mix.Tasks.Exnode.Node do
   blocks only), `--dbcache <MiB>` (coin cache budget, default 450 as Core's
   `DEFAULT_KERNEL_CACHE`), `--batch-blocks <n>` / `--batch-mib <MiB>` (commit
   batch limits, default 128 blocks / 64 MiB; larger values cut sync overhead
-  during IBD at the cost of memory and crash replay).
+  during IBD at the cost of memory and crash replay), `--chain-state-heap-mib
+  <MiB>` (the chain state's minimum heap, default 16; during IBD its live
+  data is hundreds of MiB, and a larger floor means fewer collections).
 
   `--status-file` also writes the latest status as JSON (best header height
   and hash, peer count), for scripts that compare against bitcoind.
@@ -51,6 +53,7 @@ defmodule Mix.Tasks.Exnode.Node do
     prefetch: :integer,
     batch_blocks: :integer,
     batch_mib: :integer,
+    chain_state_heap_mib: :integer,
     rpcport: :integer,
     rpcuser: :string,
     rpcpassword: :string,
@@ -105,6 +108,12 @@ defmodule Mix.Tasks.Exnode.Node do
           if(opts[:batch_mib],
             do: opts[:batch_mib] * 1024 * 1024,
             else: elem(Exnode.Chain.State.default_batch_limits(), 1)
+          ),
+        # The chain state's minimum heap, in words.
+        chain_state_min_heap:
+          if(opts[:chain_state_heap_mib],
+            do: div(opts[:chain_state_heap_mib] * 1024 * 1024, :erlang.system_info(:wordsize)),
+            else: Exnode.Chain.State.default_min_heap_size()
           ),
         # Blocks the prefetch stage prepares ahead (--prefetch 0 turns it off).
         prefetch_depth: Keyword.get(opts, :prefetch, Exnode.Chain.State.default_prefetch_depth()),
