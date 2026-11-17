@@ -6,14 +6,21 @@ defmodule Exnode.P2P.PeerAddrTest do
   * a peer we sent getaddr to may answer with many addresses, which reach
     the address book; an unsolicited inbound peer gets only its token
     bucket (1 address);
-  * addrv2 carries networks addr cannot (here TorV3);
+  * addrv2 carries networks addr cannot (here TorV3), but only reachable
+    networks are stored (IPv4, IPv6), as in Core;
+  * AUD-A2-1 (regression): each address is sanitised as in Core
+    `ProcessAddrs` before the address book sees it: a time before 1973 or
+    more than 10 minutes ahead becomes 5 days ago (a future time made an
+    entry, even a tried one, `terrible?` and evictable), addresses without
+    NODE_NETWORK or NODE_NETWORK_LIMITED and discouraged ones are dropped;
   * a block-relay-only peer's addresses are ignored;
   * an inbound getaddr is answered once, with addrv2 to a peer that sent
     sendaddrv2, and otherwise with addr filtered to IPv4/IPv6.
   """
   use Exnode.NodeCase
 
-  alias Exnode.P2P.{AddrMan, Frame, Message}
+  alias Exnode.P2P.{AddrMan, Discouraged, Frame, Message}
+  alias Exnode.P2P.AddrMan.Table
 
   @p Exnode.ChainParams.get(:regtest)
 
@@ -77,12 +84,94 @@ defmodule Exnode.P2P.PeerAddrTest do
     assert AddrMan.size(n.addrman) <= 1
   end
 
-  test "addrv2 carries TorV3 addresses", %{n: n} do
+  test "addrv2 carries TorV3 addresses; without onion reachability they are not stored",
+       %{n: n} do
+    now = System.os_time(:second)
     {pid, sock} = FakePeer.connect_from(n, node: %{addrman: n.addrman})
     handshaked(pid)
-    :ok = FakePeer.send_msgs(sock, {:addrv2, torv3s(1, System.os_time(:second))})
+    :ok = FakePeer.send_msgs(sock, {:addrv2, torv3s(1, now) ++ ipv4s(1, now)})
     barrier(sock)
-    wait_until(fn -> AddrMan.size(n.addrman, :torv3) == 1 end)
+    # The IPv4 one in the same message is stored: the TorV3 one was decoded.
+    wait_until(fn -> AddrMan.size(n.addrman, :ipv4) == 1 end)
+    assert AddrMan.size(n.addrman, :torv3) == 0
+  end
+
+  # The address book's entry for `a` (time, services, ...), or nil.
+  defp entry(addrman, a) do
+    t = :sys.get_state(addrman).t
+
+    case t.ids[AddrMan.key(a)] do
+      nil -> nil
+      id -> t.info[id]
+    end
+  end
+
+  defp addr(i, time, services \\ 9),
+    do: %{time: time, services: services, net: :ipv4, addr: <<2, i, 0, 1>>, port: 18444}
+
+  test "AUD-A2-1: a far-future or ancient time is clamped to 5 days ago; a known entry stays usable",
+       %{n: n} do
+    now = System.os_time(:second)
+    known = addr(1, now - 3600)
+    AddrMan.add(n.addrman, [known], :seed)
+    wait_until(fn -> AddrMan.find_entry(n.addrman, AddrMan.key(known)) != nil end)
+
+    {pid, sock} = FakePeer.connect_from(n, node: %{addrman: n.addrman})
+    handshaked(pid)
+    assert [{"getaddr", _}] = FakePeer.recv(sock, ["getaddr"], 1)
+
+    msg = [%{known | time: 0xFFFFFFFF}, addr(2, 0xFFFFFFFF), addr(3, 5)]
+    :ok = FakePeer.send_msgs(sock, {:addr, msg})
+    barrier(sock)
+    wait_until(fn -> AddrMan.size(n.addrman, :ipv4) == 3 end)
+
+    k = entry(n.addrman, known)
+    # Unchanged (its time is newer than 5 days ago); before, 2^32 - 2 h.
+    assert k.time == now - 3600
+    refute Table.terrible?(k, now)
+
+    for i <- [2, 3] do
+      e = entry(n.addrman, addr(i, 0))
+      # 5 days ago, minus the 2 h gossip penalty.
+      assert_in_delta e.time, now - 5 * 86_400 - 2 * 3600, 60
+      refute Table.terrible?(e, now)
+    end
+  end
+
+  test "AUD-A2-1: addresses without NODE_NETWORK or NODE_NETWORK_LIMITED are not stored",
+       %{n: n} do
+    now = System.os_time(:second)
+    {pid, sock} = FakePeer.connect_from(n, node: %{addrman: n.addrman})
+    handshaked(pid)
+    assert [{"getaddr", _}] = FakePeer.recv(sock, ["getaddr"], 1)
+
+    # 0: nothing; 8: NODE_WITNESS only; 1024: NODE_NETWORK_LIMITED; 9: NETWORK | WITNESS.
+    msg = [addr(1, now, 0), addr(2, now, 8), addr(3, now, 1024), addr(4, now, 9)]
+    :ok = FakePeer.send_msgs(sock, {:addr, msg})
+    barrier(sock)
+    wait_until(fn -> AddrMan.size(n.addrman, :ipv4) >= 2 end)
+
+    stored = for i <- 1..4, AddrMan.find_entry(n.addrman, AddrMan.key(addr(i, 0))), do: i
+    assert stored == [3, 4]
+  end
+
+  test "AUD-A2-1: discouraged addresses are not stored", %{n: n} do
+    now = System.os_time(:second)
+    bad = addr(1, now)
+
+    :sys.replace_state(n.connman, fn st ->
+      %{st | discouraged: Discouraged.put(st.discouraged, Discouraged.key(bad), now)}
+    end)
+
+    {pid, sock} = FakePeer.connect_from(n, node: %{addrman: n.addrman, connman: n.connman})
+    handshaked(pid)
+    assert [{"getaddr", _}] = FakePeer.recv(sock, ["getaddr"], 1)
+    :ok = FakePeer.send_msgs(sock, {:addr, [bad, addr(2, now)]})
+    barrier(sock)
+    wait_until(fn -> AddrMan.size(n.addrman, :ipv4) >= 1 end)
+
+    assert AddrMan.find_entry(n.addrman, AddrMan.key(bad)) == nil
+    assert AddrMan.find_entry(n.addrman, AddrMan.key(addr(2, 0))) != nil
   end
 
   test "a block-relay-only peer's addresses are ignored", %{n: n} do
