@@ -6,7 +6,7 @@ defmodule Exnode.DoS.OrphanageTest do
     no per-parent `Mempool.has?` calls: items are deduplicated, a peer that
     already announces the orphan is skipped, and parents are looked up in
     one batched `has_many?`;
-  * #7 (regression): children of an accepted tx (`reconsider_children`) and
+  * #7 (regression): children of an accepted tx (`add_children_to_work_set`) and
     of a resent reconsiderable tx (`try_1p1c`) are found through an index of
     orphans by parent txid, as Core's m_outpoint_to_orphan_wtxids, not by
     scanning every input of every orphan;

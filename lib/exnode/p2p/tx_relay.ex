@@ -178,6 +178,15 @@ defmodule Exnode.P2P.TxRelay do
        orphan_peers: %{},
        # Core TotalLatencyScore: announcements + unique orphans' input scores.
        orphan_score: 0,
+       # Orphans to reconsider (Core AddChildrenToWorkSet / ProcessOrphanTx):
+       # peer => queue of wtxids assigned to it, the peers with work in
+       # round-robin order, and every queued wtxid (Core
+       # m_reconsiderable_wtxids: queued at most once). Drained one step at a
+       # time by :orphan_work messages, so the calls TxRelay serves interleave.
+       orphan_work: %{},
+       orphan_work_peers: :queue.new(),
+       orphan_work_set: MapSet.new(),
+       orphan_work_scheduled: false,
        now: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
        # Core InvToSendBucket: global announcement backlogs and token buckets,
        # one for inbound peers and one for outbound (rate x 2.5).
@@ -391,7 +400,7 @@ defmodule Exnode.P2P.TxRelay do
     st = orphans_drop(%{st | confirmed: confirmed}, Enum.uniq(conflicting ++ confirmed_orphans))
     st = ann_delete_hashes(st, hashes)
     # AddChildrenToWorkSet: orphans spending the block's txs.
-    {:noreply, reconsider_children(st, Enum.map(txs, & &1.txid))}
+    {:noreply, add_children_to_work_set(st, Enum.map(txs, & &1.txid))}
   end
 
   def handle_info({:mempool_block, :disconnected}, st),
@@ -400,6 +409,11 @@ defmodule Exnode.P2P.TxRelay do
        %{st | confirmed: new_filter(), rejects: new_filter(), reconsiderable: new_filter()}}
 
   # Core EraseForPeer: the peer's announcements go; orphans left with none go too.
+  def handle_info(:orphan_work, st) do
+    st = %{st | orphan_work_scheduled: false}
+    {:noreply, st |> orphan_work_step() |> schedule_orphan_work()}
+  end
+
   def handle_info({:DOWN, _, :process, peer, _}, st) do
     st =
       case st.orphan_peers do
@@ -412,7 +426,7 @@ defmodule Exnode.P2P.TxRelay do
           st
       end
 
-    {:noreply, drop_peer(st, peer)}
+    {:noreply, st |> drop_orphan_work(peer) |> drop_peer(peer)}
   end
 
   def handle_info(_msg, st), do: {:noreply, st}
@@ -790,37 +804,136 @@ defmodule Exnode.P2P.TxRelay do
   defp accepted(st, tx, peer) do
     st = ann_delete_hashes(orphans_drop(st, [tx.wtxid]), [tx.txid, tx.wtxid])
     st = queue_announce(st, tx, peer)
-    reconsider_children(st, [tx.txid])
+    add_children_to_work_set(st, [tx.txid])
   end
 
-  # AddChildrenToWorkSet + ProcessOrphanTx: retry orphans spending `txids`.
-  defp reconsider_children(st, txids) do
+  # Core AddChildrenToWorkSet: each orphan spending `txids` goes to the work
+  # set of one of its announcers, chosen at random, unless already queued.
+  # Reconsidering it costs a mempool accept with script checks, so nothing
+  # is reconsidered here: the work is drained by :orphan_work steps (AUD-A4-2).
+  defp add_children_to_work_set(st, txids) do
     st
     |> orphan_children(txids)
     |> Enum.sort_by(fn {_, o} -> o.seq end)
-    |> Enum.reduce(st, fn {wtxid, o}, st ->
-      if Map.has_key?(st.orphans, wtxid) do
-        peer = o.announcers |> MapSet.to_list() |> List.first()
-        st = orphans_drop(st, [wtxid])
+    |> Enum.reduce(st, fn {w, o}, st ->
+      if MapSet.member?(st.orphan_work_set, w),
+        do: st,
+        else: enqueue_orphan_work(st, w, random_announcer(o))
+    end)
+    |> schedule_orphan_work()
+  end
+
+  defp random_announcer(o) do
+    case MapSet.to_list(o.announcers) do
+      [] -> nil
+      peers -> Enum.random(peers)
+    end
+  end
+
+  defp enqueue_orphan_work(st, w, peer) do
+    {q, peers} =
+      case st.orphan_work do
+        %{^peer => q} -> {q, st.orphan_work_peers}
+        _ -> {:queue.new(), :queue.in(peer, st.orphan_work_peers)}
+      end
+
+    %{
+      st
+      | orphan_work: Map.put(st.orphan_work, peer, :queue.in(w, q)),
+        orphan_work_peers: peers,
+        orphan_work_set: MapSet.put(st.orphan_work_set, w)
+    }
+  end
+
+  # One :orphan_work message in the mailbox at a time, behind the calls
+  # already waiting.
+  defp schedule_orphan_work(%{orphan_work_scheduled: false, orphan_work: work} = st)
+       when map_size(work) > 0 do
+    send(self(), :orphan_work)
+    %{st | orphan_work_scheduled: true}
+  end
+
+  defp schedule_orphan_work(st), do: st
+
+  # Core ProcessOrphanTx for the next peer in turn: its work set until one
+  # orphan gets a decisive answer (a missing-inputs one is cheap, and the
+  # loop goes on). The peer goes to the back of the line if work remains.
+  defp orphan_work_step(st) do
+    case :queue.out(st.orphan_work_peers) do
+      {:empty, _} ->
+        st
+
+      {{:value, peer}, rest} ->
+        st = process_peer_orphan_work(%{st | orphan_work_peers: rest}, peer)
+
+        if Map.has_key?(st.orphan_work, peer) and not :queue.member(peer, st.orphan_work_peers),
+          do: %{st | orphan_work_peers: :queue.in(peer, st.orphan_work_peers)},
+          else: st
+    end
+  end
+
+  defp process_peer_orphan_work(st, peer) do
+    case :queue.out(Map.get(st.orphan_work, peer, :queue.new())) do
+      {:empty, _} ->
+        %{st | orphan_work: Map.delete(st.orphan_work, peer)}
+
+      {{:value, w}, rest} ->
+        work =
+          if :queue.is_empty(rest),
+            do: Map.delete(st.orphan_work, peer),
+            else: Map.put(st.orphan_work, peer, rest)
+
+        st = %{st | orphan_work: work, orphan_work_set: MapSet.delete(st.orphan_work_set, w)}
+
+        case reconsider_orphan(st, w, peer) do
+          {:decisive, st} -> st
+          {:continue, st} -> process_peer_orphan_work(st, peer)
+        end
+    end
+  end
+
+  # One orphan of the work set. Gone meanwhile (accepted another way,
+  # evicted, confirmed): nothing to do.
+  defp reconsider_orphan(st, w, peer) do
+    case st.orphans do
+      %{^w => o} ->
+        st = orphans_drop(st, [w])
 
         case Mempool.accept(st.mempool, o.tx) do
           {:ok, _} ->
-            accepted(st, o.tx, peer)
+            {:decisive, accepted(st, o.tx, peer)}
 
           {:error, %{result: :missing_inputs}} ->
-            orphan_put(st, wtxid, o)
+            {:continue, orphan_put(st, w, o)}
 
           # Not a verdict on the orphan: keep it for the next parent or retry (MP-5).
           {:error, e} when e.result == :reconsiderable and e.reason in @transient ->
-            orphan_put(st, wtxid, o)
+            {:decisive, orphan_put(st, w, o)}
 
           {:error, e} ->
-            rejected(st, o.tx, e, peer, false)
+            {:decisive, rejected(st, o.tx, e, peer, false)}
         end
-      else
+
+      _ ->
+        {:continue, st}
+    end
+  end
+
+  # Core EraseForPeer: a peer's reconsideration marks go with it.
+  defp drop_orphan_work(st, peer) do
+    case Map.pop(st.orphan_work, peer) do
+      {nil, _} ->
         st
-      end
-    end)
+
+      {q, work} ->
+        %{
+          st
+          | orphan_work: work,
+            orphan_work_set:
+              Enum.reduce(:queue.to_list(q), st.orphan_work_set, &MapSet.delete(&2, &1)),
+            orphan_work_peers: :queue.filter(&(&1 != peer), st.orphan_work_peers)
+        }
+    end
   end
 
   # Core: MempoolRejectedTx
