@@ -1309,8 +1309,12 @@ defmodule Exnode.Chain.State do
 
     # Why the turn stopped to wait: the time until the next callback is
     # charged to it (timed_cb/2).
-    if state == :waiting,
-      do: Process.put(:perf_wait, {wait_reason(st), System.monotonic_time(:microsecond)})
+    case state do
+      :waiting -> Process.put(:perf_wait, {wait_reason(st), System.monotonic_time(:microsecond)})
+      # Nothing left to connect: waiting for blocks to arrive.
+      :idle -> Process.put(:perf_wait, {:no_work, System.monotonic_time(:microsecond)})
+      :more -> :ok
+    end
 
     st = note_turn(st, System.monotonic_time(:microsecond) - t0)
 
@@ -1540,9 +1544,12 @@ defmodule Exnode.Chain.State do
     tag = {:apre, st.plan.gen, make_ref()}
     # Only what the preparation reads crosses to its process, since spawning
     # copies it here: the raw block (an off-heap binary, shared, not copied;
-    # decoded there), the spent ids and the delta's created and spent coins.
-    # The txindex rows are read there, at this epoch (`kv_reader/1`).
+    # decoded there), the spent ids, the delta's created and spent coins,
+    # and the prefetched txindex rows (re-reading them there instead costs
+    # the store a block's worth of lookups again). Rows of another epoch
+    # are read there, at this epoch (`kv_reader/1`).
     reader = Archive.kv_reader(st.a)
+    history = Map.get(item, :history)
     body = if is_binary(block.raw), do: {:raw, block.raw}, else: {:decoded, block}
     %{spent: spent, delta: %{created: created, spent: sp}} = res
     delta = %{created: created, spent: sp}
@@ -1561,7 +1568,7 @@ defmodule Exnode.Chain.State do
               end
 
             if hook, do: hook.(block)
-            p = Archive.prepare_append(block, height, spent, ids, delta, reader, nil)
+            p = Archive.prepare_append(block, height, spent, ids, delta, reader, history)
 
             {:ok,
              Map.merge(p, %{
