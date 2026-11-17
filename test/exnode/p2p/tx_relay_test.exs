@@ -402,17 +402,27 @@ defmodule Exnode.P2P.TxRelayTest do
     defp put_peer(ann, peer, m) when map_size(m) == 0, do: Map.delete(ann, peer)
     defp put_peer(ann, peer, m), do: Map.put(ann, peer, m)
 
+    # Core: an expired request becomes COMPLETED; a hash with no uncompleted
+    # announcement left is forgotten (AUD-A4-1).
     defp expire_requests(st, now) do
       ann =
-        Enum.reduce(st.ann, st.ann, fn {peer, m}, acc ->
-          put_peer(
-            acc,
-            peer,
-            Map.reject(m, fn {_, a} -> a.state == :requested and a.expiry < now end)
-          )
+        for {peer, m} <- st.ann, into: %{} do
+          {peer,
+           Map.new(m, fn {h, a} ->
+             if a.state == :requested and a.expiry < now,
+               do: {h, %{a | state: :completed}},
+               else: {h, a}
+           end)}
+        end
+
+      done =
+        for({_, m} <- ann, {h, _} <- m, do: h)
+        |> Enum.uniq()
+        |> Enum.filter(fn h ->
+          Enum.all?(ann, fn {_, m} -> not Map.has_key?(m, h) or m[h].state == :completed end)
         end)
 
-      %{st | ann: ann}
+      %{st | ann: ann_delete_hashes(ann, done)}
     end
 
     @getdata_interval 60_000
@@ -427,7 +437,14 @@ defmodule Exnode.P2P.TxRelayTest do
       picks =
         for {h, anns} <- by_hash,
             not Enum.any?(anns, fn {_, a} -> a.state == :requested end),
-            ready = for({p, a} <- anns, a.ready_at <= now, Map.has_key?(st.peers, p), do: {p, a}),
+            ready =
+              for(
+                {p, a} <- anns,
+                a.state == :candidate,
+                a.ready_at <= now,
+                Map.has_key?(st.peers, p),
+                do: {p, a}
+              ),
             ready != [] do
           {peer, a} = Enum.min_by(ready, fn {_, a} -> {not a.preferred, a.seq} end)
           {h, peer, a}
@@ -506,6 +523,20 @@ defmodule Exnode.P2P.TxRelayTest do
              for({p, m} <- st.ann, {h, %{state: :requested}} <- m, into: %{}, do: {h, p})
 
     assert Enum.all?(Map.keys(st.waiting), &Map.has_key?(st.requested, &1))
+
+    # AUD-A4-1: the by-hash index matches `ann`, and no hash is kept with
+    # every announcement completed (Core forgets it).
+    by_hash =
+      for {p, m} <- st.ann, {h, _} <- m, reduce: %{} do
+        acc -> Map.update(acc, h, MapSet.new([p]), &MapSet.put(&1, p))
+      end
+
+    assert st.ann_peers == by_hash
+
+    for {h, ps} <- by_hash do
+      refute Enum.all?(ps, &(st.ann[&1][h].state == :completed)),
+             "every announcement of a hash is completed"
+    end
   end
 
   defp op_gen do
