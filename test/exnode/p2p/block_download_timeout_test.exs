@@ -96,6 +96,32 @@ defmodule Exnode.P2P.BlockDownloadTimeoutTest do
     assert BlockDownload.in_flight(bd) == %{}
   end
 
+  test "a peer withholding the byte budget stalls the others too: disconnected after 2 s" do
+    # Kept on purpose: the byte budget runs out before the window, and a peer
+    # it leaves empty-handed marks the holder of the first block in flight,
+    # as when the window runs out. Exempting a budget-gated pick would let
+    # ~10 connections that never deliver fill the 256 MiB budget with
+    # requests and switch stall detection off: blocks would then wait for
+    # the 10-minute download timeout.
+    %{bd: bd, clock: c, best: best} = start(2_000, max_bytes: 16_000, initial_estimate: 1_000)
+    staller = peer()
+    assert length(BlockDownload.request(bd, staller, best)) == 16
+
+    # The window has ~1,000 missing blocks left, but the budget is spent.
+    blocked = peer()
+    assert BlockDownload.request(bd, blocked, best) == []
+    assert BlockDownload.stats(bd).budget_gated > 0
+
+    Clock.advance(c, 2)
+    :ok = Clock.tick(bd)
+    refute_received {_, {:disconnect, _}}
+
+    Clock.advance(c, 1)
+    :ok = Clock.tick(bd)
+    assert_receive {^staller, {:disconnect, :block_stalling}}
+    refute_received {^blocked, {:disconnect, _}}
+  end
+
   test "the peer holding the window's lowest block stalls the others: disconnected after 2 s" do
     # 2,000 blocks: a 1,024-block window, 16 requests per peer (no byte
     # budget in the way: the window is what runs out).
