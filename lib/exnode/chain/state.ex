@@ -343,6 +343,8 @@ defmodule Exnode.Chain.State do
     # blocks (default_min_heap_size/0, default_min_bin_vheap_size/0).
     if n = opts[:min_heap_size], do: Process.flag(:min_heap_size, n)
     if n = opts[:min_bin_vheap_size], do: Process.flag(:min_bin_vheap_size, n)
+    # The perf line's garbage collection figures (node only: GcProbe).
+    if opts[:gc_probe], do: Process.put(:gc_probe, Exnode.Chain.GcProbe.start())
     p = Keyword.fetch!(opts, :params)
     headers = Keyword.fetch!(opts, :headers)
     kv = Keyword.fetch!(opts, :kv)
@@ -1918,20 +1920,33 @@ defmodule Exnode.Chain.State do
   #
   # Per window: the time in each callback, by message (a call by its
   # request, an info by its message), and within `:drive` the turn's parts.
-  # What no callback took is idle (waiting for a message).
+  # What no callback took is idle. Each gap between two callbacks is split
+  # by the mailbox when the first one ended: empty, the process waited for
+  # the message that ends the gap (`{:gap_for, key}`); not empty, it had
+  # work but did not run (`{:gap, :queued}`: descheduled, collecting
+  # garbage, or the gen_server's own receive).
 
   defp timed_cb(msg, fun) do
     t0 = System.monotonic_time(:microsecond)
+    key = if is_tuple(msg) and tuple_size(msg) > 0, do: elem(msg, 0), else: msg
+    key = if is_atom(key), do: key, else: :other
 
     case Process.delete(:perf_wait) do
       {reason, since} -> cs_time({:wait, reason}, t0 - since)
       nil -> :ok
     end
 
+    case Process.delete(:perf_cb_end) do
+      {te, true} -> cs_time({:gap, :queued}, t0 - te)
+      {te, false} -> cs_time({:gap_for, key}, t0 - te)
+      nil -> :ok
+    end
+
     r = fun.()
-    key = if is_tuple(msg) and tuple_size(msg) > 0, do: elem(msg, 0), else: msg
-    key = if is_atom(key), do: key, else: :other
-    cs_time({:cb, key}, System.monotonic_time(:microsecond) - t0)
+    t1 = System.monotonic_time(:microsecond)
+    cs_time({:cb, key}, t1 - t0)
+    {:message_queue_len, q} = Process.info(self(), :message_queue_len)
+    Process.put(:perf_cb_end, {t1, q > 0})
     r
   end
 
@@ -1992,6 +2007,12 @@ defmodule Exnode.Chain.State do
       |> Enum.sort_by(&(-elem(&1, 2)))
       |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
 
+    gaps_for =
+      for({{:gap_for, k}, {n, us}} <- m, do: {k, n, us})
+      |> Enum.sort_by(&(-elem(&1, 2)))
+      |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
+
+    {queued_n, queued_us} = Map.get(m, {:gap, :queued}, {0, 0})
     {apre_n, apre_lat} = Map.get(m, :apre_latency, {0, 0})
     {_, apre_work} = Map.get(m, :apre_worker, {0, 0})
 
@@ -1999,7 +2020,25 @@ defmodule Exnode.Chain.State do
       "(turn #{g.(:turn)}ms: prepare #{g.(:prepare)}ms retire #{g.(:retire)}ms " <>
       "dispatch #{g.(:dispatch)}ms; epilogue #{g.(:epilogue)}ms; by message: #{calls}; " <>
       "waiting for: #{waits}; archive preparations #{apre_n}: " <>
-      "avg latency #{div(apre_lat, max(apre_n, 1) * 1000)}ms, avg work #{div(apre_work, max(apre_n, 1) * 1000)}ms)"
+      "avg latency #{div(apre_lat, max(apre_n, 1) * 1000)}ms, avg work #{div(apre_work, max(apre_n, 1) * 1000)}ms; " <>
+      "gaps: with messages queued #{div(queued_us, 1000)}ms/#{queued_n}, mailbox empty, until: #{gaps_for})" <>
+      gc_line()
+  end
+
+  defp gc_line do
+    case Process.get(:gc_probe) do
+      nil ->
+        ""
+
+      probe ->
+        g = Exnode.Chain.GcProbe.take(probe)
+
+        "; gc: minor #{g.minor_n}x #{div(g.minor_us, 1000)}ms major #{g.major_n}x " <>
+          "#{div(g.major_us, 1000)}ms heap max #{div(g.heap_max_words * 8, 1024 * 1024)}MiB; " <>
+          "long schedules: chain-state #{g.own_sched_n}x #{g.own_sched_ms}ms " <>
+          "others #{g.sched_n}x #{g.sched_ms}ms; " <>
+          "run queue now #{:erlang.statistics(:total_run_queue_lengths_all)}"
+    end
   end
 
   defp add_us(key, t0),

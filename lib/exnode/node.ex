@@ -381,6 +381,7 @@ defmodule Exnode.Node do
                 ChainState.default_min_bin_vheap_size()
               ),
             listeners: [n.block_download],
+            gc_probe: Keyword.get(opts, :gc_probe, true),
             name: n.chain_state,
             params: params,
             headers: n.headers,
