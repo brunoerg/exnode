@@ -144,8 +144,13 @@ defmodule Exnode.P2P.TxRelay do
      %{
        mempool: Keyword.fetch!(opts, :mempool),
        peers: %{},
-       # peer => %{hash => %{kind, preferred, ready_at, seq, state, expiry}}
+       # peer => %{hash => %{kind, preferred, ready_at, seq, state, expiry}};
+       # state :candidate, :requested or :completed (Core COMPLETED: answered,
+       # notfound or expired; kept so the peer's re-announcement is a no-op).
        ann: %{},
+       # hash => MapSet of the peers with an announcement of it, any state
+       # (Core's ByTxHash index: is this the last uncompleted one?).
+       ann_peers: %{},
        ann_seq: 0,
        # {ready_at, seq} => {peer, hash}: candidates by the time they become ready.
        ready: :gb_trees.empty(),
@@ -334,8 +339,9 @@ defmodule Exnode.P2P.TxRelay do
 
   def handle_call({:tx, peer, tx}, _from, st), do: {:reply, :ok, received_tx_impl(st, peer, tx)}
 
+  # Core ReceivedNotFound -> TxRequestTracker::ReceivedResponse.
   def handle_call({:notfound, peer, items}, _from, st),
-    do: {:reply, :ok, Enum.reduce(items, st, &ann_delete_peer_hash(&2, peer, &1.hash))}
+    do: {:reply, :ok, Enum.reduce(items, st, &ann_complete(&2, peer, &1.hash))}
 
   def handle_call({:feefilter, peer, rate}, _from, st) do
     if Map.has_key?(st.peers, peer),
@@ -542,6 +548,7 @@ defmodule Exnode.P2P.TxRelay do
       %{
         st
         | ann: ann_put(st.ann, peer, h, a),
+          ann_peers: Map.update(st.ann_peers, h, MapSet.new([peer]), &MapSet.put(&1, peer)),
           ann_seq: st.ann_seq + 1,
           ready: :gb_trees.enter({ready_at, a.seq}, {peer, h}, st.ready)
       }
@@ -554,12 +561,52 @@ defmodule Exnode.P2P.TxRelay do
 
   defp ann_put(ann, peer, h, a), do: Map.update(ann, peer, %{h => a}, &Map.put(&1, h, a))
 
-  # Under one peer; an absent peer or hash is a no-op. Empty sub-maps are dropped.
-  defp ann_delete_peer_hash(st, peer, h) do
+  # Core MakeCompleted (a response, a notfound, an expired request): the
+  # peer's announcement of `h` becomes :completed, so its re-announcement is a
+  # no-op (Core ReceivedInv), and a request it held frees the hash for
+  # another announcer. If it was the last uncompleted announcement of `h`,
+  # every announcement of `h` is forgotten. An absent one is a no-op.
+  defp ann_complete(st, peer, h) do
     case st.ann do
-      %{^peer => %{^h => a} = m} ->
+      %{^peer => %{^h => %{state: :completed}}} ->
+        st
+
+      %{^peer => %{^h => a}} ->
         st = if a.state == :requested, do: release(st, peer, h), else: st
-        %{st | ann: put_peer(st.ann, peer, Map.delete(m, h))}
+        # Completed before anything else looks at it: a request already
+        # released must not be counted again by ann_delete_hashes/2.
+        st = %{st | ann: ann_put(st.ann, peer, h, %{a | state: :completed})}
+        if only_uncompleted?(st, peer, h), do: ann_delete_hashes(st, [h]), else: st
+
+      _ ->
+        st
+    end
+  end
+
+  # Core IsOnlyNonCompleted: every other announcement of `h` is :completed.
+  defp only_uncompleted?(st, peer, h) do
+    st.ann_peers
+    |> Map.get(h, MapSet.new())
+    |> Enum.all?(fn p ->
+      p == peer or match?(%{^h => %{state: :completed}}, Map.get(st.ann, p, %{}))
+    end)
+  end
+
+  # Removes one announcement, whatever its state.
+  defp ann_erase(st, peer, h) do
+    case st.ann do
+      %{^peer => %{^h => _} = m} ->
+        peers = MapSet.delete(Map.get(st.ann_peers, h, MapSet.new()), peer)
+
+        %{
+          st
+          | ann: put_peer(st.ann, peer, Map.delete(m, h)),
+            ann_peers:
+              if(MapSet.size(peers) == 0,
+                do: Map.delete(st.ann_peers, h),
+                else: Map.put(st.ann_peers, h, peers)
+              )
+        }
 
       _ ->
         st
@@ -581,6 +628,7 @@ defmodule Exnode.P2P.TxRelay do
     %{
       st
       | ann: ann,
+        ann_peers: Map.drop(st.ann_peers, hs),
         in_flight: in_flight,
         requested: Map.drop(st.requested, hs),
         waiting: Map.drop(st.waiting, hs)
@@ -590,12 +638,14 @@ defmodule Exnode.P2P.TxRelay do
   defp put_peer(ann, peer, m) when map_size(m) == 0, do: Map.delete(ann, peer)
   defp put_peer(ann, peer, m), do: Map.put(ann, peer, m)
 
-  # Core DisconnectedPeer: its announcements go; requests it held free their hashes.
+  # Core DisconnectedPeer: each announcement is completed (a request it held
+  # frees its hash; the last uncompleted one of a hash forgets them all),
+  # then removed.
   defp drop_peer(st, peer) do
     st =
       Map.get(st.ann, peer, %{})
-      |> Enum.filter(fn {_, a} -> a.state == :requested end)
-      |> Enum.reduce(st, fn {h, _}, st -> release(st, peer, h) end)
+      |> Map.keys()
+      |> Enum.reduce(st, fn h, st -> st |> ann_complete(peer, h) |> ann_erase(peer, h) end)
 
     %{
       st
@@ -669,8 +719,9 @@ defmodule Exnode.P2P.TxRelay do
         st = %{st | expiry: expiry}
 
         case st.ann do
+          # Core: an expired REQUESTED announcement becomes COMPLETED.
           %{^peer => %{^h => %{state: :requested, seq: ^seq}}} ->
-            expire_requests(ann_delete_peer_hash(st, peer, h), now)
+            expire_requests(ann_complete(st, peer, h), now)
 
           _ ->
             expire_requests(st, now)
@@ -774,7 +825,7 @@ defmodule Exnode.P2P.TxRelay do
   # Core: ReceivedTx, then ProcessTransaction and MempoolAcceptedTx / MempoolRejectedTx.
   defp received_tx_impl(st, peer, tx) do
     # ReceivedResponse: the request is answered.
-    st = st |> ann_delete_peer_hash(peer, tx.txid) |> ann_delete_peer_hash(peer, tx.wtxid)
+    st = st |> ann_complete(peer, tx.txid) |> ann_complete(peer, tx.wtxid)
 
     cond do
       already_have?(st, {:wtxid, tx.wtxid}, false) ->

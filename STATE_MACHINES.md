@@ -292,19 +292,23 @@ ChainState accumulates `mempool_event`s each turn and sends `{:mempool_update, t
 
 ### 5.1 Announcement / request tracker
 
-This mirrors Core's TxRequestTracker, without a COMPLETED state. Per `(peer, hash)` the states are: candidate → (parked in `waiting[h]`) → requested → deleted.
+This mirrors Core's TxRequestTracker. Per `(peer, hash)` the states are: candidate → (parked in `waiting[h]`) → requested → completed → deleted. A completed entry stays so that the peer's re-announcement of `h` is a no-op (Core `ReceivedInv`); it counts towards the per-peer cap. Until AUD-A4-1 there was no completed state: a response deleted the entry, and a peer could re-announce at once.
 
 | From | Event | To |
 |---|---|---|
 | none | inv, not already had, under the per-peer cap | candidate (`ready_at` = now + delays) |
 | candidate | tick, ready, `h` requested elsewhere | parked in `waiting[h]` |
 | candidate | tick, best ready (preferred, then oldest) | requested; `in_flight[p]++`; expiry; getdata |
-| requested | tx / notfound / 60 s expiry / peer DOWN | deleted; `release` re-queues `waiting[h]` |
+| candidate / requested | tx / notfound / 60 s expiry (`ann_complete`, Core MakeCompleted) | **completed**; a request is released (`release` re-queues `waiting[h]`) (AUD-A4-1) |
+| completed | inv of `h` from the same peer | **unchanged** (AUD-A4-1) |
+| any | the last uncompleted entry of `h` completes | **every entry of `h` deleted** (Core IsOnlyNonCompleted) (AUD-A4-1) |
+| any | peer DOWN | completed, then deleted (Core DisconnectedPeer) |
 | any | tx accepted / orphaned / confirmed | `ann_delete_hashes` for every peer |
 
 Invariants:
 
 - At most one `requested` entry per hash.
+- **(AUD-A4-1)** `ann_peers[h]` is exactly the peers with an entry of `h`; no hash is kept with every entry completed.
 - `in_flight[p]` equals the number of `p`'s requested entries.
 - Stale tree entries are skipped by sequence number.
 
@@ -527,6 +531,7 @@ Severity reflects impact if the bug is reached.
 | AUD-B9-1 | Medium | fixed | An invalid block relayed by compact block got the relaying peer disconnected and discouraged; Core exempts it (BIP152) | `maybe_punish_for_block` had no `via_compact_block`: a rebuilt block failing `:consensus`/`:mutated` (synchronously or in a deferred `{:block_checked}`) and a cmpctblock header failing `:cached_invalid` punished the peer. Core announces to high-bandwidth peers from `NewPoWValidBlock`, before `ConnectBlock`, so honest Core peers relay PoW-valid invalid blocks: one such block (cheap on testnet4) disconnected and discouraged exnode's honest high-bandwidth outbound peers for 24 h, which helps an eclipse. Now Core's rule (`net_processing.cpp` `MaybePunishNodeForBlock`): via compact, `:consensus`, `:mutated` and `:cached_invalid` are not punished; invalid headers still are. Found in a static security review, 2026-11-17. | `p2p/compact_block_peer_test.exs` "an invalid block rebuilt from a compact block…", "a deferred verdict on a rebuilt block…", "a cached-invalid header via cmpctblock punishes neither…" (all three failed before the fix; the last one had asserted the divergence) |
 | AUD-A4-2 | Medium | fixed | Orphan reconsideration ran inline in TxRelay: relaying one parent stalled every peer's TxRelay calls for the sum of its orphan children's script checks | `reconsider_children` made one synchronous `Mempool.accept` per child of an accepted tx (and of a block's txs), recursively, inside the handler that accepted it. Attackers fill the orphanage within its caps with children built to fail late, then relay the parent: every peer blocks in its `:infinity` TxRelay call (inv, tx, notfound, getdata), and the blocks queued behind those calls wait. Measured: 200 children × 25 ms stalled another peer's `inv` 5.2 s. Now Core's work sets (`AddChildrenToWorkSet` to a random announcer, `ProcessOrphanTx` until one decisive orphan): drained by `:orphan_work` steps, round-robin over peers, behind the calls already queued (6 ms). A disconnecting peer's work goes with it. Found in a static security review, 2026-11-17. | `dos/orphan_reconsider_stall_test.exs` (the stall and disconnect tests failed before the fix) |
 | AUD-A2-1 | Medium | fixed | Peer-sent address times were stored unclamped: re-announcing known addresses with a future time made them terrible and evictable | Core `ProcessAddrs` clamps a time ≤ 100,000,000 or > now + 10 min to now − 5 days, drops addresses without NODE_NETWORK / NODE_NETWORK_LIMITED, discouraged ones, and unreachable networks; exnode passed them straight to `AddrMan.add`. `add_single`'s update branch then set a known entry's time (tried ones too) to 2³² − 2 h, so `terrible?` held: honest entries were overwritable by any new address in `place_new`, left out of `getaddr` answers, and never refreshed by honest sources, which helps an eclipse. Now `Peer.sanitize_addrs/2` applies Core's rules after the token bucket (`Connman.reject_discouraged/2` in one call). TorV3 from addrv2 is no longer stored (no onion proxy: not reachable). Found in a static security review, 2026-11-17. | `p2p/peer_addr_test.exs` "AUD-A2-1: …" (three tests) and the TorV3 test (all four failed before the fix) |
+| AUD-A4-1 | Medium | fixed | `notfound` (and a tx response or an expiry) deleted the peer's announcement, so re-announcing at once piled parked entries behind another peer's request | Core marks the announcement COMPLETED (`ReceivedResponse` → `MakeCompleted`), `ReceivedInv` from that peer is then a no-op, and a hash is forgotten once all its announcements are completed. exnode had no completed state: peer X holds requests unanswered; peer B announces the same hashes, gets parked behind X in `waiting`, sends notfound, re-announces; every round parked new entries while the old ones stayed until X's request ended (≤ 60 s), then all were re-inserted in one turn. Measured: 20 rounds × 100 hashes parked 2,000 entries (now 100). Now `ann_complete/3` with a by-hash peer index (`ann_peers`) for Core's IsOnlyNonCompleted; DOWN completes then erases. Found in a static security review, 2026-11-17. | `dos/notfound_churn_test.exs` (failed before the fix); `p2p/tx_relay_test.exs` property, its oracle moved to Core's rule, with the index and no-all-completed invariants (both fail with forgetting removed) |
 | MP-2 | Medium | fixed | A re-add judged against a chain view that is already ahead dropped valid children | A reorg spanning turns sends `[disconnected B]` while the view has B′ (containing P) connected. Re-adding P gives `txn-already-known`, and the error branch removed P's mempool children. | `mempool/maintenance_test.exs` "a re-add judged against a view…" |
 | BD-1 | Medium | fixed | A quarantined block was re-downloaded forever | `poison` deleted `{:held,h}` without invalidating the header, so `view_have_many` said "missing" and it was the earliest missing block (exempt from the byte budget). Every peer fetched 1–4 MB, got `:quarantined`, released it, and repeated. | `quarantine_test.exs` "a quarantined block counts as had…" |
 | SVC-1 | Medium | fixed | `GET /tx/:txid/outspends` answered 500 whenever address indexing was disabled | `node.ex` passed `scripthash_index: false`; `chain_spender` matched `idx != nil` and called `Scripthash.history(false, …)` → ArgumentError | `rest/disabled_index_test.exs` |
@@ -638,5 +643,7 @@ The fixed bugs are grouped by root cause, in priority order.
 23. **Orphans are reconsidered in steps (AUD-A4-2).** `TxRelay.add_children_to_work_set/2` queues children per announcer; `handle_info(:orphan_work)` runs `orphan_work_step/1`, one peer's work until a decisive answer, and reschedules itself behind the mailbox; `drop_orphan_work/2` on DOWN.
 
 24. **Peer addresses are sanitised before the address book (AUD-A2-1).** `Peer.sanitize_addrs/2`: services, reachable networks (`Connman.reachable_nets/0`), the time clamp, and `Connman.reject_discouraged/2`.
+
+25. **Request responses complete announcements (AUD-A4-1).** `TxRelay.ann_complete/3` (notfound, a received tx, expiry) and `drop_peer/2` follow Core's MakeCompleted / DisconnectedPeer, with `ann_peers` as the by-hash index.
 
 CS-7 was re-checked and is not reachable (see the register). No item of the register is open.
