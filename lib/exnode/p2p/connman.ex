@@ -121,6 +121,13 @@ defmodule Exnode.P2P.Connman do
   @doc "Whether a peer address (any form `Discouraged.key/1` takes) is discouraged now."
   def discouraged?(server, addr), do: GenServer.call(server, {:discouraged?, addr}, 5_000)
 
+  @doc "The addresses of `addrs` that are not discouraged now, in one call."
+  def reject_discouraged(server, addrs),
+    do: GenServer.call(server, {:reject_discouraged, addrs}, 5_000)
+
+  @doc "Networks we can connect to (Core g_reachable_nets: no proxy, so IPv4 and IPv6)."
+  def reachable_nets, do: @reachable_nets
+
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
@@ -239,6 +246,9 @@ defmodule Exnode.P2P.Connman do
 
   def handle_call({:discouraged?, addr}, _from, st),
     do: {:reply, disc?(st, Discouraged.key(addr)), st}
+
+  def handle_call({:reject_discouraged, addrs}, _from, st),
+    do: {:reply, Enum.reject(addrs, &disc?(st, Discouraged.key(&1))), st}
 
   @impl true
   def handle_info(:tick, st) do

@@ -825,6 +825,7 @@ defmodule Exnode.P2P.Peer do
       {rate, accepted, _limited} =
         Exnode.P2P.AddrRate.received(st.addr_rate, addrs, Exnode.Clock.mono(st.node[:clock]))
 
+      accepted = sanitize_addrs(st, accepted)
       src = st.target && AddrMan.key(target_addr(st))
       # Core: gossiped addresses get a 2 h time penalty (none for self-announcements).
       if accepted != [], do: AddrMan.add(st.node.addrman, accepted, src || :seed, 2 * 3600)
@@ -2133,6 +2134,38 @@ defmodule Exnode.P2P.Peer do
       nil -> :ok
       ms -> Process.send_after(self(), :tick, ms)
     end
+  end
+
+  # Core ProcessAddrs, for each address the token bucket let through
+  # (AUD-A2-1): only full nodes (NODE_NETWORK or NODE_NETWORK_LIMITED); a
+  # time before 1973 or more than 10 minutes ahead becomes 5 days ago (a
+  # future time would make the entry, even a tried one, terrible and
+  # evictable); not discouraged; only reachable networks are stored.
+  defp sanitize_addrs(_st, []), do: []
+
+  defp sanitize_addrs(st, addrs) do
+    now = now(st)
+    full = Message.service(:network) ||| Message.service(:network_limited)
+    reachable = Exnode.P2P.Connman.reachable_nets()
+
+    addrs
+    |> Enum.filter(&((&1.services &&& full) != 0 and &1.net in reachable))
+    |> Enum.map(fn a ->
+      if a.time <= 100_000_000 or a.time > now + 600,
+        do: %{a | time: now - 5 * 86_400},
+        else: a
+    end)
+    |> reject_discouraged(st.node[:connman])
+  end
+
+  defp reject_discouraged([], _connman), do: []
+  defp reject_discouraged(addrs, nil), do: addrs
+
+  # Connman restarting: the addresses still go in (they are only candidates).
+  defp reject_discouraged(addrs, connman) do
+    Exnode.P2P.Connman.reject_discouraged(connman, addrs)
+  catch
+    :exit, _ -> addrs
   end
 
   defp now(st), do: Exnode.Clock.now(st.node[:clock])
