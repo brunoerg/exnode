@@ -24,7 +24,8 @@ defmodule Exnode.Chain.GcSettingsTest do
   end
 
   test "a node's chain state has both floors, also after a crash restart", %{tmp_dir: dir} do
-    %{n: n} = TestNode.start(dir)
+    # TestNode lowers the heap floor; the node's own default here.
+    %{n: n} = TestNode.start(dir, chain_state_min_heap: State.default_min_heap_size())
     cs = GenServer.whereis(n.chain_state)
     g = gc(cs)
     assert g[:min_heap_size] >= State.default_min_heap_size()

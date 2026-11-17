@@ -23,7 +23,7 @@ defmodule Mix.Tasks.Exnode.Node do
   `DEFAULT_KERNEL_CACHE`), `--batch-blocks <n>` / `--batch-mib <MiB>` (commit
   batch limits, default 128 blocks / 64 MiB; larger values cut sync overhead
   during IBD at the cost of memory and crash replay), `--chain-state-heap-mib
-  <MiB>` (the chain state's minimum heap, default 16; during IBD its live
+  <MiB>` (the chain state's minimum heap, default 384; during IBD its live
   data is hundreds of MiB, and a larger floor means fewer collections).
 
   `--status-file` also writes the latest status as JSON (best header height

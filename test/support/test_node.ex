@@ -11,7 +11,11 @@ defmodule Exnode.Test.Node do
 
   `opts` go to `Exnode.Node` with these defaults: `chain: :regtest`, a
   unique `name`, and `connect: [{"127.0.0.1", 1}]` (manual mode with a
-  dead address: no outbound peers, no DNS or fixed seeds). `listen: 0`
+  dead address: no outbound peers, no DNS or fixed seeds), a 16 MiB
+  chain-state minimum heap (`chain_state_min_heap`; the node's 384 MiB
+  default, times the nodes of concurrent tests, would be gigabytes) and no
+  garbage collection probe (`gc_probe`: tracing and the system monitor are
+  VM-wide). `listen: 0`
   binds a free port, returned as `port`. The clock is a new one unless
   given (`:clock`): `Exnode.Clock.advance/2` it, then `Exnode.Node.tick/1`
   the node's name, instead of sleeping. The child id is the name, so
@@ -23,7 +27,16 @@ defmodule Exnode.Test.Node do
     clock = Keyword.get_lazy(opts, :clock, &Exnode.Clock.new/0)
 
     opts =
-      Keyword.merge([chain: :regtest, datadir: dir, connect: [{"127.0.0.1", 1}]], opts)
+      Keyword.merge(
+        [
+          chain: :regtest,
+          datadir: dir,
+          connect: [{"127.0.0.1", 1}],
+          chain_state_min_heap: 2_000_000,
+          gc_probe: false
+        ],
+        opts
+      )
       |> Keyword.merge(name: name, clock: clock)
 
     start_supervised!(Supervisor.child_spec({Exnode.Node, opts}, id: name))

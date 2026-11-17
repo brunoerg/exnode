@@ -194,13 +194,16 @@ defmodule Exnode.Chain.State do
   def default_batch_limits, do: {@batch_blocks, @batch_bytes}
 
   @doc """
-  The node's chain-state minimum heap (words, 16 MiB). The activation plan
+  The node's chain-state minimum heap (words, 384 MiB). The activation plan
   retains several decoded blocks, prefetch results and deltas; with the
   default heap the chain state spent 6.9 s of a 41 s full-script replay in
-  GC, 2.2 s with this. Not applied to chain states started
-  without `min_heap_size` (tests), so many can run at once.
+  GC, 2.2 s with 16 MiB. During mainnet IBD (around height 900k) its live
+  data is 200-700 MiB: with a 16 MiB floor it collected 72 minor and 22
+  major times per 30 s, 11.2 s in all; with 384 MiB, 30 and 4.5 times,
+  5.1 s (1 GiB did no better). Not applied to chain states started without
+  `min_heap_size` (tests), so many can run at once.
   """
-  def default_min_heap_size, do: 2_000_000
+  def default_min_heap_size, do: div(384 * 1024 * 1024, :erlang.system_info(:wordsize))
 
   @doc """
   The node's chain-state minimum binary virtual heap (words). The chain
