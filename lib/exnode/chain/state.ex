@@ -1307,6 +1307,11 @@ defmodule Exnode.Chain.State do
 
     cs_time(:epilogue, System.monotonic_time(:microsecond) - t1)
 
+    # Why the turn stopped to wait: the time until the next callback is
+    # charged to it (timed_cb/2).
+    if state == :waiting,
+      do: Process.put(:perf_wait, {wait_reason(st), System.monotonic_time(:microsecond)})
+
     st = note_turn(st, System.monotonic_time(:microsecond) - t0)
 
     case state do
@@ -1533,18 +1538,36 @@ defmodule Exnode.Chain.State do
     next = %{block: ids.block + 1, out: ids.out + nouts, inp: ids.inp + nins}
     owner = self()
     tag = {:apre, st.plan.gen, make_ref()}
-    reader = Archive.reader(st.a)
-    history = Map.get(item, :history)
-    %{spent: spent, delta: delta} = res
+    # Only what the preparation reads crosses to its process, since spawning
+    # copies it here: the raw block (an off-heap binary, shared, not copied;
+    # decoded there), the spent ids and the delta's created and spent coins.
+    # The txindex rows are read there, at this epoch (`kv_reader/1`).
+    reader = Archive.kv_reader(st.a)
+    body = if is_binary(block.raw), do: {:raw, block.raw}, else: {:decoded, block}
+    %{spent: spent, delta: %{created: created, spent: sp}} = res
+    delta = %{created: created, spent: sp}
     height = entry.height
     hook = st.test_archive_prep_hook
+    launched = System.monotonic_time(:microsecond)
 
     {_pid, mref} =
       spawn_monitor(fn ->
         result =
           try do
+            block =
+              case body do
+                {:raw, raw} -> elem(Block.decode_exact(raw), 1)
+                {:decoded, b} -> b
+              end
+
             if hook, do: hook.(block)
-            {:ok, Archive.prepare_append(block, height, spent, ids, delta, reader, history)}
+            p = Archive.prepare_append(block, height, spent, ids, delta, reader, nil)
+
+            {:ok,
+             Map.merge(p, %{
+               launched_at: launched,
+               worker_us: System.monotonic_time(:microsecond) - launched
+             })}
           catch
             kind, reason -> {:error, {kind, reason}}
           end
@@ -1582,6 +1605,8 @@ defmodule Exnode.Chain.State do
 
               case result do
                 {:ok, p} ->
+                  cs_time(:apre_latency, System.monotonic_time(:microsecond) - p.launched_at)
+                  cs_time(:apre_worker, p.worker_us)
                   {%{i | apre: {:done, p}}, p.prepare_us}
 
                 {:error, _} ->
@@ -1890,6 +1915,12 @@ defmodule Exnode.Chain.State do
 
   defp timed_cb(msg, fun) do
     t0 = System.monotonic_time(:microsecond)
+
+    case Process.delete(:perf_wait) do
+      {reason, since} -> cs_time({:wait, reason}, t0 - since)
+      nil -> :ok
+    end
+
     r = fun.()
     key = if is_tuple(msg) and tuple_size(msg) > 0, do: elem(msg, 0), else: msg
     key = if is_atom(key), do: key, else: :other
@@ -1910,6 +1941,33 @@ defmodule Exnode.Chain.State do
     Process.put(:perf_cs, Map.put(m, key, {n + 1, t + us}))
   end
 
+  # "<head>/<why>": the plan's head (`apre`: ready, its archive preparation
+  # running; else its state, or `empty`) and why nothing more was prepared
+  # (`prefetch`: the next block's prefetch result; `no_blocks`: none left
+  # to prepare; `full`: pipeline_depth or pipeline_bytes; `prep_busy`: the
+  # preparation worker).
+  defp wait_reason(%{plan: %{} = plan} = st) do
+    head =
+      case :queue.peek(plan.items) do
+        {:value, %{state: :ready, apre: {:pending, _, _}}} -> "apre"
+        {:value, %{state: s}} -> Atom.to_string(s)
+        :empty -> "empty"
+      end
+
+    why =
+      cond do
+        Map.has_key?(st, :pf_wait_since) -> "prefetch"
+        plan.todo == [] or plan.final -> "no_blocks"
+        not admitted?(st) -> "full"
+        not prep_free?(st) -> "prep_busy"
+        true -> "other"
+      end
+
+    String.to_atom(head <> "/" <> why)
+  end
+
+  defp wait_reason(_st), do: :no_plan
+
   # Busy and idle time, the turn's parts, and each message's time/count,
   # largest first.
   defp cs_line(m, window_us) do
@@ -1922,9 +1980,19 @@ defmodule Exnode.Chain.State do
       |> Enum.sort_by(&(-elem(&1, 2)))
       |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
 
+    waits =
+      for({{:wait, k}, {n, us}} <- m, do: {k, n, us})
+      |> Enum.sort_by(&(-elem(&1, 2)))
+      |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
+
+    {apre_n, apre_lat} = Map.get(m, :apre_latency, {0, 0})
+    {_, apre_work} = Map.get(m, :apre_worker, {0, 0})
+
     "chain-state: busy #{div(busy, 1000)}ms idle #{div(max(window_us - busy, 0), 1000)}ms " <>
       "(turn #{g.(:turn)}ms: prepare #{g.(:prepare)}ms retire #{g.(:retire)}ms " <>
-      "dispatch #{g.(:dispatch)}ms; epilogue #{g.(:epilogue)}ms; by message: #{calls})"
+      "dispatch #{g.(:dispatch)}ms; epilogue #{g.(:epilogue)}ms; by message: #{calls}; " <>
+      "waiting for: #{waits}; archive preparations #{apre_n}: " <>
+      "avg latency #{div(apre_lat, max(apre_n, 1) * 1000)}ms, avg work #{div(apre_work, max(apre_n, 1) * 1000)}ms)"
   end
 
   defp add_us(key, t0),

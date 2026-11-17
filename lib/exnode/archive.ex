@@ -274,6 +274,12 @@ defmodule Exnode.Archive do
       overwritten: a.overwritten
     }
 
+  @doc """
+  Only the store and the epoch of `a`: enough for `prepare_append/7` to read
+  committed txindex rows (and small to send to another process).
+  """
+  def kv_reader(%__MODULE__{kv: kv, epoch: e}), do: %__MODULE__{kv: kv, epoch: e}
+
   @doc "The committed-state epoch (see the struct): bumped by every commit and disconnect."
   def epoch(%__MODULE__{epoch: e}), do: e
 
