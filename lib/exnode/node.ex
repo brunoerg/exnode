@@ -10,7 +10,7 @@ defmodule Exnode.Node do
       ├─ ChainState
       ├─ Relay (rest_for_one): MempoolVerify (Task.Supervisor), Mempool, TxRelay
       ├─ P2P (rest_for_one): Book (AddrMan), SyncState, BlockDownload,
-       │    HighBandwidth, BlockServing, Conns (one_for_all): PeerSup, Connman; Listener (optional)
+       │    HighBandwidth, BlockServing, DecodeBudget, Conns (one_for_all): PeerSup, Connman; Listener (optional)
       └─ Services (one_for_one): BlockFilter, Scripthash, RPC, REST (optional)
 
   * The chain core (Headers, ChainState) is upstream of everything: if it
@@ -43,6 +43,8 @@ defmodule Exnode.Node do
     * `:listen`: port to accept inbound peers on (default: none); `0` binds
       a free port, reported by `listen_port/1`
     * `:max_outbound_full_relay`, `:max_block_relay`, `:max_connections`
+    * `:decode_budget_bytes`: payload bytes of large peer messages decoded and
+      handled at once, node-wide (default `Exnode.P2P.DecodeBudget.default_bytes/0`)
     * `:assume_valid`: block hash (display hex), `"0"` to verify every script, default: the chain's
     * `:shadow`: run the shadow validator (Core's engine) and compare every verdict (default false)
     * `:halt_on_divergence`: halt block connection on a shadow divergence (default true)
@@ -122,6 +124,7 @@ defmodule Exnode.Node do
       filter_index: Module.concat(prefix, FilterIndex),
       scripthash_index: Module.concat(prefix, ScripthashIndex),
       connman: Module.concat(prefix, Connman),
+      decode_budget: Module.concat(prefix, DecodeBudget),
       listener: Module.concat(prefix, Listener),
       relay_sup: Module.concat(prefix, RelaySup),
       p2p_sup: Module.concat(prefix, P2PSup),
@@ -267,6 +270,7 @@ defmodule Exnode.Node do
       tx_relay: n.tx_relay,
       mempool: n.mempool,
       high_bandwidth: n.high_bandwidth,
+      decode_budget: n.decode_budget,
       nonce: :rand.uniform(0xFFFFFFFFFFFFFFFF),
       # NODE_WITNESS, plus NODE_NETWORK (all blocks served), or
       # NODE_NETWORK_LIMITED with witness pruning.
@@ -450,6 +454,10 @@ defmodule Exnode.Node do
                clock: clock},
               {Exnode.P2P.HighBandwidth, name: n.high_bandwidth},
               {Exnode.P2P.BlockServing, name: n.block_serving},
+              {Exnode.P2P.DecodeBudget,
+               name: n.decode_budget,
+               bytes:
+                 Keyword.get(opts, :decode_budget_bytes, Exnode.P2P.DecodeBudget.default_bytes())},
               group(n.conns_sup, :one_for_all, [
                 {DynamicSupervisor, name: n.peer_sup, strategy: :one_for_one},
                 {Connman, connman_opts}
