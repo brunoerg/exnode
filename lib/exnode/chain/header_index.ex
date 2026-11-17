@@ -2,13 +2,17 @@ defmodule Exnode.Chain.HeaderIndex do
   @moduledoc """
   In-memory header tree (Core's `BlockMap` of `CBlockIndex`), backed by ETS.
 
-  Two tables:
+  Three tables:
   * `entries`: hash → `%Entry{}` for every accepted header, side chains included.
   * `heights`: height → hash along the best-header chain (`m_best_header`).
     This makes ancestor lookups and locators cheap; Core uses its skiplist.
+  * `meta`: the best header's entry (`best/1`).
 
   Writes come only from the owner process (`Exnode.Chain.Headers`). Reads
-  work from any process.
+  work from any process, and the struct itself never changes after `new/0`:
+  a handle taken once always reads the current index, including the best
+  header, without a call into the owner (which can be blocked, e.g. on a
+  KV write queued behind a chain-state commit).
 
   Coherence of `heights` for other processes: a best-header change rewrites
   the table back to the fork point, one height at a time, so a reader in
@@ -39,7 +43,7 @@ defmodule Exnode.Chain.HeaderIndex do
     ]
   end
 
-  defstruct [:entries, :heights, :best, :gen]
+  defstruct [:entries, :heights, :meta, :gen]
 
   @type t :: %__MODULE__{}
 
@@ -47,7 +51,8 @@ defmodule Exnode.Chain.HeaderIndex do
     %__MODULE__{
       entries: :ets.new(:header_entries, [:set, :protected, read_concurrency: true]),
       heights: :ets.new(:header_heights, [:set, :protected, read_concurrency: true]),
-      best: nil,
+      # The best header's entry, under the key :best (absent until genesis is inserted).
+      meta: :ets.new(:header_meta, [:set, :protected, read_concurrency: true]),
       # Rewrite generation of `heights` (seqlock: odd while rewriting).
       gen: :atomics.new(1, [])
     }
@@ -72,6 +77,18 @@ defmodule Exnode.Chain.HeaderIndex do
 
   def lookup(%__MODULE__{entries: t}, hash) do
     case :ets.lookup(t, hash) do
+      [{_, e}] -> e
+      [] -> nil
+    end
+  end
+
+  @doc """
+  The best header (Core `m_best_header`): the most-work entry that is not
+  failed, or nil before genesis is inserted. Read from ETS, so it is current
+  for every holder of the index.
+  """
+  def best(%__MODULE__{meta: t}) do
+    case :ets.lookup(t, :best) do
       [{_, e}] -> e
       [] -> nil
     end
@@ -103,8 +120,9 @@ defmodule Exnode.Chain.HeaderIndex do
   # Core: AddToBlockIndex; LoadBlockIndex (validation.cpp)
   def insert(%__MODULE__{} = idx, %Entry{} = e) do
     :ets.insert(idx.entries, {e.hash, e})
+    best = best(idx)
 
-    if idx.best == nil or (e.status != :failed and e.chain_work > idx.best.chain_work) do
+    if best == nil or (e.status != :failed and e.chain_work > best.chain_work) do
       set_best(idx, e)
     else
       idx
@@ -118,16 +136,21 @@ defmodule Exnode.Chain.HeaderIndex do
   end
 
   defp set_best(idx, e) do
-    old_best_height = if idx.best, do: idx.best.height, else: -1
+    old = best(idx)
+    old_best_height = if old, do: old.height, else: -1
     # Extending the best chain by one entry rewrites only its own height: a
     # reader of a lower height is unaffected, and one of this height reads
     # either nothing (not yet an ancestor of anything it holds) or the entry.
-    extending = idx.best != nil and e.prev_hash == idx.best.hash
+    extending = old != nil and e.prev_hash == old.hash
     unless extending, do: bump_gen(idx)
     rewrite_heights(idx, e)
     for h <- (e.height + 1)..old_best_height//1, do: :ets.delete(idx.heights, h)
+    # After the heights rewrite and inside the seqlock bracket: a reader that
+    # sees the new best and then the heights either gets them coherent or an
+    # odd/changed generation (ancestor/3 retries or walks parent links).
+    :ets.insert(idx.meta, {:best, e})
     unless extending, do: bump_gen(idx)
-    %{idx | best: e}
+    idx
   end
 
   defp bump_gen(%{gen: nil}), do: :ok
@@ -160,7 +183,9 @@ defmodule Exnode.Chain.HeaderIndex do
       e ->
         newly = set_failure_flags(idx, e)
 
-        if idx.best && ancestor_of?(idx, e, idx.best),
+        best = best(idx)
+
+        if best && ancestor_of?(idx, e, best),
           do: {recalculate_best(idx, fallback), newly},
           else: {idx, newly}
     end

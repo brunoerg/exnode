@@ -608,7 +608,7 @@ defmodule Exnode.Chain.State do
   defp maybe_commit(st) do
     {n, bytes} = Archive.batch_size(st.a)
     age = System.monotonic_time(:millisecond) - (Archive.batch_since(st.a) || 0)
-    best = Headers.index(st.headers).best
+    best = HeaderIndex.best(Headers.index(st.headers))
     tip = Archive.tip(st.a)
     caught_up = st.commit_at_tip and best.hash == tip.hash
 

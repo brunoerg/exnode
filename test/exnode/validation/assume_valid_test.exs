@@ -116,7 +116,7 @@ defmodule Exnode.Validation.AssumeValidTest do
     assert AssumeValid.decide(tip, idx, e.(10), @p) == :skip
 
     # Best header below nMinimumChainWork: always check.
-    p = %{@p | minimum_chain_work: idx.best.chain_work + 1}
+    p = %{@p | minimum_chain_work: HeaderIndex.best(idx).chain_work + 1}
 
     assert AssumeValid.decide(tip, idx, e.(10), p) ==
              {:check, "best header chainwork below minimumchainwork"}

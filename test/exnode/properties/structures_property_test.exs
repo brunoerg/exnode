@@ -312,12 +312,16 @@ defmodule Exnode.Properties.StructuresPropertyTest do
 
       # Best: most work; on a tie the first inserted (Core: strictly greater work).
       max_work = entries |> Enum.map(& &1.chain_work) |> Enum.max()
-      assert idx.best.hash == Enum.find(entries, &(&1.chain_work == max_work)).hash
+      assert HeaderIndex.best(idx).hash == Enum.find(entries, &(&1.chain_work == max_work)).hash
 
-      for h <- 0..idx.best.height,
-          do: assert(HeaderIndex.hash_at(idx, h) == naive_ancestor(by_hash, idx.best, h).hash)
+      for h <- 0..HeaderIndex.best(idx).height,
+          do:
+            assert(
+              HeaderIndex.hash_at(idx, h) ==
+                naive_ancestor(by_hash, HeaderIndex.best(idx), h).hash
+            )
 
-      assert HeaderIndex.hash_at(idx, idx.best.height + 1) == nil
+      assert HeaderIndex.hash_at(idx, HeaderIndex.best(idx).height + 1) == nil
 
       for {a, b, h} <- picks do
         ea = Enum.at(entries, rem(a, length(entries)))

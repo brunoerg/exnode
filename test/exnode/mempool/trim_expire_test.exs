@@ -152,7 +152,10 @@ defmodule Exnode.Mempool.TrimExpireTest do
             specs <- pool_spec(),
             frac <- integer(0..100),
             rolling <- member_of([0.0, 500.0, 5_000_000.0]),
-            max_runs: 2000
+            # 2000 runs took ~37-39 s alone on a fast machine (the reference
+            # linearizes every cluster) and passed the 60 s ExUnit timeout on
+            # CI runners alongside the rest of the suite.
+            max_runs: 500
           ) do
       pool = build(specs)
       limit = div(pool.total_usage * frac, 100)
