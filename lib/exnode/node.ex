@@ -53,7 +53,7 @@ defmodule Exnode.Node do
     * `:rest_port`: serve the Esplora REST API on this port (needs `:index_scripthash` for addresses)
     * `:cache_bytes`: coin cache budget (default 450 MiB, Core `DEFAULT_KERNEL_CACHE`)
     * `:chain_state_min_heap`: the chain state's minimum heap in words
-      (default `Exnode.Chain.State.default_min_heap_size/0`, 16 MiB)
+      (default `Exnode.Chain.State.default_min_heap_size/0`, 384 MiB)
     * `:chain_state_min_bin_vheap`: the chain state's minimum binary virtual
       heap in words (default `Exnode.Chain.State.default_min_bin_vheap_size/0`;
       `nil`: the VM default)
@@ -381,6 +381,7 @@ defmodule Exnode.Node do
                 ChainState.default_min_bin_vheap_size()
               ),
             listeners: [n.block_download],
+            gc_probe: Keyword.get(opts, :gc_probe, true),
             name: n.chain_state,
             params: params,
             headers: n.headers,

@@ -194,13 +194,16 @@ defmodule Exnode.Chain.State do
   def default_batch_limits, do: {@batch_blocks, @batch_bytes}
 
   @doc """
-  The node's chain-state minimum heap (words, 16 MiB). The activation plan
+  The node's chain-state minimum heap (words, 384 MiB). The activation plan
   retains several decoded blocks, prefetch results and deltas; with the
   default heap the chain state spent 6.9 s of a 41 s full-script replay in
-  GC, 2.2 s with this. Not applied to chain states started
-  without `min_heap_size` (tests), so many can run at once.
+  GC, 2.2 s with 16 MiB. During mainnet IBD (around height 900k) its live
+  data is 200-700 MiB: with a 16 MiB floor it collected 72 minor and 22
+  major times per 30 s, 11.2 s in all; with 384 MiB, 30 and 4.5 times,
+  5.1 s (1 GiB did no better). Not applied to chain states started without
+  `min_heap_size` (tests), so many can run at once.
   """
-  def default_min_heap_size, do: 2_000_000
+  def default_min_heap_size, do: div(384 * 1024 * 1024, :erlang.system_info(:wordsize))
 
   @doc """
   The node's chain-state minimum binary virtual heap (words). The chain
@@ -343,6 +346,8 @@ defmodule Exnode.Chain.State do
     # blocks (default_min_heap_size/0, default_min_bin_vheap_size/0).
     if n = opts[:min_heap_size], do: Process.flag(:min_heap_size, n)
     if n = opts[:min_bin_vheap_size], do: Process.flag(:min_bin_vheap_size, n)
+    # The perf line's garbage collection figures (node only: GcProbe).
+    if opts[:gc_probe], do: Process.put(:gc_probe, Exnode.Chain.GcProbe.start())
     p = Keyword.fetch!(opts, :params)
     headers = Keyword.fetch!(opts, :headers)
     kv = Keyword.fetch!(opts, :kv)
@@ -765,13 +770,15 @@ defmodule Exnode.Chain.State do
   end
 
   @impl true
-  def handle_call(:tip, _from, st), do: {:reply, Archive.tip(st.a), st}
-  def handle_call({:set_monitor, m}, _from, st), do: {:reply, :ok, %{st | monitor: m}}
+  def handle_call(msg, from, st), do: timed_cb(msg, fn -> do_handle_call(msg, from, st) end)
 
-  def handle_call(:script_stats, _from, st), do: {:reply, st.script_stats, st}
-  def handle_call(:prefetch_stats, _from, st), do: {:reply, st.pf_stats, st}
+  defp do_handle_call(:tip, _from, st), do: {:reply, Archive.tip(st.a), st}
+  defp do_handle_call({:set_monitor, m}, _from, st), do: {:reply, :ok, %{st | monitor: m}}
 
-  def handle_call(:work_stats, _from, st) do
+  defp do_handle_call(:script_stats, _from, st), do: {:reply, st.script_stats, st}
+  defp do_handle_call(:prefetch_stats, _from, st), do: {:reply, st.pf_stats, st}
+
+  defp do_handle_call(:work_stats, _from, st) do
     st = take_cs_work(st)
 
     {:reply,
@@ -783,7 +790,7 @@ defmodule Exnode.Chain.State do
      }, st}
   end
 
-  def handle_call(:debug, _from, st) do
+  defp do_handle_call(:debug, _from, st) do
     idx = Headers.index(st.headers)
     held = for h <- st.blocks, e = HeaderIndex.lookup(idx, h), do: {e.height, e.status}
 
@@ -799,7 +806,7 @@ defmodule Exnode.Chain.State do
   # each part of the state (`:erts_debug.size/1`, sharing within a part
   # counted once; parts may share), with the process's own heap figures.
   # Walks the whole state: never on a production path.
-  def handle_call(:debug_live, _from, st) do
+  defp do_handle_call(:debug_live, _from, st) do
     w = &:erts_debug.size/1
     a = st.a
     items = if st.plan, do: :queue.to_list(st.plan.items), else: []
@@ -833,24 +840,24 @@ defmodule Exnode.Chain.State do
     {:reply, Map.merge(parts, Map.new(info)), st}
   end
 
-  def handle_call({:have?, hash}, _from, st), do: {:reply, have?(st, hash), st}
+  defp do_handle_call({:have?, hash}, _from, st), do: {:reply, have?(st, hash), st}
 
-  def handle_call({:have_many, hashes}, _from, st),
+  defp do_handle_call({:have_many, hashes}, _from, st),
     do:
       {:reply,
        MapSet.new(Enum.filter(hashes, &(have?(st, &1) or MapSet.member?(st.poisoned, &1)))), st}
 
-  def handle_call({:with_archive, fun}, _from, st) do
+  defp do_handle_call({:with_archive, fun}, _from, st) do
     st = commit(st)
     {:reply, fun.(st.a), st}
   end
 
-  def handle_call({:peek_archive, fun}, _from, st), do: {:reply, fun.(st.a), st}
+  defp do_handle_call({:peek_archive, fun}, _from, st), do: {:reply, fun.(st.a), st}
 
-  def handle_call({:mempool_view, ops}, _from, st),
+  defp do_handle_call({:mempool_view, ops}, _from, st),
     do: {:reply, {Archive.tip(st.a), Archive.resolve_many(st.a, ops)}, st}
 
-  def handle_call({:precheck_block, header, requested}, _from, st) do
+  defp do_handle_call({:precheck_block, header, requested}, _from, st) do
     reply =
       case submission_entry(st, header, requested) do
         {:ok, _, _} -> :check
@@ -860,9 +867,9 @@ defmodule Exnode.Chain.State do
     {:reply, reply, st}
   end
 
-  def handle_call(:commit, _from, st), do: {:reply, :ok, st |> commit() |> flush_round()}
+  defp do_handle_call(:commit, _from, st), do: {:reply, :ok, st |> commit() |> flush_round()}
 
-  def handle_call({:submit, %Block{} = b, opts}, from, st) do
+  defp do_handle_call({:submit, %Block{} = b, opts}, from, st) do
     t0 = System.monotonic_time(:microsecond)
     {reply, st} = do_submit(st, b, opts)
 
@@ -912,20 +919,20 @@ defmodule Exnode.Chain.State do
     if reply == :connect, do: {:noreply, st}, else: {:reply, reply, st}
   end
 
-  def handle_call(:halted, _from, st), do: {:reply, st.halted, st}
+  defp do_handle_call(:halted, _from, st), do: {:reply, st.halted, st}
 
-  def handle_call(:clear_halt, _from, %{halted: false} = st), do: {:reply, :not_halted, st}
+  defp do_handle_call(:clear_halt, _from, %{halted: false} = st), do: {:reply, :not_halted, st}
 
-  def handle_call(:clear_halt, _from, st) do
+  defp do_handle_call(:clear_halt, _from, st) do
     :ok = Exnode.Store.KV.write(st.kv, [{:delete, :meta, @halt_key}], sync: true)
     :ets.insert(st.view, {:halted, false})
     Logger.warning("block connection halt cleared (was #{inspect(st.halted)})")
     {:reply, st.halted, queue_drive(%{st | halted: false, retarget: true})}
   end
 
-  def handle_call(:poisoned, _from, st), do: {:reply, MapSet.to_list(st.poisoned), st}
+  defp do_handle_call(:poisoned, _from, st), do: {:reply, MapSet.to_list(st.poisoned), st}
 
-  def handle_call({:reconsider_poisoned, which}, from, st) do
+  defp do_handle_call({:reconsider_poisoned, which}, from, st) do
     hashes =
       if which == :all,
         do: MapSet.to_list(st.poisoned),
@@ -966,36 +973,38 @@ defmodule Exnode.Chain.State do
   @impl true
   # One activation turn (coalesced); it queues the next only if it stopped
   # on a budget, never to wait for a completion.
-  def handle_info(:drive, st), do: {:noreply, drive(%{st | drive_queued: false})}
+  def handle_info(msg, st), do: timed_cb(msg, fn -> do_handle_info(msg, st) end)
 
-  def handle_info({:script_exec, tag, outcome, wstats}, st),
+  defp do_handle_info(:drive, st), do: {:noreply, drive(%{st | drive_queued: false})}
+
+  defp do_handle_info({:script_exec, tag, outcome, wstats}, st),
     do: {:noreply, script_result(st, tag, outcome, wstats)}
 
-  def handle_info({:prefetch_done, tag, result}, st),
+  defp do_handle_info({:prefetch_done, tag, result}, st),
     do: {:noreply, prefetch_result(st, tag, result)}
 
-  def handle_info({:prep_done, tag, result, wstats}, st),
+  defp do_handle_info({:prep_done, tag, result, wstats}, st),
     do: {:noreply, prep_result(st, tag, result, wstats)}
 
-  def handle_info({:archive_prep_done, tag, result}, st),
+  defp do_handle_info({:archive_prep_done, tag, result}, st),
     do: {:noreply, archive_prep_result(st, tag, result)}
 
-  def handle_info({:DOWN, mref, :process, _, reason}, %{prep_worker: {_, mref}} = st),
+  defp do_handle_info({:DOWN, mref, :process, _, reason}, %{prep_worker: {_, mref}} = st),
     do: {:noreply, prep_worker_down(st, reason)}
 
   # The private executor went: outstanding script work is lost.
-  def handle_info({:DOWN, mref, :process, _, reason}, %{exec_private: {_, mref}} = st),
+  defp do_handle_info({:DOWN, mref, :process, _, reason}, %{exec_private: {_, mref}} = st),
     do: {:stop, {:script_exec_down, reason}, st}
 
-  def handle_info({:DOWN, mref, :process, _, _} = down, st),
+  defp do_handle_info({:DOWN, mref, :process, _, _} = down, st),
     do: {:noreply, elem(handle_down(st, mref, down), 1)}
 
-  def handle_info(:commit_tick, st) do
+  defp do_handle_info(:commit_tick, st) do
     Process.send_after(self(), :commit_tick, @batch_ms)
     {:noreply, st |> maybe_commit() |> flush_round()}
   end
 
-  def handle_info({:EXIT, _pid, reason}, st) do
+  defp do_handle_info({:EXIT, _pid, reason}, st) do
     cond do
       reason in [:normal, :shutdown] -> {:noreply, st}
       match?({:shutdown, _}, reason) -> {:noreply, st}
@@ -1003,7 +1012,7 @@ defmodule Exnode.Chain.State do
     end
   end
 
-  def handle_info(_msg, st), do: {:noreply, st}
+  defp do_handle_info(_msg, st), do: {:noreply, st}
 
   # Commit what is connected (Core flushes on shutdown). Provisional items
   # are dropped (their pending copies remain for the next start); a private
@@ -1052,7 +1061,9 @@ defmodule Exnode.Chain.State do
   end
 
   @impl true
-  def handle_cast({:halt, reason}, %{halted: false} = st) do
+  def handle_cast(msg, st), do: timed_cb(msg, fn -> do_handle_cast(msg, st) end)
+
+  defp do_handle_cast({:halt, reason}, %{halted: false} = st) do
     Logger.error("block connection halted: #{inspect(reason)}")
     # Durable first (CS-2): a restart, with or without the shadow, must not
     # replay `pending` past the divergence. Cleared only by clear_halt/1 or
@@ -1072,7 +1083,7 @@ defmodule Exnode.Chain.State do
   end
 
   # Already halted: the first reason (and its mark) stands.
-  def handle_cast({:halt, _reason}, st),
+  defp do_handle_cast({:halt, _reason}, st),
     do:
       (
         ack_halt(st)
@@ -1293,9 +1304,22 @@ defmodule Exnode.Chain.State do
     t0 = System.monotonic_time(:microsecond)
     {st, state} = turn(Map.put(st, :turn_retired, 0))
     st = hwm(st, :turn_retired_max, st.turn_retired)
+    t1 = System.monotonic_time(:microsecond)
+    cs_time(:turn, t1 - t0)
 
     st =
       st |> maybe_commit() |> publish() |> publish_pipeline() |> flush_round() |> flush_mempool()
+
+    cs_time(:epilogue, System.monotonic_time(:microsecond) - t1)
+
+    # Why the turn stopped to wait: the time until the next callback is
+    # charged to it (timed_cb/2).
+    case state do
+      :waiting -> Process.put(:perf_wait, {wait_reason(st), System.monotonic_time(:microsecond)})
+      # Nothing left to connect: waiting for blocks to arrive.
+      :idle -> Process.put(:perf_wait, {:no_work, System.monotonic_time(:microsecond)})
+      :more -> :ok
+    end
 
     st = note_turn(st, System.monotonic_time(:microsecond) - t0)
 
@@ -1425,12 +1449,14 @@ defmodule Exnode.Chain.State do
   # The next action on the plan: retire the head if complete, else prepare
   # the next block if admitted and its data is in, else extend, else wait.
   defp step(st) do
+    t0 = System.monotonic_time(:microsecond)
     st = dispatch_archive_preps(st)
+    cs_time(:dispatch, System.monotonic_time(:microsecond) - t0)
 
     case :queue.peek(st.plan.items) do
       {:value, %{state: s} = head} when s in [:ready, :failed] ->
         case await_archive_prep(st, head) do
-          {:ok, st, head} -> retire(st, head)
+          {:ok, st, head} -> cs_timed(:retire, fn -> retire(st, head) end)
           :pending -> advance(st)
         end
 
@@ -1444,7 +1470,7 @@ defmodule Exnode.Chain.State do
 
     cond do
       plan.todo != [] and not plan.final and admitted?(st) and prep_free?(st) ->
-        case prepare_next(st) do
+        case cs_timed(:prepare, fn -> prepare_next(st) end) do
           {:wait, st} -> {:waiting, st}
           {:ok, st} -> {:prepared, st}
         end
@@ -1521,18 +1547,39 @@ defmodule Exnode.Chain.State do
     next = %{block: ids.block + 1, out: ids.out + nouts, inp: ids.inp + nins}
     owner = self()
     tag = {:apre, st.plan.gen, make_ref()}
-    reader = Archive.reader(st.a)
+    # Only what the preparation reads crosses to its process, since spawning
+    # copies it here: the raw block (an off-heap binary, shared, not copied;
+    # decoded there), the spent ids, the delta's created and spent coins,
+    # and the prefetched txindex rows (re-reading them there instead costs
+    # the store a block's worth of lookups again). Rows of another epoch
+    # are read there, at this epoch (`kv_reader/1`).
+    reader = Archive.kv_reader(st.a)
     history = Map.get(item, :history)
-    %{spent: spent, delta: delta} = res
+    body = if is_binary(block.raw), do: {:raw, block.raw}, else: {:decoded, block}
+    %{spent: spent, delta: %{created: created, spent: sp}} = res
+    delta = %{created: created, spent: sp}
     height = entry.height
     hook = st.test_archive_prep_hook
+    launched = System.monotonic_time(:microsecond)
 
     {_pid, mref} =
       spawn_monitor(fn ->
         result =
           try do
+            block =
+              case body do
+                {:raw, raw} -> elem(Block.decode_exact(raw), 1)
+                {:decoded, b} -> b
+              end
+
             if hook, do: hook.(block)
-            {:ok, Archive.prepare_append(block, height, spent, ids, delta, reader, history)}
+            p = Archive.prepare_append(block, height, spent, ids, delta, reader, history)
+
+            {:ok,
+             Map.merge(p, %{
+               launched_at: launched,
+               worker_us: System.monotonic_time(:microsecond) - launched
+             })}
           catch
             kind, reason -> {:error, {kind, reason}}
           end
@@ -1570,6 +1617,8 @@ defmodule Exnode.Chain.State do
 
               case result do
                 {:ok, p} ->
+                  cs_time(:apre_latency, System.monotonic_time(:microsecond) - p.launched_at)
+                  cs_time(:apre_worker, p.worker_us)
                   {%{i | apre: {:done, p}}, p.prepare_us}
 
                 {:error, _} ->
@@ -1771,6 +1820,7 @@ defmodule Exnode.Chain.State do
             tc = System.monotonic_time(:microsecond)
 
             with :ok <- unchecked_check_block(st, entry, block),
+                 _ <- add_us(:perf_checkblock_us, tc),
                  :ok <-
                    BlockRules.contextual_check_block(
                      block,
@@ -1831,14 +1881,27 @@ defmodule Exnode.Chain.State do
 
         validate_us = System.monotonic_time(:microsecond) - t0
 
-        st =
-          update_pstats(st, %{
-            prep_rules_us: Process.delete(:perf_rules_us) || 0,
-            prep_connect_us: Process.delete(:perf_connect_us) || 0,
-            prep_populate_us: Process.delete(:perf_populate_us) || 0,
-            prep_context_us: Process.delete(:perf_context_us) || 0,
-            prep_check_us: Process.delete(:perf_check_us) || 0
+        split = %{
+          prep_rules_us: Process.delete(:perf_rules_us) || 0,
+          prep_connect_us: Process.delete(:perf_connect_us) || 0,
+          prep_populate_us: Process.delete(:perf_populate_us) || 0,
+          prep_context_us: Process.delete(:perf_context_us) || 0,
+          prep_check_us: Process.delete(:perf_check_us) || 0
+        }
+
+        # The perf line's validation split, per window (see perf/4).
+        checkblock = Process.delete(:perf_checkblock_us) || 0
+
+        Process.put(
+          :perf_vwin,
+          add_counts(Process.get(:perf_vwin) || %{}, %{
+            checkblock: checkblock,
+            contextual: max(split.prep_rules_us - checkblock, 0),
+            connect: split.prep_connect_us
           })
+        )
+
+        st = update_pstats(st, split)
 
         case result do
           {:ok, res} ->
@@ -1855,6 +1918,134 @@ defmodule Exnode.Chain.State do
         end
     end
   end
+
+  # --- chain-state time accounting (the perf line's `chain-state:` part) ---
+  #
+  # Per window: the time in each callback, by message (a call by its
+  # request, an info by its message), and within `:drive` the turn's parts.
+  # What no callback took is idle. Each gap between two callbacks is split
+  # by the mailbox when the first one ended: empty, the process waited for
+  # the message that ends the gap (`{:gap_for, key}`); not empty, it had
+  # work but did not run (`{:gap, :queued}`: descheduled, collecting
+  # garbage, or the gen_server's own receive).
+
+  defp timed_cb(msg, fun) do
+    t0 = System.monotonic_time(:microsecond)
+    key = if is_tuple(msg) and tuple_size(msg) > 0, do: elem(msg, 0), else: msg
+    key = if is_atom(key), do: key, else: :other
+
+    case Process.delete(:perf_wait) do
+      {reason, since} -> cs_time({:wait, reason}, t0 - since)
+      nil -> :ok
+    end
+
+    case Process.delete(:perf_cb_end) do
+      {te, true} -> cs_time({:gap, :queued}, t0 - te)
+      {te, false} -> cs_time({:gap_for, key}, t0 - te)
+      nil -> :ok
+    end
+
+    r = fun.()
+    t1 = System.monotonic_time(:microsecond)
+    cs_time({:cb, key}, t1 - t0)
+    {:message_queue_len, q} = Process.info(self(), :message_queue_len)
+    Process.put(:perf_cb_end, {t1, q > 0})
+    r
+  end
+
+  defp cs_timed(key, fun) do
+    t0 = System.monotonic_time(:microsecond)
+    r = fun.()
+    cs_time(key, System.monotonic_time(:microsecond) - t0)
+    r
+  end
+
+  defp cs_time(key, us) do
+    m = Process.get(:perf_cs) || %{}
+    {n, t} = Map.get(m, key, {0, 0})
+    Process.put(:perf_cs, Map.put(m, key, {n + 1, t + us}))
+  end
+
+  # "<head>/<why>": the plan's head (`apre`: ready, its archive preparation
+  # running; else its state, or `empty`) and why nothing more was prepared
+  # (`prefetch`: the next block's prefetch result; `no_blocks`: none left
+  # to prepare; `full`: pipeline_depth or pipeline_bytes; `prep_busy`: the
+  # preparation worker).
+  defp wait_reason(%{plan: %{} = plan} = st) do
+    head =
+      case :queue.peek(plan.items) do
+        {:value, %{state: :ready, apre: {:pending, _, _}}} -> "apre"
+        {:value, %{state: s}} -> Atom.to_string(s)
+        :empty -> "empty"
+      end
+
+    why =
+      cond do
+        Map.has_key?(st, :pf_wait_since) -> "prefetch"
+        plan.todo == [] or plan.final -> "no_blocks"
+        not admitted?(st) -> "full"
+        not prep_free?(st) -> "prep_busy"
+        true -> "other"
+      end
+
+    String.to_atom(head <> "/" <> why)
+  end
+
+  defp wait_reason(_st), do: :no_plan
+
+  # Busy and idle time, the turn's parts, and each message's time/count,
+  # largest first.
+  defp cs_line(m, window_us) do
+    cbs = for {{:cb, k}, {n, us}} <- m, do: {k, n, us}
+    busy = Enum.reduce(cbs, 0, fn {_, _, us}, acc -> acc + us end)
+    g = fn k -> m |> Map.get(k, {0, 0}) |> elem(1) |> div(1000) end
+
+    calls =
+      cbs
+      |> Enum.sort_by(&(-elem(&1, 2)))
+      |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
+
+    waits =
+      for({{:wait, k}, {n, us}} <- m, do: {k, n, us})
+      |> Enum.sort_by(&(-elem(&1, 2)))
+      |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
+
+    gaps_for =
+      for({{:gap_for, k}, {n, us}} <- m, do: {k, n, us})
+      |> Enum.sort_by(&(-elem(&1, 2)))
+      |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
+
+    {queued_n, queued_us} = Map.get(m, {:gap, :queued}, {0, 0})
+    {apre_n, apre_lat} = Map.get(m, :apre_latency, {0, 0})
+    {_, apre_work} = Map.get(m, :apre_worker, {0, 0})
+
+    "chain-state: busy #{div(busy, 1000)}ms idle #{div(max(window_us - busy, 0), 1000)}ms " <>
+      "(turn #{g.(:turn)}ms: prepare #{g.(:prepare)}ms retire #{g.(:retire)}ms " <>
+      "dispatch #{g.(:dispatch)}ms; epilogue #{g.(:epilogue)}ms; by message: #{calls}; " <>
+      "waiting for: #{waits}; archive preparations #{apre_n}: " <>
+      "avg latency #{div(apre_lat, max(apre_n, 1) * 1000)}ms, avg work #{div(apre_work, max(apre_n, 1) * 1000)}ms; " <>
+      "gaps: with messages queued #{div(queued_us, 1000)}ms/#{queued_n}, mailbox empty, until: #{gaps_for})" <>
+      gc_line()
+  end
+
+  defp gc_line do
+    case Process.get(:gc_probe) do
+      nil ->
+        ""
+
+      probe ->
+        g = Exnode.Chain.GcProbe.take(probe)
+
+        "; gc: minor #{g.minor_n}x #{div(g.minor_us, 1000)}ms major #{g.major_n}x " <>
+          "#{div(g.major_us, 1000)}ms heap max #{div(g.heap_max_words * 8, 1024 * 1024)}MiB; " <>
+          "long schedules: chain-state #{g.own_sched_n}x #{g.own_sched_ms}ms " <>
+          "others #{g.sched_n}x #{g.sched_ms}ms; " <>
+          "run queue now #{:erlang.statistics(:total_run_queue_lengths_all)}"
+    end
+  end
+
+  defp add_us(key, t0),
+    do: Process.put(key, (Process.get(key) || 0) + System.monotonic_time(:microsecond) - t0)
 
   # CheckBlock unless done at submission (fChecked). A local error there (a
   # kernel API failure on signet's challenge) is a crash, not a verdict.
@@ -2874,6 +3065,7 @@ defmodule Exnode.Chain.State do
       c = Map.get(st, :cs_window, %{})
       w = st.pf_window
       g = fn m, k -> Map.get(m, k, 0) end
+      v = Map.merge(Process.delete(:perf_vwin) || %{}, Exnode.Validation.Connect.take_split())
 
       # `archive append` is Archive.connect only; commits (segment fsync, KV
       # batch) are timed separately. Worker busy time is summed over
@@ -2893,7 +3085,11 @@ defmodule Exnode.Chain.State do
           "txindex #{ms(g.(c, :append_txindex_us))}ms (reads #{g.(c, :txindex_reads)}, read #{ms(g.(c, :txindex_read_us))}ms, " <>
           "hint stale #{g.(c, :txindex_hint_stale)}) overwritten #{ms(g.(c, :append_overwritten_us))}ms " <>
           "record #{ms(g.(c, :append_record_us))}ms overlay #{ms(g.(c, :connect_overlay_us))}ms " <>
-          "(spent #{ms(g.(c, :ov_spent_us))}ms created #{ms(g.(c, :ov_created_us))}ms) chain #{ms(g.(c, :connect_chain_us))}ms"
+          "(spent #{ms(g.(c, :ov_spent_us))}ms created #{ms(g.(c, :ov_created_us))}ms) chain #{ms(g.(c, :connect_chain_us))}ms; " <>
+          "validation: check_block #{ms(g.(v, :checkblock))}ms contextual #{ms(g.(v, :contextual))}ms " <>
+          "connect #{ms(g.(v, :connect))}ms (resolve #{ms(p.resolve)}ms, loop #{ms(g.(v, :txloop))}ms ages #{ms(g.(v, :ages))}ms " <>
+          "finish #{ms(g.(v, :finish))}ms); " <>
+          cs_line(Process.delete(:perf_cs) || %{}, round(secs * 1_000_000))
       )
 
       %{st | pf_stats: %{used: 0, stale: 0, none: 0}, pf_window: %{}}
