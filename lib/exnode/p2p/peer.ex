@@ -29,6 +29,7 @@ defmodule Exnode.P2P.Peer do
   alias Exnode.Codec.Block
   alias Exnode.Consensus.Pow
   alias Exnode.P2P.{AddrMan, BlockDownload, Frame, FrameBuffer, HeadersSync, Message, SyncState}
+  alias Exnode.P2P.DecodeBudget
   alias Exnode.P2P.V2.Transport
 
   # net.cpp m_peer_connect_timeout default (DEFAULT_PEER_CONNECT_TIMEOUT)
@@ -463,7 +464,19 @@ defmodule Exnode.P2P.Peer do
     end
   end
 
+  # A large message is decoded and handled holding its size from the
+  # node-wide DecodeBudget (AUD-A1-1): decoded terms are several times their
+  # wire size, and Core decodes one message at a time on one thread.
   defp process_message(st, cmd, payload) do
+    case DecodeBudget.with_budget(st.node[:decode_budget], byte_size(payload), fn ->
+           decode_and_handle(st, cmd, payload)
+         end) do
+      :unavailable -> {:stop, {:shutdown, :decode_budget_unavailable}, st}
+      result -> result
+    end
+  end
+
+  defp decode_and_handle(st, cmd, payload) do
     st = trace(st, {:in, cmd})
 
     case Message.decode(cmd, payload) do

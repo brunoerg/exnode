@@ -60,11 +60,18 @@ defmodule Exnode.Codec.CompactSize do
 
   @doc "Decodes a CompactSize-prefixed byte vector, returning `{bytes, rest}` (bytes is a sub-binary)."
   def decode_bytes(bin) do
-    {len, rest} = decode(bin)
+    case decode(bin) do
+      # The empty vector is the shared literal: no heap per item. A witness
+      # stack of millions of empty items (AUD-A1-1) otherwise cost a fresh
+      # binary each, ~45 B of heap per wire byte.
+      {0, rest} ->
+        {<<>>, rest}
 
-    case rest do
-      <<bytes::binary-size(len), rest2::binary>> -> {bytes, rest2}
-      _ -> throw({:codec_error, :truncated})
+      {len, rest} ->
+        case rest do
+          <<bytes::binary-size(len), rest2::binary>> -> {bytes, rest2}
+          _ -> throw({:codec_error, :truncated})
+        end
     end
   end
 

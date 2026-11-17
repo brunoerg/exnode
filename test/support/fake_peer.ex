@@ -70,6 +70,7 @@ defmodule Exnode.Test.FakePeer do
           sync: n.sync,
           chain_state: n.chain_state,
           block_serving: n[:block_serving],
+          decode_budget: n[:decode_budget],
           nonce: 1,
           services: 9,
           user_agent: "/t/"
