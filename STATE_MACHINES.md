@@ -70,7 +70,7 @@ Block states:
 | header-only | `do_submit` | contextual check fails | failed | `Headers.invalidate` |
 | header-only | `do_submit` | quarantined | refused | `{:error,{:quarantined,_}}`; never validated |
 | held / disconnected | `new_plan` / `extend_plan` | path available, not failed, not quarantined | provisional | `add_item` |
-| provisional | head ready, `retire` | — | active-uncommitted | `Archive.connect`, view tip, mempool and listener events |
+| provisional | head ready, `retire` | its archive preparation is not running | active-uncommitted | `Archive.connect` (with the prepared records if their ids still match), view tip, mempool and listener events |
 | provisional | head `{:error}` / `{:invalid}` | — | failed | `cancel_plan`, `commit`, invalidate (descendants too), unhold |
 | provisional | head `{:crash}` / `{:local}` | — | quarantined | `commit`, `poison` (fsynced mark, crash report, view marker) |
 | active-uncommitted | `commit` (batch full, age, at tip, halt, fail, quarantine, disconnect, `with_archive`, `terminate`) | — | committed | `Archive.flush`, `pending` deletes in the same KV batch, `:held` removed |
@@ -81,7 +81,7 @@ Invariants:
 
 - **CS-I1.** Only the head of the plan's FIFO retires. A failure makes the plan final.
 - **CS-I2.** A reorg (`disconnect_to`) happens only in `new_plan`, so only while there is no plan. Speculative results never survive a base change.
-- **CS-I3.** Script results carry `{:blk, gen, ref, i}` and preparation results carry `{:prep, gen, ref}`. Both are matched against the live plan generation and item ref; stale results are dropped.
+- **CS-I3.** Script results carry `{:blk, gen, ref, i}`, preparation results carry `{:prep, gen, ref}` and archive preparation results carry `{:apre, gen, ref}`. All are matched against the live plan generation and item; stale results are dropped.
 - **CS-I4.** For download selection, a block counts as "had" if it is held, archived **or quarantined**. See BD-1.
 - **CS-I5 (fixed by CS-1).** `terminate/2` commits only an archive struct whose epoch equals the epoch of this process's last durable write (`note_durable/1`, `durable_current?/1`).
 - **CS-I6b (fixed by CS-8).** `find_target` ranks candidates and the tip with one key, Core's `CBlockIndexWorkComparator`: more work, then the earlier activatable body (sequence id), then the hash. A candidate ranked above the tip qualifies even at equal work.
@@ -94,6 +94,7 @@ Invariants:
   - `:waiting`: a completion message is due.
   - `:idle`: the waiters are answered.
 - **Item states:** `:preparing` → `:scripts` → `:ready` / `:failed`.
+- **Archive preparation (per item, alongside its state):** `nil` → `{:pending, tag, mref}` (started once the item has its result and the ids before it are known) → `{:done, prepared}`, or `:none` if it failed or its process died. A `:ready` head retires only once this is not pending; `:none` and a stale id guess both mean the block is archived in place, with the same result.
 - **Halt:** while `halted != false`, every turn cancels the plan and returns `:idle`.
 
 ### 2.2.1 Halt (durable, CS-2)
