@@ -954,6 +954,8 @@ defmodule Exnode.Archive do
     :append_record_us,
     :append_ops,
     :append_repeated,
+    :append_prepared,
+    :append_prepared_mismatch,
     :txindex_reads,
     :txindex_read_us,
     :txindex_found,
@@ -1004,6 +1006,10 @@ defmodule Exnode.Archive do
     `append_record_us` splits into `append_tx_ops_us` (txindex value
     encoding), `append_spend_ops_us`, `append_ops_list_us` (block record
     encoding, op list) and `append_batch_us` (batch maps).
+  * `prepare_append/7` results passed to `connect/5`: `append_prepared`
+    (used), `append_prepared_mismatch` (ids or block no longer matched:
+    encoded in place). With one used, `append_encode_us` is only the
+    remaining check and the encoding cost was paid by the preparing process.
   * `connect/5` (whole: `connect_us`): `connect_lookup_us` (is the block
     archived), the append above, `connect_overlay_us` (`Overlay.apply_block`;
     the overlay's own `ov_*` counters split it) and `connect_chain_us`
@@ -1238,6 +1244,10 @@ defmodule Exnode.Archive do
     commit or disconnect since: the committed rows are those rows) and for
     txids the batch has no list for (the batch's is newer). Anything else
     is read from the store as without it.
+  * `prepared:` a `prepare_append/7` result built from this block, `spent`
+    and `delta`: used for a new block when its ids are `next_ids/1` (else
+    ignored, the block is encoded here); its `:history`, if any, replaces
+    `history:`. The result is the same either way.
 
   New blocks are archived (segments, KV entries). Blocks archived before
   (disconnected by a reorg) only get their spend records and the tip
@@ -1248,10 +1258,25 @@ defmodule Exnode.Archive do
     known = block_id(a, block.header.hash)
     count(:connect_lookup_us, System.monotonic_time(:microsecond) - t0)
 
+    prepared =
+      case {known, opts[:prepared]} do
+        {nil, %{} = p} ->
+          p = usable_prepared(a, block, height, p)
+          count(if(p, do: :append_prepared, else: :append_prepared_mismatch), 1)
+          p
+
+        _ ->
+          nil
+      end
+
     {a, id} =
       case known do
         nil ->
-          append(a, block, height, spent, index_txs: true, history: opts[:history])
+          append(a, block, height, spent,
+            index_txs: true,
+            history: opts[:history],
+            prepared: prepared
+          )
 
         id ->
           # Core AddCoins adds these outputs anew. Any earlier destruction
@@ -1281,7 +1306,13 @@ defmodule Exnode.Archive do
     a =
       case opts[:delta] do
         %{created: created, spent: sp} ->
-          %{a | overlay: Overlay.apply_block(a.overlay, id, created, sp)}
+          case prepared do
+            %{overlay: %{gen: ^id} = rows} ->
+              %{a | overlay: Overlay.apply_prepared(a.overlay, rows)}
+
+            _ ->
+              %{a | overlay: Overlay.apply_block(a.overlay, id, created, sp)}
+          end
 
         nil ->
           # Uncommitted spends must stay masked, so batching needs the delta.
@@ -1450,12 +1481,72 @@ defmodule Exnode.Archive do
     %{a | batch: b}
   end
 
-  defp append(a, %Block{} = block, height, spent, opts) do
-    id = a.next.block
-    base_out = a.next.out
-    base_in = a.next.inp
-    t0 = System.monotonic_time(:microsecond)
+  @doc """
+  The part of archiving a new block that depends only on the block, its
+  `spent` output ids, its ids (`%{block: id, out: base_out, inp: base_in}`,
+  as `next_ids/1` will return just before it is connected) and, optionally,
+  its connect `delta`: segment records and their layout, tx metadata, the
+  block's own txindex occurrences, its spend records and its overlay rows.
+  Pure (no archive state), so a process other than the owner may build it
+  while the owner works on something else; `connect/5` takes it as
+  `:prepared` and uses it only if the ids still match (otherwise the block
+  is encoded again in place), so it never changes what is archived.
 
+  `reader` (`reader/1`) with `history` (see `connect/5`): when `history` is
+  not of the reader's epoch, the block's committed txindex rows are read
+  anew, at the reader's epoch, and returned as `:history`.
+  """
+  def prepare_append(
+        %Block{} = block,
+        height,
+        spent,
+        ids,
+        delta \\ nil,
+        reader \\ nil,
+        history \\ nil
+      ) do
+    t0 = System.monotonic_time(:microsecond)
+    p = encode_append(block, height, spent, ids)
+
+    p =
+      case delta do
+        %{created: created, spent: sp} ->
+          Map.put(p, :overlay, Overlay.prepare_block(ids.block, created, sp))
+
+        nil ->
+          p
+      end
+
+    p =
+      case {reader, history} do
+        {nil, _} ->
+          Map.put(p, :history, history)
+
+        {%__MODULE__{epoch: e}, %{epoch: e}} ->
+          Map.put(p, :history, history)
+
+        {r, _} ->
+          txids = Map.keys(p.own)
+          rows = Map.new(Enum.zip(txids, KV.multi_get(r.kv, :txindex, txids)))
+          Map.put(p, :history, %{epoch: r.epoch, rows: rows})
+      end
+
+    # Records as one binary each: sent between processes by reference.
+    segs =
+      Map.new(p.segs, fn {k, {recs, rel, total}} ->
+        {k, {IO.iodata_to_binary(recs), rel, total}}
+      end)
+
+    Map.merge(p, %{segs: segs, prepare_us: System.monotonic_time(:microsecond) - t0})
+  end
+
+  # Encoding shared by both paths of append/5.
+  defp encode_append(
+         %Block{} = block,
+         height,
+         spent,
+         %{block: id, out: base_out, inp: base_in} = ids
+       ) do
     out_recs =
       for tx <- block.txs,
           o <- tx.outputs,
@@ -1472,23 +1563,6 @@ defmodule Exnode.Archive do
           ]
 
     wit_recs = for tx <- block.txs, i <- tx.inputs, do: Tx.encode_witness(i.witness)
-    t1 = System.monotonic_time(:microsecond)
-
-    {segs, locs, firsts} =
-      Enum.reduce(
-        [outputs: {out_recs, base_out}, inputs: {in_recs, base_in}, witness: {wit_recs, base_in}],
-        {a.segs, [], %{}},
-        fn {kind, {recs, base}}, {segs, ops, firsts} ->
-          {s, first, sparse} = Segments.append_sparse(segs[kind], recs, base, @sparse)
-          {Map.put(segs, kind, s), ops ++ sparse_ops(kind, sparse), Map.put(firsts, kind, first)}
-        end
-      )
-
-    # Every block has a coinbase input, so it has witness records, all in one
-    # segment. Its exact start is kept: with pruning, the sparse-index entry of
-    # its first id may point into a deleted segment.
-    {wseg, _} = wloc = firsts.witness
-    a = %{a | wseg_max: Map.update(a.wseg_max, wseg, height, &max(&1, height))}
 
     {tx_meta, {_, _}} =
       Enum.map_reduce(block.txs, {base_out, base_in}, fn tx, {o, i} ->
@@ -1496,12 +1570,59 @@ defmodule Exnode.Archive do
          {o + length(tx.outputs), i + length(tx.inputs)}}
       end)
 
+    %{
+      ids: ids,
+      hash: block.header.hash,
+      height: height,
+      segs: %{
+        outputs: Segments.layout(out_recs, base_out, @sparse),
+        inputs: Segments.layout(in_recs, base_in, @sparse),
+        witness: Segments.layout(wit_recs, base_in, @sparse)
+      },
+      nouts: length(out_recs),
+      nins: length(in_recs),
+      tx_meta: tx_meta,
+      own: own_txindex(id, block, base_out, base_in),
+      spend: if(spent, do: spend_ops(id, base_in, block, spent), else: [])
+    }
+  end
+
+  # A `prepare_append/7` result for this exact block, height and ids.
+  defp usable_prepared(a, block, height, %{ids: ids, hash: hash, height: height} = p) do
+    if ids == a.next and hash == block.header.hash, do: p
+  end
+
+  defp usable_prepared(_a, _block, _height, _p), do: nil
+
+  defp append(a, %Block{} = block, height, spent, opts) do
+    t0 = System.monotonic_time(:microsecond)
+
+    # connect/5 passes :prepared only when it matches this block and a.next.
+    p = opts[:prepared] || encode_append(block, height, spent, a.next)
+
+    %{block: id, out: base_out, inp: base_in} = p.ids
+    t1 = System.monotonic_time(:microsecond)
+
+    {segs, locs, firsts} =
+      Enum.reduce([:outputs, :inputs, :witness], {a.segs, [], %{}}, fn kind,
+                                                                       {segs, ops, firsts} ->
+        {s, first, sparse} = Segments.append_layout(segs[kind], p.segs[kind])
+        {Map.put(segs, kind, s), ops ++ sparse_ops(kind, sparse), Map.put(firsts, kind, first)}
+      end)
+
+    # Every block has a coinbase input, so it has witness records, all in one
+    # segment. Its exact start is kept: with pruning, the sparse-index entry of
+    # its first id may point into a deleted segment.
+    {wseg, _} = wloc = firsts.witness
+    a = %{a | wseg_max: Map.update(a.wseg_max, wseg, height, &max(&1, height))}
+    tx_meta = p.tx_meta
     prev_id = if height == 0, do: nil, else: a.tip.id
     t2 = System.monotonic_time(:microsecond)
+    history = if Map.has_key?(p, :history), do: p.history, else: opts[:history]
 
     txindex =
       if opts[:index_txs],
-        do: txindex_lists(a, id, block, base_out, base_in, opts[:history]),
+        do: txindex_lists(a, p.own, history),
         else: %{}
 
     repeated =
@@ -1544,12 +1665,9 @@ defmodule Exnode.Archive do
       end
 
     t4a = System.monotonic_time(:microsecond)
-    spend = if spent, do: spend_ops(id, base_in, block, spent), else: []
+    spend = p.spend
     t4b = System.monotonic_time(:microsecond)
-
-    nouts = length(out_recs)
-    nins = length(in_recs)
-    a = %{a | segs: segs, next: %{block: id + 1, out: base_out + nouts, inp: base_in + nins}}
+    a = %{a | segs: segs, next: %{block: id + 1, out: base_out + p.nouts, inp: base_in + p.nins}}
 
     ops =
       [
@@ -1594,7 +1712,9 @@ defmodule Exnode.Archive do
   # (see connect/5) when its epoch is current, then one multi_get. The
   # block's own occurrences are collected in one pass (a txid twice in the
   # block keeps both, in order) and appended to the existing list.
-  defp txindex_lists(a, id, block, base_out, base_in, history) do
+  # The block's own occurrences, `txid => [entry]` newest first (a txid
+  # twice in the block keeps both).
+  defp own_txindex(id, block, base_out, base_in) do
     {own, _, _, _} =
       Enum.reduce(block.txs, {%{}, 0, base_out, base_in}, fn tx, {m, pos, o, i} ->
         no = length(tx.outputs)
@@ -1610,6 +1730,10 @@ defmodule Exnode.Archive do
         {m, pos + 1, o + no, i + length(tx.inputs)}
       end)
 
+    own
+  end
+
+  defp txindex_lists(a, own, history) do
     batch = a.batch.txindex
     missing = for {t, _} <- own, not is_map_key(batch, t), do: t
 

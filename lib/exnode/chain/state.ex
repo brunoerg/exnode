@@ -414,6 +414,12 @@ defmodule Exnode.Chain.State do
       turn_ms: Keyword.get(opts, :turn_ms, @turn_ms),
       pipeline_depth: Keyword.get(opts, :pipeline_depth, @pipeline_depth),
       pipeline_bytes: Keyword.get(opts, :pipeline_bytes, @pipeline_bytes),
+      # Build each new block's archive records in a short-lived process
+      # (Archive.prepare_append) while later blocks are validated; see
+      # "archive preparation" below.
+      archive_prep: Keyword.get(opts, :archive_prep, true),
+      # Test only: called with the block in each archive preparation process.
+      test_archive_prep_hook: Keyword.get(opts, :test_archive_prep_hook),
       plan: nil,
       plan_seq: 0,
       drive_queued: false,
@@ -966,6 +972,9 @@ defmodule Exnode.Chain.State do
   def handle_info({:prep_done, tag, result, wstats}, st),
     do: {:noreply, prep_result(st, tag, result, wstats)}
 
+  def handle_info({:archive_prep_done, tag, result}, st),
+    do: {:noreply, archive_prep_result(st, tag, result)}
+
   def handle_info({:DOWN, mref, :process, _, reason}, %{prep_worker: {_, mref}} = st),
     do: {:noreply, prep_worker_down(st, reason)}
 
@@ -1312,6 +1321,7 @@ defmodule Exnode.Chain.State do
             {:script_exec, tag, outcome, wstats} -> script_result(st, tag, outcome, wstats)
             {:prefetch_done, tag, result} -> prefetch_result(st, tag, result)
             {:prep_done, tag, result, wstats} -> prep_result(st, tag, result, wstats)
+            {:archive_prep_done, tag, result} -> archive_prep_result(st, tag, result)
             {:DOWN, mref, :process, _, reason} = down -> any_down(st, mref, reason, down)
           end
 
@@ -1410,31 +1420,197 @@ defmodule Exnode.Chain.State do
   # The next action on the plan: retire the head if complete, else prepare
   # the next block if admitted and its data is in, else extend, else wait.
   defp step(st) do
-    plan = st.plan
+    st = dispatch_archive_preps(st)
 
-    case :queue.peek(plan.items) do
+    case :queue.peek(st.plan.items) do
       {:value, %{state: s} = head} when s in [:ready, :failed] ->
-        retire(st, head)
+        case await_archive_prep(st, head) do
+          {:ok, st, head} -> retire(st, head)
+          :pending -> advance(st)
+        end
 
       _ ->
-        cond do
-          plan.todo != [] and not plan.final and admitted?(st) and prep_free?(st) ->
-            case prepare_next(st) do
-              {:wait, st} -> {:waiting, st}
-              {:ok, st} -> {:prepared, st}
-            end
-
-          :queue.is_empty(plan.items) and (plan.todo == [] or plan.final) ->
-            {:done, cancel_plan(st)}
-
-          plan.todo == [] and not plan.final and st.retarget ->
-            extend_plan(%{st | retarget: false})
-
-          true ->
-            {:waiting, st}
-        end
+        advance(st)
     end
   end
+
+  defp advance(st) do
+    plan = st.plan
+
+    cond do
+      plan.todo != [] and not plan.final and admitted?(st) and prep_free?(st) ->
+        case prepare_next(st) do
+          {:wait, st} -> {:waiting, st}
+          {:ok, st} -> {:prepared, st}
+        end
+
+      :queue.is_empty(plan.items) and (plan.todo == [] or plan.final) ->
+        {:done, cancel_plan(st)}
+
+      plan.todo == [] and not plan.final and st.retarget ->
+        extend_plan(%{st | retarget: false})
+
+      true ->
+        {:waiting, st}
+    end
+  end
+
+  # --- archive preparation -------------------------------------------------
+  #
+  # Archiving a new block (Archive.connect at retirement) runs in this
+  # process, after the block's checks and before the next block's.
+  # Everything in it that depends only on the block, its `spent` ids, its
+  # delta and its archive ids (record encoding and layout, tx metadata, the
+  # block's own txindex occurrences, spend records, overlay rows, and its
+  # committed txindex rows when the prefetched ones are stale) is built
+  # instead by a short-lived process (Archive.prepare_append) as soon as the
+  # item has its result, while this process prepares later blocks. A ready
+  # head waits for it before retiring (it stays in the view meanwhile, like
+  # a head waiting for its scripts).
+  #
+  # Ids: the archive's next ids, advanced over the unretired items in
+  # order (a reconnected block takes none). Archive.connect checks them
+  # again and encodes the block in place if they no longer match, so a
+  # wrong guess costs time, never correctness. A preparation that fails or
+  # whose process dies (:none) is also just done in place. Results are
+  # tagged with the plan generation: those of a dropped plan are ignored.
+
+  # Starts preparations for the items that have their result, oldest
+  # first, stopping at the first one without (its outputs, and so the
+  # later ids, are not known yet).
+  defp dispatch_archive_preps(%{archive_prep: false} = st), do: st
+
+  defp dispatch_archive_preps(st) do
+    {items, _, launched} =
+      Enum.reduce(:queue.to_list(st.plan.items), {[], Archive.next_ids(st.a), false}, fn
+        item, {acc, nil, l} ->
+          {[item | acc], nil, l}
+
+        %{apre_next: next} = item, {acc, _ids, l} when next != nil ->
+          {[item | acc], next, l}
+
+        %{res: nil} = item, {acc, _ids, l} ->
+          {[item | acc], nil, l}
+
+        %{state: :failed} = item, {acc, _ids, l} ->
+          {[item | acc], nil, l}
+
+        item, {acc, ids, l} ->
+          if Map.get(item, :archived, false) do
+            {[item | acc], ids, l}
+          else
+            item = launch_archive_prep(st, item, ids)
+            {[item | acc], item.apre_next, true}
+          end
+      end)
+
+    if launched, do: put_in(st.plan.items, :queue.from_list(Enum.reverse(items))), else: st
+  end
+
+  defp launch_archive_prep(st, %{block: block, res: res, entry: entry} = item, ids) do
+    {nouts, nins} =
+      Enum.reduce(block.txs, {0, 0}, fn tx, {o, i} ->
+        {o + length(tx.outputs), i + length(tx.inputs)}
+      end)
+
+    next = %{block: ids.block + 1, out: ids.out + nouts, inp: ids.inp + nins}
+    owner = self()
+    tag = {:apre, st.plan.gen, make_ref()}
+    reader = Archive.reader(st.a)
+    history = Map.get(item, :history)
+    %{spent: spent, delta: delta} = res
+    height = entry.height
+    hook = st.test_archive_prep_hook
+
+    {_pid, mref} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            if hook, do: hook.(block)
+            {:ok, Archive.prepare_append(block, height, spent, ids, delta, reader, history)}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+
+        send(owner, {:archive_prep_done, tag, result})
+      end)
+
+    %{item | apre: {:pending, tag, mref}, apre_next: next}
+  end
+
+  # The head is ready (or failed): it retires now unless its preparation
+  # is still running. A result already in the mailbox is taken at once.
+  defp await_archive_prep(st, %{state: :ready, apre: {:pending, tag, _}}) do
+    receive do
+      {:archive_prep_done, ^tag, result} ->
+        st = archive_prep_result(st, tag, result)
+        {:value, head} = :queue.peek(st.plan.items)
+        {:ok, st, head}
+    after
+      0 -> :pending
+    end
+  end
+
+  defp await_archive_prep(st, head), do: {:ok, st, head}
+
+  # A preparation's result: settles the item still pending under `tag` in
+  # the current plan; anything else is stale.
+  defp archive_prep_result(st, {:apre, gen, _} = tag, result) do
+    case st.plan do
+      %{gen: ^gen} = plan ->
+        {items, found} =
+          Enum.map_reduce(:queue.to_list(plan.items), nil, fn
+            %{apre: {:pending, ^tag, mref}} = i, nil ->
+              Process.demonitor(mref, [:flush])
+
+              case result do
+                {:ok, p} ->
+                  {%{i | apre: {:done, p}}, p.prepare_us}
+
+                {:error, _} ->
+                  {%{i | apre: :none}, 0}
+              end
+
+            i, acc ->
+              {i, acc}
+          end)
+
+        case found do
+          nil ->
+            update_pstat(st, :archive_prep_stale, 1)
+
+          us ->
+            st = put_in(st.plan.items, :queue.from_list(items))
+
+            st
+            |> update_pstats(%{archive_prep_us: us, archive_prep_jobs: 1})
+            |> queue_drive()
+        end
+
+      _ ->
+        update_pstat(st, :archive_prep_stale, 1)
+    end
+  end
+
+  # A preparation process died without answering: its item is archived in place.
+  defp archive_prep_down(%{plan: %{items: items}} = st, mref, reason) when reason != :normal do
+    list = :queue.to_list(items)
+
+    if Enum.any?(list, &match?(%{apre: {:pending, _, ^mref}}, &1)) do
+      list =
+        Enum.map(list, fn
+          %{apre: {:pending, _, ^mref}} = i -> %{i | apre: :none}
+          i -> i
+        end)
+
+      st = put_in(st.plan.items, :queue.from_list(list))
+      {:ok, queue_drive(update_pstat(st, :archive_prep_down, 1))}
+    else
+      :unknown
+    end
+  end
+
+  defp archive_prep_down(_st, _mref, _reason), do: :unknown
 
   # Items in the plan (prepared, unretired) stay below `pipeline_depth`, and
   # their retained bytes plus ready prefetch results below `pipeline_bytes`;
@@ -1662,6 +1838,7 @@ defmodule Exnode.Chain.State do
         case result do
           {:ok, res} ->
             st = add_item(st, entry, rest, block, {:ok, res}, validate_us)
+            st = mark_archived(st, archived)
             {:ok, if(archived, do: zero_new_outputs(st), else: attach_history(st, history))}
 
           {:populated, facts} ->
@@ -1698,6 +1875,11 @@ defmodule Exnode.Chain.State do
     put_in(st.plan.items, :queue.in(Map.put(last, :history, history), q))
   end
 
+  defp mark_archived(st, archived) do
+    {{:value, last}, q} = :queue.out_r(st.plan.items)
+    put_in(st.plan.items, :queue.in(Map.put(last, :archived, archived), q))
+  end
+
   # An archived block (a reconnect) has its output ids already: it reserves none.
   defp zero_new_outputs(st) do
     {{:value, last}, q} = :queue.out_r(st.plan.items)
@@ -1726,6 +1908,11 @@ defmodule Exnode.Chain.State do
       new_outputs: 0,
       bytes: 0,
       validate_us: validate_us,
+      # Archive preparation: nil (not started), {:pending, tag, mref},
+      # {:done, prepared} or :none (failed: archived in place); apre_next:
+      # the archive ids after this block.
+      apre: nil,
+      apre_next: nil,
       prepared_at: now,
       done_at: now,
       # When it became the FIFO head (the oldest unretired block).
@@ -2069,14 +2256,21 @@ defmodule Exnode.Chain.State do
 
   defp prefetch_result(st, _tag, _result), do: st
 
-  defp handle_down(%{plan: %{pf: %Prefetch{} = pf}} = st, mref, _down) do
+  defp handle_down(%{plan: %{pf: %Prefetch{} = pf}} = st, mref, down) do
     case Prefetch.down(pf, mref) do
       {:ok, pf} -> {:ok, queue_drive(put_in(st.plan.pf, pf))}
-      :unknown -> {:unknown, st}
+      :unknown -> down_other(st, mref, down)
     end
   end
 
-  defp handle_down(st, _mref, _down), do: {:unknown, st}
+  defp handle_down(st, mref, down), do: down_other(st, mref, down)
+
+  defp down_other(st, mref, {:DOWN, _, :process, _, reason}) do
+    case archive_prep_down(st, mref, reason) do
+      {:ok, st} -> {:ok, st}
+      :unknown -> {:unknown, st}
+    end
+  end
 
   # Startup's selective receive: the preparation worker or a prefetch
   # worker; the private executor's death is fatal, as after init (its
@@ -2382,11 +2576,18 @@ defmodule Exnode.Chain.State do
   defp archive_connect(st, %{entry: entry, block: block, res: res} = item) do
     t1 = System.monotonic_time(:microsecond)
 
+    prepared =
+      case item do
+        %{apre: {:done, p}} -> p
+        _ -> nil
+      end
+
     a =
       Archive.connect(st.a, block, entry.height, res.spent,
         delta: res.delta,
         commit: false,
-        history: Map.get(item, :history)
+        history: Map.get(item, :history),
+        prepared: prepared
       )
 
     if hook = st.test_archive_hook, do: hook.(block)
@@ -2681,7 +2882,13 @@ defmodule Exnode.Chain.State do
           "prefetch ops #{g.(w, :considered)} omitted #{g.(w, :omitted)} sent #{g.(w, :sent)}, " <>
           "worker busy #{ms(g.(w, :worker_us))}ms (overlapping), worker reads #{g.(w, :output_groups)} groups " <>
           "#{g.(w, :preads)} preads #{div(g.(w, :pread_bytes), 1024)}KiB; chain-state committed ops #{g.(c, :committed_ops)}, " <>
-          "reads #{g.(c, :output_groups)} groups #{g.(c, :preads)} preads #{div(g.(c, :pread_bytes), 1024)}KiB"
+          "reads #{g.(c, :output_groups)} groups #{g.(c, :preads)} preads #{div(g.(c, :pread_bytes), 1024)}KiB; " <>
+          "archive: prepared #{g.(c, :append_prepared)} mismatched #{g.(c, :append_prepared_mismatch)}, " <>
+          "encode #{ms(g.(c, :append_encode_us))}ms segments #{ms(g.(c, :append_segments_us))}ms " <>
+          "txindex #{ms(g.(c, :append_txindex_us))}ms (reads #{g.(c, :txindex_reads)}, read #{ms(g.(c, :txindex_read_us))}ms, " <>
+          "hint stale #{g.(c, :txindex_hint_stale)}) overwritten #{ms(g.(c, :append_overwritten_us))}ms " <>
+          "record #{ms(g.(c, :append_record_us))}ms overlay #{ms(g.(c, :connect_overlay_us))}ms " <>
+          "(spent #{ms(g.(c, :ov_spent_us))}ms created #{ms(g.(c, :ov_created_us))}ms) chain #{ms(g.(c, :connect_chain_us))}ms"
       )
 
       %{st | pf_stats: %{used: 0, stale: 0, none: 0}, pf_window: %{}}

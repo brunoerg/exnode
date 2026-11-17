@@ -87,13 +87,27 @@ defmodule Exnode.Archive.Segments do
   `sparse` `[{id, {seg, offset}}]` for the ids that are multiples of
   `every`, in order. One pass over the records; the write is the same.
   """
-  def append_sparse(%__MODULE__{} = st, records, base, every) do
+  def append_sparse(%__MODULE__{} = st, records, base, every),
+    do: append_layout(st, layout(records, base, every))
+
+  @doc """
+  The position-independent part of `append_sparse/4`: `{records, rel,
+  total}`, `rel` the `{id, offset in the block}` of the ids that are
+  multiples of `every` (newest first). Pure, so any process may compute it;
+  `records` may be flattened to one binary before `append_layout/2`.
+  """
+  def layout(records, base, every) do
     {rel, total, _} =
       Enum.reduce(records, {[], 0, base}, fn r, {acc, off, id} ->
         acc = if rem(id, every) == 0, do: [{id, off} | acc], else: acc
         {acc, off + IO.iodata_length(r), id + 1}
       end)
 
+    {records, rel, total}
+  end
+
+  @doc "Writes a `layout/3` result; returns what `append_sparse/4` returns."
+  def append_layout(%__MODULE__{} = st, {records, rel, total}) do
     st = if st.offset > 0 and st.offset + total > st.max, do: roll(st), else: st
     %{seg: seg, offset: start} = st
     sparse = Enum.reduce(rel, [], fn {id, off}, acc -> [{id, {seg, start + off}} | acc] end)
