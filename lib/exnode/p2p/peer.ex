@@ -141,6 +141,11 @@ defmodule Exnode.P2P.Peer do
       # (newest first, at most @max_cmpct_seen): Core marks such a block in
       # flight from the peer, so a resend is "already syncing" and ignored.
       cmpct_seen: [],
+      # Blocks rebuilt from this peer's compact blocks that the chain state
+      # stored for a deferred verdict (newest first, at most @max_partials):
+      # their {:block_checked, ...} is via_compact_block (Core mapBlockSource
+      # with fMayBan = false).
+      rebuilt_deferred: [],
       # BIP152: the peer asked us to announce new blocks as cmpctblock.
       hb_requested: false,
       # BIP152: we asked the peer to announce new blocks to us as cmpctblock
@@ -319,8 +324,11 @@ defmodule Exnode.P2P.Peer do
 
   # Core BlockChecked -> MaybePunishNodeForBlock, for a block this peer sent
   # that failed when the chain state connected it (deferred submission).
-  def handle_info({:block_checked, _hash, {:error, {result, reason}}}, st) do
-    case maybe_punish_for_block(st, result, "invalid block: #{reason}") do
+  def handle_info({:block_checked, hash, {:error, {result, reason}}}, st) do
+    via_compact = hash in st.rebuilt_deferred
+    st = %{st | rebuilt_deferred: List.delete(st.rebuilt_deferred, hash)}
+
+    case maybe_punish_for_block(st, result, "invalid block: #{reason}", via_compact) do
       {:ok, st} -> {:noreply, st}
       stop -> stop
     end
@@ -1111,19 +1119,28 @@ defmodule Exnode.P2P.Peer do
   defp continuous?([_]), do: true
   defp continuous?([a, b | rest]), do: b.prev_hash == a.hash and continuous?([b | rest])
 
-  # Core: MaybePunishNodeForBlock (headers: via_compact_block = false)
-  defp maybe_punish_for_block(st, result, msg) do
+  # Core: MaybePunishNodeForBlock. `via_compact`: the header came in a
+  # cmpctblock, or the block was rebuilt from one. BIP152 lets a
+  # high-bandwidth peer relay a block after checking only its header (Core
+  # announces from NewPoWValidBlock, before ConnectBlock), so an invalid
+  # block or a header we hold as invalid is not that peer's fault; a peer
+  # that builds on an invalid chain is still caught by its headers.
+  defp maybe_punish_for_block(st, result, msg, via_compact \\ false) do
     case result do
       # Our own validation crash (quarantine), or a block refused because it
       # is quarantined: never the peer's fault.
       r when r in [:crash, :quarantined] ->
         {:ok, st}
 
-      r when r in [:consensus, :mutated, :invalid_header, :invalid_prev, :missing_prev] ->
+      r when r in [:consensus, :mutated] ->
+        if via_compact, do: {:ok, st}, else: misbehaving(st, msg)
+
+      r when r in [:invalid_header, :invalid_prev, :missing_prev] ->
         misbehaving(st, msg)
 
+      # Outbound (not inbound) peers on an invalid chain; not via compact.
       :cached_invalid ->
-        if st.inbound, do: {:ok, st}, else: misbehaving(st, msg)
+        if st.inbound or via_compact, do: {:ok, st}, else: misbehaving(st, msg)
 
       _ ->
         {:ok, st}
@@ -1243,9 +1260,19 @@ defmodule Exnode.P2P.Peer do
           outcome in [nil, {:ok, :connected}, {:ok, :stored}, {:ok, :duplicate}]
         )
 
+    # A rebuilt block stored for a deferred verdict: that verdict is via
+    # compact block too.
+    st =
+      if rebuilt and outcome == {:ok, :stored},
+        do: %{
+          st
+          | rebuilt_deferred: Enum.take([b.header.hash | st.rebuilt_deferred], @max_partials)
+        },
+        else: st
+
     case outcome do
       {:error, {result, reason}} ->
-        maybe_punish_for_block(st, result, "invalid block: #{reason}")
+        maybe_punish_for_block(st, result, "invalid block: #{reason}", rebuilt)
 
       reply ->
         # Core ProcessBlock: m_last_block_time when the block was new (eviction);
@@ -1308,10 +1335,10 @@ defmodule Exnode.P2P.Peer do
                now: now(st)
              ) do
           {:error, {result, reason}, _} ->
-            maybe_punish_for_block(st, result, "invalid header via cmpctblock: #{reason}")
+            maybe_punish_for_block(st, result, "invalid header via cmpctblock: #{reason}", true)
 
           {:error, {result, reason}} ->
-            maybe_punish_for_block(st, result, "invalid header via cmpctblock: #{reason}")
+            maybe_punish_for_block(st, result, "invalid header via cmpctblock: #{reason}", true)
 
           {:ok, _} ->
             compact_block_header_ok(st, c)
