@@ -159,14 +159,8 @@ defmodule Exnode.Validation.Connect do
   defp connect_tx(a, tx, pos, st, entry, {prev, prev_mtp}, idx, flags, csv) do
     coinbase = pos == 0
 
-    with {:ok, coins} <-
-           timed(:perf_v_inputs_us, fn ->
-             if(coinbase, do: {:ok, []}, else: have_inputs(a, tx, st))
-           end),
-         {:ok, fee} <-
-           timed(:perf_v_amounts_us, fn ->
-             if(coinbase, do: {:ok, 0}, else: check_tx_inputs(tx, coins, entry.height))
-           end),
+    with {:ok, coins} <- if(coinbase, do: {:ok, []}, else: have_inputs(a, tx, st)),
+         {:ok, fee} <- if(coinbase, do: {:ok, 0}, else: check_tx_inputs(tx, coins, entry.height)),
          fees = st.fees + fee,
          :ok <-
            if(Consensus.money_range?(fees),
@@ -174,14 +168,11 @@ defmodule Exnode.Validation.Connect do
              else: {:error, {:consensus, "bad-txns-accumulated-fee-outofrange"}}
            ),
          :ok <-
-           timed(:perf_v_locks_us, fn ->
-             if(coinbase or sequence_locks?(tx, coins, csv, entry, prev, idx, prev_mtp),
-               do: :ok,
-               else: {:error, {:consensus, "bad-txns-nonfinal"}}
-             )
-           end),
-         sigops =
-           st.sigops + timed(:perf_v_sigops_us, fn -> sigop_cost(tx, coins, flags, coinbase) end),
+           if(coinbase or sequence_locks?(tx, coins, csv, entry, prev, idx, prev_mtp),
+             do: :ok,
+             else: {:error, {:consensus, "bad-txns-nonfinal"}}
+           ),
+         sigops = st.sigops + sigop_cost(tx, coins, flags, coinbase),
          :ok <-
            if(sigops > Consensus.max_block_sigops_cost(),
              do: {:error, {:consensus, "bad-blk-sigops"}},
@@ -193,32 +184,23 @@ defmodule Exnode.Validation.Connect do
           else: [{tx.raw, Enum.map(coins, &{&1.script_pubkey, &1.value})} | st.checks]
 
       {:ok,
-       timed(:perf_v_coins_us, fn ->
-         update_coins(tx, coins, coinbase, entry.height, %{
-           st
-           | fees: fees,
-             sigops: sigops,
-             checks: checks
-         })
-       end)}
+       update_coins(tx, coins, coinbase, entry.height, %{
+         st
+         | fees: fees,
+           sigops: sigops,
+           checks: checks
+       })}
     end
   end
 
   @doc """
-  Time spent in each per-tx step of `connect_block/6` in this process since
-  the last call, in µs (the perf log's validation split): `inputs` (finding
-  the spent coins), `amounts` (CheckTxInputs), `locks` (sequence locks),
-  `sigops` (sigop cost), `coins` (updating the block's coin view), `txloop`
-  (the whole per-tx loop, the five above included), `ages` (the prevout
-  age histogram) and `finish` (the coinbase amount check and the result).
+  Time spent in `connect_block/6` in this process since the last call, in
+  µs (the perf log's validation split): `txloop` (the per-tx loop), `ages`
+  (the prevout age histogram) and `finish` (the coinbase amount check and
+  the result).
   """
   def take_split do
     for {k, key} <- [
-          inputs: :perf_v_inputs_us,
-          amounts: :perf_v_amounts_us,
-          locks: :perf_v_locks_us,
-          sigops: :perf_v_sigops_us,
-          coins: :perf_v_coins_us,
           txloop: :perf_v_txloop_us,
           ages: :perf_v_ages_us,
           finish: :perf_v_finish_us

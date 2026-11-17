@@ -3045,9 +3045,7 @@ defmodule Exnode.Chain.State do
           "record #{ms(g.(c, :append_record_us))}ms overlay #{ms(g.(c, :connect_overlay_us))}ms " <>
           "(spent #{ms(g.(c, :ov_spent_us))}ms created #{ms(g.(c, :ov_created_us))}ms) chain #{ms(g.(c, :connect_chain_us))}ms; " <>
           "validation: check_block #{ms(g.(v, :checkblock))}ms contextual #{ms(g.(v, :contextual))}ms " <>
-          "connect #{ms(g.(v, :connect))}ms (resolve #{ms(p.resolve)}ms, per tx: inputs #{ms(g.(v, :inputs))}ms " <>
-          "amounts #{ms(g.(v, :amounts))}ms locks #{ms(g.(v, :locks))}ms sigops #{ms(g.(v, :sigops))}ms " <>
-          "coins #{ms(g.(v, :coins))}ms; loop #{ms(g.(v, :txloop))}ms ages #{ms(g.(v, :ages))}ms " <>
+          "connect #{ms(g.(v, :connect))}ms (resolve #{ms(p.resolve)}ms, loop #{ms(g.(v, :txloop))}ms ages #{ms(g.(v, :ages))}ms " <>
           "finish #{ms(g.(v, :finish))}ms); " <>
           cs_line(Process.delete(:perf_cs) || %{}, round(secs * 1_000_000))
       )
