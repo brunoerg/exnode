@@ -26,6 +26,10 @@ defmodule Mix.Tasks.Exnode.Node do
   <MiB>` (the chain state's minimum heap, default 384; during IBD its live
   data is hundreds of MiB, and a larger floor means fewer collections).
 
+  `--decode-budget-mib <MiB>`: payload bytes of large peer messages (64 KiB
+  or more) decoded and handled at once across all peers (default 32). A
+  decoded block is several times its wire size; this bounds that memory.
+
   `--status-file` also writes the latest status as JSON (best header height
   and hash, peer count), for scripts that compare against bitcoind.
   """
@@ -54,6 +58,7 @@ defmodule Mix.Tasks.Exnode.Node do
     batch_blocks: :integer,
     batch_mib: :integer,
     chain_state_heap_mib: :integer,
+    decode_budget_mib: :integer,
     rpcport: :integer,
     rpcuser: :string,
     rpcpassword: :string,
@@ -114,6 +119,11 @@ defmodule Mix.Tasks.Exnode.Node do
           if(opts[:chain_state_heap_mib],
             do: div(opts[:chain_state_heap_mib] * 1024 * 1024, :erlang.system_info(:wordsize)),
             else: Exnode.Chain.State.default_min_heap_size()
+          ),
+        decode_budget_bytes:
+          if(opts[:decode_budget_mib],
+            do: opts[:decode_budget_mib] * 1024 * 1024,
+            else: Exnode.P2P.DecodeBudget.default_bytes()
           ),
         # Blocks the prefetch stage prepares ahead (--prefetch 0 turns it off).
         prefetch_depth: Keyword.get(opts, :prefetch, Exnode.Chain.State.default_prefetch_depth()),
