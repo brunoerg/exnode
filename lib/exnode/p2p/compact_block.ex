@@ -132,6 +132,9 @@ defmodule Exnode.P2P.CompactBlock do
     {:codec_error, _} -> {:error, :malformed}
   end
 
+  # Shorter than the block hash (as decode_blocktxn/1).
+  def decode_getblocktxn(_payload), do: {:error, :malformed}
+
   def encode_blocktxn(hash, txs),
     do: IO.iodata_to_binary([hash, CompactSize.encode(length(txs)), Enum.map(txs, &Tx.encode/1)])
 

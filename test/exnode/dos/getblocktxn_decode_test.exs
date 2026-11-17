@@ -6,6 +6,10 @@ defmodule Exnode.DoS.GetblocktxnDecodeTest do
   integers (~126 MB) in the peer process and was then silently ignored.
   Now such a payload is refused before anything is built, and an empty
   index list disconnects, as in Core.
+
+  Regression (found by fuzzamoto): a payload shorter than the block hash
+  matched no clause of `decode_getblocktxn/1`, so the peer process crashed
+  instead of disconnecting the peer as misbehaving.
   """
   use Exnode.NodeCase
   @moduletag :dos
@@ -38,6 +42,27 @@ defmodule Exnode.DoS.GetblocktxnDecodeTest do
     assert length(idx) == 65_536 and List.last(idx) == 65_535
     top = IO.iodata_to_binary(CompactSize.encode(65_535))
     assert {:ok, _, [65_535]} = CompactBlock.decode_getblocktxn(payload(1, top))
+  end
+
+  # The fuzzer's payload: 15 bytes, no room for the 32-byte block hash.
+  @short "***888x#c8c888x"
+
+  test "decode refuses a payload shorter than the block hash" do
+    for p <- [<<>>, @short, :binary.copy(<<0>>, 31)] do
+      assert CompactBlock.decode_getblocktxn(p) == {:error, :malformed}
+    end
+  end
+
+  test "a getblocktxn shorter than the block hash is misbehaviour, not a crash",
+       %{tmp_dir: dir} do
+    %{n: n} = TestNode.start(dir)
+    {pid, sock} = FakePeer.connect_from(n)
+    FakePeer.recv(sock, ["verack"], 1)
+    ref = Process.monitor(pid)
+    :ok = FakePeer.send_msgs(sock, [{:getblocktxn, @short}])
+
+    assert_receive {:DOWN, ^ref, _, _, {:shutdown, {:misbehaving, "malformed getblocktxn"}}},
+                   5_000
   end
 
   test "an oversized getblocktxn costs no memory spike; an empty one disconnects", %{tmp_dir: dir} do
