@@ -1771,6 +1771,7 @@ defmodule Exnode.Chain.State do
             tc = System.monotonic_time(:microsecond)
 
             with :ok <- unchecked_check_block(st, entry, block),
+                 _ <- add_us(:perf_checkblock_us, tc),
                  :ok <-
                    BlockRules.contextual_check_block(
                      block,
@@ -1831,14 +1832,27 @@ defmodule Exnode.Chain.State do
 
         validate_us = System.monotonic_time(:microsecond) - t0
 
-        st =
-          update_pstats(st, %{
-            prep_rules_us: Process.delete(:perf_rules_us) || 0,
-            prep_connect_us: Process.delete(:perf_connect_us) || 0,
-            prep_populate_us: Process.delete(:perf_populate_us) || 0,
-            prep_context_us: Process.delete(:perf_context_us) || 0,
-            prep_check_us: Process.delete(:perf_check_us) || 0
+        split = %{
+          prep_rules_us: Process.delete(:perf_rules_us) || 0,
+          prep_connect_us: Process.delete(:perf_connect_us) || 0,
+          prep_populate_us: Process.delete(:perf_populate_us) || 0,
+          prep_context_us: Process.delete(:perf_context_us) || 0,
+          prep_check_us: Process.delete(:perf_check_us) || 0
+        }
+
+        # The perf line's validation split, per window (see perf/4).
+        checkblock = Process.delete(:perf_checkblock_us) || 0
+
+        Process.put(
+          :perf_vwin,
+          add_counts(Process.get(:perf_vwin) || %{}, %{
+            checkblock: checkblock,
+            contextual: max(split.prep_rules_us - checkblock, 0),
+            connect: split.prep_connect_us
           })
+        )
+
+        st = update_pstats(st, split)
 
         case result do
           {:ok, res} ->
@@ -1855,6 +1869,9 @@ defmodule Exnode.Chain.State do
         end
     end
   end
+
+  defp add_us(key, t0),
+    do: Process.put(key, (Process.get(key) || 0) + System.monotonic_time(:microsecond) - t0)
 
   # CheckBlock unless done at submission (fChecked). A local error there (a
   # kernel API failure on signet's challenge) is a crash, not a verdict.
@@ -2874,6 +2891,7 @@ defmodule Exnode.Chain.State do
       c = Map.get(st, :cs_window, %{})
       w = st.pf_window
       g = fn m, k -> Map.get(m, k, 0) end
+      v = Map.merge(Process.delete(:perf_vwin) || %{}, Exnode.Validation.Connect.take_split())
 
       # `archive append` is Archive.connect only; commits (segment fsync, KV
       # batch) are timed separately. Worker busy time is summed over
@@ -2893,7 +2911,11 @@ defmodule Exnode.Chain.State do
           "txindex #{ms(g.(c, :append_txindex_us))}ms (reads #{g.(c, :txindex_reads)}, read #{ms(g.(c, :txindex_read_us))}ms, " <>
           "hint stale #{g.(c, :txindex_hint_stale)}) overwritten #{ms(g.(c, :append_overwritten_us))}ms " <>
           "record #{ms(g.(c, :append_record_us))}ms overlay #{ms(g.(c, :connect_overlay_us))}ms " <>
-          "(spent #{ms(g.(c, :ov_spent_us))}ms created #{ms(g.(c, :ov_created_us))}ms) chain #{ms(g.(c, :connect_chain_us))}ms"
+          "(spent #{ms(g.(c, :ov_spent_us))}ms created #{ms(g.(c, :ov_created_us))}ms) chain #{ms(g.(c, :connect_chain_us))}ms; " <>
+          "validation: check_block #{ms(g.(v, :checkblock))}ms contextual #{ms(g.(v, :contextual))}ms " <>
+          "connect #{ms(g.(v, :connect))}ms (resolve #{ms(p.resolve)}ms, per tx: inputs #{ms(g.(v, :inputs))}ms " <>
+          "amounts #{ms(g.(v, :amounts))}ms locks #{ms(g.(v, :locks))}ms sigops #{ms(g.(v, :sigops))}ms " <>
+          "coins #{ms(g.(v, :coins))}ms)"
       )
 
       %{st | pf_stats: %{used: 0, stale: 0, none: 0}, pf_window: %{}}
