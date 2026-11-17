@@ -7,8 +7,11 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
   * a malformed cmpctblock or blocktxn is misbehaviour; a compact block
     whose prefilled index is out of range is invalid (misbehaviour);
   * a compact block on an unknown parent makes us sync headers instead;
-  * an invalid header via cmpctblock is punished, and a second peer
-    sending the cached-invalid header is punished only if outbound;
+  * an invalid header via cmpctblock is punished; a cached-invalid header
+    via cmpctblock is not, from an inbound or an outbound peer, and neither
+    is an invalid block rebuilt from a compact block (Core
+    `MaybePunishNodeForBlock` with `via_compact_block`: BIP152 lets a
+    high-bandwidth peer relay a block after checking only its header);
   * a reconstruction that cannot start (duplicate short ids), a blocktxn
     that fills it wrongly (merkle mismatch) or a partial that times out
     (60 s) falls back to requesting the full block; a wrong number of
@@ -151,7 +154,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     assert_stopped(ref, {:misbehaving, "invalid header via cmpctblock: bad-diffbits"})
   end
 
-  test "a cached-invalid header via cmpctblock: an inbound peer is not punished, an outbound one is",
+  test "a cached-invalid header via cmpctblock punishes neither an inbound nor an outbound peer",
        %{n: n, bs: bs, port: port} do
     # A valid header whose block is invalid (coinbase pays too much): the
     # header is stored, then marked failed.
@@ -171,10 +174,47 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     # Still connected: it answers the ping.
     before_pong(inbound)
 
+    # B9-1: Core exempts it (via_compact_block) from an outbound peer too.
     {_pid, sock, _clock, ref} = hb_peer(n, bs)
     :ok = FakePeer.send_msgs(sock, {:cmpctblock, payload})
-    assert_receive {:DOWN, ^ref, :process, _, {:shutdown, {:misbehaving, why}}}, 5_000
-    assert why =~ "invalid header via cmpctblock"
+    before_pong(sock)
+    refute_received {:DOWN, ^ref, _, _, _}
+  end
+
+  test "an invalid block rebuilt from a compact block does not punish its peer; it is marked failed",
+       %{n: n, bs: bs} do
+    # B9-1. Core's NewPoWValidBlock announces a block to high-bandwidth
+    # peers before ConnectBlock, so honest peers relay blocks with valid PoW
+    # that turn out invalid. Every tx is prefilled: it is rebuilt at once.
+    bad = BB.build(List.last(bs).header, [BB.coinbase(151, 100 * 100_000_000)])
+    {_pid, sock, _clock, ref} = hb_peer(n, bs)
+    :ok = FakePeer.send_msgs(sock, cmpct(bad))
+    before_pong(sock)
+    refute_received {:DOWN, ^ref, _, _, _}
+
+    assert {:error, {:cached_invalid, _}} = State.submit_block(n.chain_state, bad)
+    assert tip(n).hash == List.last(bs).header.hash
+  end
+
+  test "a deferred verdict on a rebuilt block is not punished; on a full block it is",
+       %{n: n, bs: bs} do
+    # In IBD the chain state stores a block and answers later with
+    # {:block_checked, ...} (Core BlockChecked, with via_compact_block =
+    # !fMayBan from mapBlockSource).
+    rebuilt = :crypto.strong_rand_bytes(32)
+    {pid, sock, _clock, ref} = hb_peer(n, bs)
+    :sys.replace_state(pid, &%{&1 | rebuilt_deferred: [rebuilt]})
+    send(pid, {:block_checked, rebuilt, {:error, {:consensus, "bad-cb-amount"}}})
+    before_pong(sock)
+    refute_received {:DOWN, ^ref, _, _, _}
+    assert :sys.get_state(pid).rebuilt_deferred == []
+
+    send(
+      pid,
+      {:block_checked, :crypto.strong_rand_bytes(32), {:error, {:consensus, "bad-cb-amount"}}}
+    )
+
+    assert_stopped(ref, {:misbehaving, "invalid block: bad-cb-amount"})
   end
 
   test "a prefilled index out of range is an invalid compact block", %{n: n, bs: bs, b151: b} do
