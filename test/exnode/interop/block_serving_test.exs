@@ -99,13 +99,17 @@ defmodule Exnode.Interop.BlockServingTest do
            )
 
     # NODE_NETWORK_LIMITED: a witness-pruned exnode serving C, which already has
-    # the chain up to 20 blocks below the tip (synced from A, then cut off).
+    # part of the chain (synced from A, then cut off).
     ex2 = start_exnode(Path.join(dir, "ex2"), a, prune_witness: true)
     tip_a = Bitcoind.cli(a, ["getbestblockhash"])
     assert Bitcoind.wait_until(fn -> tip_hex(ex2) == tip_a end, 120_000)
 
-    # C syncs from A and shuts itself down at `target` (-stopatheight).
-    target = Bitcoind.json(a, ["getblockcount"]) - 20
+    # C syncs from A and shuts itself down at `target` (-stopatheight), 40
+    # blocks below the tip. Core connects up to 32 blocks per step before it
+    # checks the stop height, so C can stop up to 31 past it: still below the
+    # tip, with the rest to fetch from exnode2.
+    height_a = Bitcoind.json(a, ["getblockcount"])
+    target = height_a - 40
     cdir = Path.join(dir, "c")
     _ = Bitcoind.start(cdir, ["-connect=127.0.0.1:#{a.p2p}", "-stopatheight=#{target}"])
 
@@ -117,7 +121,9 @@ defmodule Exnode.Interop.BlockServingTest do
     c = Bitcoind.start(cdir, ["-connect=127.0.0.1:#{ex2.port}"])
     on_exit(fn -> Bitcoind.stop(c) end)
     start_h = Bitcoind.json(c, ["getblockcount"])
-    assert start_h < target + 5, "C should start near #{target}, is at #{start_h}"
+
+    assert start_h >= target and start_h < height_a,
+           "C should start between #{target} and #{height_a}, is at #{start_h}"
 
     assert Bitcoind.wait_until(
              fn -> match?([%{"version" => v}] when v > 0, Bitcoind.json(c, ["getpeerinfo"])) end,

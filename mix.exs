@@ -41,8 +41,26 @@ defmodule Exnode.MixProject do
       make_clean: ["clean"],
       elixirc_paths: elixirc_paths(Mix.env()),
       test_coverage: test_coverage(),
-      deps: deps()
+      deps: deps(),
+      releases: releases()
     ]
+  end
+
+  # `MIX_ENV=prod mix release`; the reproducible build is contrib/release.
+  # bin/exnoded runs a node (rel/overlays). No cookie is shipped: one fixed
+  # at build time would be the same in every copy (rel/env.sh.eex).
+  defp releases do
+    [
+      exnode: [
+        include_executables_for: [:unix],
+        steps: [:assemble, &drop_cookie/1]
+      ]
+    ]
+  end
+
+  defp drop_cookie(release) do
+    File.rm!(Path.join(release.path, "releases/COOKIE"))
+    release
   end
 
   # `mix test --cover`: report only (no minimum, so a run below the default

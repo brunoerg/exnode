@@ -298,6 +298,25 @@ defmodule Exnode.Chain.StateTest do
       assert {:ok, :connected} = State.submit_block(cs, honest)
     end
 
+    test "a mutated copy of a connected block is rejected as mutated, not a duplicate", %{
+      cs: cs,
+      bs: bs
+    } do
+      [b1, b2 | _] = bs
+      tip = List.last(bs).header
+      tx1 = BB.spend_op_true(hd(b1.txs).txid, 0, 50 * @coin)
+      tx2 = BB.spend_op_true(hd(b2.txs).txid, 0, 50 * @coin)
+      cb = BB.coinbase(151, 25 * @coin)
+      honest = BB.build(tip, [cb, tx1, tx2])
+      assert {:ok, :connected} = State.submit_block(cs, honest)
+
+      mutated = BB.build(tip, [cb, tx1, tx2, tx2], merkle_txs: [cb, tx1, tx2])
+      assert mutated.header.hash == honest.header.hash
+      assert {:error, {:mutated, "bad-txns-duplicate"}} = State.submit_block(cs, mutated)
+      assert {:ok, :duplicate} = State.submit_block(cs, honest)
+      assert State.tip(cs).hash == honest.header.hash
+    end
+
     test "invalid block is marked failed; its children are rejected as bad-prevblk", %{
       cs: cs,
       bs: bs

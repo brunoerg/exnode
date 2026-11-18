@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runs a node until it stops: the options of `mix exnode.node`.
+set -e
+SELF=$(readlink -f "$0")
+exec "$(dirname "$SELF")/exnode" eval 'Exnode.CLI.node(System.argv())' "$@"

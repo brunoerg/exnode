@@ -30,3 +30,4 @@ exnode-*.tar
 /data/
 /compile_flags.txt
 /docs/
+/dist/

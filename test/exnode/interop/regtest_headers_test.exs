@@ -65,6 +65,8 @@ defmodule Exnode.Interop.RegtestHeadersTest do
       Bitcoind.mine(btc, 10)
       assert Bitcoind.wait_until(fn -> synced?(n, btc) end)
       # A fake peer: listen locally, have exnode-style Peer connect to us.
+      # Automatic outbound, not manual: a manual peer is never disconnected
+      # for misbehaving.
       {:ok, lsock} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
       {:ok, port} = :inet.port(lsock)
 
@@ -81,7 +83,7 @@ defmodule Exnode.Interop.RegtestHeadersTest do
       {:ok, pid} =
         DynamicSupervisor.start_child(
           n.peer_sup,
-          {Peer, %{node: node, conn_type: :manual, connect: {"127.0.0.1", port}}}
+          {Peer, %{node: node, conn_type: :outbound_full_relay, connect: {"127.0.0.1", port}}}
         )
 
       {:ok, sock} = :gen_tcp.accept(lsock, 5000)
