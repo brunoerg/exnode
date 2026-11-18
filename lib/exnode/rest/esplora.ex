@@ -29,8 +29,10 @@ defmodule Exnode.REST.Esplora do
   output, one tx read per spender; no address history, and no scripthash
   index needed). An address's confirmed
   stats are the index's per-script totals (`Scripthash.totals/2`), not a
-  history scan; `/utxo` still scans the history, in the request's process,
-  and `/txs` pages read only their rows (a reverse seek from the last seen
+  history scan; `/utxo` streams the history in the request's process,
+  holding only the outputs unspent so far and answering 400 past 500 of
+  them (electrs' `--utxos-limit`; `:utxos_limit` in the context), and
+  `/txs` pages read only their rows (a reverse seek from the last seen
   tx).
   """
   use Plug.Router, copy_opts_to_assign: :opts
@@ -224,16 +226,32 @@ defmodule Exnode.REST.Esplora do
   get("/address/:addr/utxo",
     do:
       with_script(conn, conn.assigns.opts, {:address, addr}, fn sh, _ ->
-        json(conn, utxos(conn.assigns.opts, sh))
+        utxo_response(conn, sh)
       end)
   )
 
   get("/scripthash/:sh/utxo",
     do:
       with_script(conn, conn.assigns.opts, {:scripthash, sh}, fn h, _ ->
-        json(conn, utxos(conn.assigns.opts, h))
+        utxo_response(conn, h)
       end)
   )
+
+  defp utxo_response(conn, script) do
+    opts = conn.assigns.opts
+
+    case utxos(opts, script) do
+      {:ok, list} ->
+        json(conn, list)
+
+      {:error, :too_many} ->
+        err(
+          conn,
+          400,
+          "Too many unspent transaction outputs (>#{utxos_limit(opts)}). Contact support to raise limits."
+        )
+    end
+  end
 
   # --- mempool / fees ----------------------------------------------------------------
 
@@ -638,8 +656,10 @@ defmodule Exnode.REST.Esplora do
         else: err(conn, 400, "Address indexing is disabled")
       )
 
-  # Confirmed history rows on the active chain, plus the mempool txs touching the script.
-  defp confirmed(opts, {sh, _spk}), do: Scripthash.history(ctx(opts).scripthash_index, sh)
+  # electrs' default `--utxos-limit`: `/utxo` answers at most this many
+  # confirmed outputs (AUD-A7-1).
+  @utxos_limit 500
+  defp utxos_limit(opts), do: ctx(opts)[:utxos_limit] || @utxos_limit
 
   # height => the active chain's header entry, for the heights of `rows`
   # whose indexed block is that one. Between a disconnect and the index's
@@ -702,21 +722,31 @@ defmodule Exnode.REST.Esplora do
 
   # The index's per-script totals (five point reads). While an index built
   # before them is still getting them, the same figures from the history.
-  defp chain_stats(opts, {sh, _} = script) do
-    Scripthash.totals(ctx(opts).scripthash_index, sh) ||
-      (
-        rows = confirmed(opts, script)
-        fund = Enum.filter(rows, &(&1.kind == :funding))
-        spend = Enum.filter(rows, &(&1.kind == :spending))
+  defp chain_stats(opts, {sh, _}) do
+    index = ctx(opts).scripthash_index
+    Scripthash.totals(index, sh) || history_totals(index, sh)
+  end
 
-        %{
-          funded_txo_count: length(fund),
-          funded_txo_sum: Enum.reduce(fund, 0, &(&2 + &1.value)),
-          spent_txo_count: length(spend),
-          spent_txo_sum: Enum.reduce(spend, 0, &(&2 + &1.value)),
-          tx_count: rows |> Enum.map(&{&1.height, &1.pos}) |> Enum.uniq() |> length()
-        }
-      )
+  # The totals from one pass over the rows, none held (AUD-A7-1). Rows come
+  # in chain order, so a tx's rows are adjacent.
+  defp history_totals(index, sh) do
+    {fc, fs, sc, ss, txs, _} =
+      Scripthash.fold_history(index, sh, {0, 0, 0, 0, 0, nil}, fn r,
+                                                                  {fc, fs, sc, ss, txs, last} ->
+        txs = if {r.height, r.pos} == last, do: txs, else: txs + 1
+
+        if r.kind == :funding,
+          do: {fc + 1, fs + r.value, sc, ss, txs, {r.height, r.pos}},
+          else: {fc, fs, sc + 1, ss + r.value, txs, {r.height, r.pos}}
+      end)
+
+    %{
+      funded_txo_count: fc,
+      funded_txo_sum: fs,
+      spent_txo_count: sc,
+      spent_txo_sum: ss,
+      tx_count: txs
+    }
   end
 
   # Esplora: up to 50 mempool txs, then the first 25 confirmed (newest first);
@@ -774,9 +804,16 @@ defmodule Exnode.REST.Esplora do
     end
   end
 
-  defp utxos(opts, script) do
-    rows = confirmed(opts, script)
-    spent = MapSet.new(for r <- rows, r.kind == :spending, do: r.prevout)
+  # The script's unspent outputs, or {:error, :too_many} past the limit:
+  # the index's rows are streamed, holding only the outputs unspent so far
+  # (`Scripthash.utxos/3`), never the whole history (AUD-A7-1).
+  defp utxos(opts, {sh, _} = script) do
+    with {:ok, rows} <- Scripthash.utxos(ctx(opts).scripthash_index, sh, utxos_limit(opts)) do
+      {:ok, utxos(opts, script, rows)}
+    end
+  end
+
+  defp utxos(opts, script, rows) do
     mem = mempool_rows(opts, script)
     mem_spent = MapSet.new(for m <- mem, {_, _, op} <- m.spending, do: op)
     t = tip_entry(opts)
@@ -784,9 +821,7 @@ defmodule Exnode.REST.Esplora do
 
     confirmed_utxos =
       for r <- rows,
-          r.kind == :funding,
           op = {r.txid, r.index},
-          not MapSet.member?(spent, op),
           not MapSet.member?(mem_spent, op),
           e = active[r.height],
           e != nil do
