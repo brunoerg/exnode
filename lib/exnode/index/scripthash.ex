@@ -51,6 +51,51 @@ defmodule Exnode.Index.Scripthash do
   end
 
   @doc """
+  The confirmed outputs of `sh` not spent in its history, in chain order:
+  `{:ok, [%{txid, index, value, height}]}`, or `{:error, :too_many}` as
+  soon as more than `limit` are unspent at any point of the scan (electrs'
+  `utxo_delta`, `--utxos-limit`). The rows are folded in chain order, a
+  spend always after the funding it spends, so only the outputs unspent so
+  far are held: memory is bounded by `limit`, not by the history's length
+  (AUD-A7-1). In the caller, like `history/2`.
+  """
+  def utxos(server, sh, limit) do
+    unspent =
+      fold_history(server, sh, %{}, fn
+        %{kind: :funding} = r, acc ->
+          acc = Map.put(acc, {r.txid, r.index}, {r.height, r.pos, r.value})
+          if map_size(acc) > limit, do: throw({__MODULE__, :too_many}), else: acc
+
+        %{kind: :spending, prevout: op}, acc ->
+          Map.delete(acc, op)
+      end)
+
+    {:ok,
+     unspent
+     |> Enum.sort_by(fn {{_txid, vout}, {h, pos, _}} -> {h, pos, vout} end)
+     |> Enum.map(fn {{txid, vout}, {h, _pos, value}} ->
+       %{txid: txid, index: vout, value: value, height: h}
+     end)}
+  catch
+    {__MODULE__, :too_many} -> {:error, :too_many}
+  end
+
+  @doc """
+  Folds `fun` over the confirmed history rows of `sh`, oldest first,
+  without holding them (in the caller, like `history/2`).
+  """
+  def fold_history(server, sh, acc, fun) do
+    server
+    |> kv()
+    |> KV.fold_prefix(@cf, sh, acc, fn kv, acc ->
+      case row(kv) do
+        nil -> acc
+        r -> fun.(r, acc)
+      end
+    end)
+  end
+
+  @doc """
   One page of history, newest first: the rows of at most `limit` txs (by
   `{height, pos}`), before the tx at `before` (`{height, pos}`, exclusive;
   nil: from the newest). Reads only those rows (a reverse seek), in the
