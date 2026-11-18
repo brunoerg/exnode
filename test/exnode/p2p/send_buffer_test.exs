@@ -66,7 +66,7 @@ defmodule Exnode.P2P.SendBufferTest do
     end
   end
 
-  defp connect(%{n: n, gate: gate, clock: clock}) do
+  defp connect(%{n: n, gate: gate, clock: clock}, relay \\ false) do
     {pid, sock} =
       FakePeer.connect_from(n,
         node: %{
@@ -77,8 +77,9 @@ defmodule Exnode.P2P.SendBufferTest do
           # Only the test's explicit ticks: no pass lands mid-assertion.
           tick_ms: nil
         },
-        # No tx announcements to this peer: only the getdata answers are sent.
-        version: %{start_height: 120, relay: false}
+        # No tx announcements to this peer (unless a test needs them: a tx
+        # is served only after it was announced, Core m_last_inv_sequence).
+        version: %{start_height: 120, relay: relay}
       )
 
     _ = FakePeer.recv(sock, ["verack"], 1)
@@ -86,6 +87,17 @@ defmodule Exnode.P2P.SendBufferTest do
   end
 
   defp peer_state(pid), do: :sys.get_state(pid)
+
+  # Reads invs until every tx of `txs` was announced (by txid or wtxid,
+  # whichever the peer negotiated).
+  defp await_announced(_sock, []), do: :ok
+
+  defp await_announced(sock, txs) do
+    [{"inv", payload}] = FakePeer.recv(sock, ["inv"], 1)
+    {:ok, {:inv, items}} = Message.decode("inv", payload)
+    hashes = MapSet.new(items, & &1.hash)
+    await_announced(sock, Enum.reject(txs, &(&1.txid in hashes or &1.wtxid in hashes)))
+  end
 
   test "paused over the limit: getdata stops, later messages wait, the peer still answers calls; " <>
          "draining resumes everything in order",
@@ -152,6 +164,12 @@ defmodule Exnode.P2P.SendBufferTest do
 
   test "tx getdata: no tx is served once paused; the rest are served after, notfound only for misses",
        %{n: n, blocks: blocks, gate: gate} = ctx do
+    # Txs are served only once announced to the peer (AUD-A2-2): connect
+    # first, then wait for every announcement.
+    {pid, sock} = connect(ctx, true)
+    # Registered with TxRelay (at verack) before any tx is accepted.
+    wait_until(fn -> Map.has_key?(:sys.get_state(n.tx_relay).peers, pid) end)
+
     # 20 txs of ~350 bytes each (8 outputs), spending coinbases 1..20.
     txs =
       for b <- Enum.take(blocks, 20) do
@@ -176,7 +194,7 @@ defmodule Exnode.P2P.SendBufferTest do
         tx
       end
 
-    {pid, sock} = connect(ctx)
+    await_announced(sock, txs)
     close(gate)
     unknown = %{type: :wtx, witness: false, hash: :crypto.hash(:sha256, "nope")}
     items = [unknown | for(t <- txs, do: %{type: :wtx, witness: false, hash: t.wtxid})]

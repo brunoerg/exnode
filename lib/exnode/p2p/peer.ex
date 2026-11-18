@@ -1685,8 +1685,11 @@ defmodule Exnode.P2P.Peer do
   # queue, and notfound covers only the items processed.
   defp serve_txs(st, []), do: st
 
+  # Core ProcessGetData: no TxRelay for a block-relay-only peer or one that
+  # sent fRelay = false (we offer no NODE_BLOOM): its tx items are skipped,
+  # with no notfound (AUD-A2-2).
   defp serve_txs(st, tx_items) do
-    if st.node[:tx_relay] != nil do
+    if st.node[:tx_relay] != nil and st.conn_type != :block_relay and st.version.relay do
       # Found txs come back in request order (Mempool.get_txs).
       {txs, missing} = Exnode.P2P.TxRelay.lookup(st.node.tx_relay, tx_items)
       {st, rest, notfound} = push_txs(st, tx_items, txs, MapSet.new(missing), [])
@@ -1707,9 +1710,15 @@ defmodule Exnode.P2P.Peer do
       push_txs(st, rest, txs, missing, [i | nf])
     else
       [tx | txs] = txs
-      push_txs(push(st, {:tx, tx.raw}), rest, txs, missing, nf)
+      push_txs(push(st, {:tx, tx_bytes(tx, i)}), rest, txs, missing, nf)
     end
   end
+
+  # Core: MSG_TX gets TX_NO_WITNESS; MSG_WITNESS_TX and MSG_WTX the full tx.
+  defp tx_bytes(tx, %{type: :tx, witness: false}),
+    do: IO.iodata_to_binary(Exnode.Codec.Tx.encode(tx, witness: false))
+
+  defp tx_bytes(tx, _item), do: tx.raw
 
   # Core ProcessGetBlockData for one item. The block is decoded only when it
   # must be re-encoded (cmpctblock, or without witness); a witness or
