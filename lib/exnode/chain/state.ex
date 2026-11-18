@@ -21,7 +21,8 @@ defmodule Exnode.Chain.State do
   batch reaches `@batch_blocks` blocks or `@batch_bytes` (options
   `:batch_blocks` / `:batch_bytes`), when the oldest is
   `@batch_ms` old (`@batch_ms_behind` while the tip is at least
-  `@batch_blocks` behind the best header), when the tip reaches the best
+  `@near_tip_blocks` behind the best header, option `:near_tip_blocks`),
+  when the tip reaches the best
   header, before any
   disconnect or rejection, and on shutdown. A block's `pending` copy is
   deleted in the same KV batch that commits it, so a crash loses nothing
@@ -65,6 +66,11 @@ defmodule Exnode.Chain.State do
   # on slow blocks left prefetch nothing it could use. This only bounds how
   # long a stalled download leaves blocks uncommitted.
   @batch_ms_behind 300_000
+  # How far behind the best header the tip must be for `@batch_ms_behind`.
+  # Its own setting, not `batch_blocks`: a larger batch (--batch-blocks 2048)
+  # made the 5 s age rule start 2048 blocks out, and on that last stretch
+  # each commit voided prefetch's answers (mainnet: 3.3 -> 1.1 blk/s).
+  @near_tip_blocks 128
   @gc_bytes 256 * 1024 * 1024
   # Blocks the prefetch stage prepares ahead of the one being connected
   # (0 disables it). On by default: on a mainnet sync bound by input
@@ -403,6 +409,7 @@ defmodule Exnode.Chain.State do
       batch_bytes: Keyword.get(opts, :batch_bytes, @batch_bytes),
       batch_ms: Keyword.get(opts, :batch_ms, @batch_ms),
       batch_ms_behind: Keyword.get(opts, :batch_ms_behind, @batch_ms_behind),
+      near_tip_blocks: Keyword.get(opts, :near_tip_blocks, @near_tip_blocks),
       # Blocks prepared ahead by Chain.Prefetch (0 disables it).
       prefetch_depth: Keyword.get(opts, :prefetch_depth, @prefetch_depth),
       pf: nil,
@@ -629,7 +636,9 @@ defmodule Exnode.Chain.State do
     caught_up = st.commit_at_tip and best.hash == tip.hash
 
     max_age =
-      if best.height - tip.height >= st.batch_blocks, do: st.batch_ms_behind, else: st.batch_ms
+      if best.height - tip.height >= st.near_tip_blocks,
+        do: st.batch_ms_behind,
+        else: st.batch_ms
 
     if n >= st.batch_blocks or bytes >= st.batch_bytes or age >= max_age or caught_up or
          st.halted != false,
