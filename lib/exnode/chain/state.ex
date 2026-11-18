@@ -1171,6 +1171,15 @@ defmodule Exnode.Chain.State do
             fail_submitted(st, hash, reason)
         end
 
+      # Core ProcessNewBlock runs CheckBlock before AcceptBlock's
+      # already-have check: a mutated body under a known hash is rejected as
+      # mutated, not ignored as a duplicate.
+      {:ok, :duplicate} = reply ->
+        case checked || check_block(b, st.p) do
+          :ok -> {reply, st}
+          {:error, reason} -> {{:error, reason}, st}
+        end
+
       reply ->
         {reply, st}
     end
