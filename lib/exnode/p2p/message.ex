@@ -78,6 +78,9 @@ defmodule Exnode.P2P.Message do
     {_addr_from, rest} = if rest == <<>>, do: {nil, rest}, else: take_netaddr_v1(rest)
     {nonce, rest} = optional(rest, fn <<n::little-64, r::binary>> -> {n, r} end, 0)
     {ua, rest} = optional(rest, &limited_string(&1, @max_subversion_length), "")
+    # Kept for the connection's lifetime (Peer `version`): a slice of 64 bytes
+    # or more would keep the whole payload, up to 4 MB, alive (AUD-A1-2).
+    ua = :binary.copy(ua)
     {height, rest} = optional(rest, fn <<h::little-signed-32, r::binary>> -> {h, r} end, -1)
     {relay, _rest} = optional(rest, fn <<b, r::binary>> -> {b != 0, r} end, true)
 
