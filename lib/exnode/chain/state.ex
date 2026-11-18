@@ -367,7 +367,8 @@ defmodule Exnode.Chain.State do
         [
           max: opts[:segment_max],
           cache_bytes: opts[:cache_bytes],
-          prune_keep: if(opts[:prune_witness], do: Keyword.get(opts, :prune_keep, 288))
+          prune_keep: if(opts[:prune_witness], do: Keyword.get(opts, :prune_keep, 288)),
+          segwit_height: p.segwit_height
         ]
         |> Enum.reject(&is_nil(elem(&1, 1)))
       )

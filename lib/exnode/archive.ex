@@ -60,7 +60,10 @@ defmodule Exnode.Archive do
     committed: nil,
     committed_next: nil,
     epoch: 0,
-    overwritten: MapSet.new()
+    overwritten: MapSet.new(),
+    # Blocks at or above it are read back expecting their witness
+    # commitment (Core DeploymentActiveAfter(SEGWIT)); 0: every block.
+    segwit_height: 0
   ]
 
   # The uncommitted batch: KV ops (reversed list of per-block op lists) and
@@ -114,7 +117,8 @@ defmodule Exnode.Archive do
       overlay: Overlay.new(cache_bytes),
       batch: empty_batch(),
       prune_keep: Keyword.get(opts, :prune_keep),
-      wpruned_live: :atomics.new(1, signed: true)
+      wpruned_live: :atomics.new(1, signed: true),
+      segwit_height: Keyword.get(opts, :segwit_height, 0)
     }
 
     :atomics.put(a.wpruned_live, 1, -1)
@@ -271,7 +275,8 @@ defmodule Exnode.Archive do
       tip: a.committed || a.tip,
       next: a.committed_next || a.next,
       epoch: a.epoch,
-      overwritten: a.overwritten
+      overwritten: a.overwritten,
+      segwit_height: a.segwit_height
     }
 
   @doc """
@@ -1979,11 +1984,10 @@ defmodule Exnode.Archive do
     {:ok, block} = Block.decode_exact(raw)
     :ok = BlockRules.check_merkle_root(block)
 
-    :ok =
-      BlockRules.check_witness_malleation(
-        block,
-        BlockRules.witness_commitment_index(block) != nil
-      )
+    # Core ContextualCheckBlock: a commitment is expected once segwit is
+    # active, whatever the coinbase looks like. A pre-segwit block may carry
+    # a commitment-shaped output without a coinbase witness (AUD-B5-1).
+    :ok = BlockRules.check_witness_malleation(block, rec.height >= a.segwit_height)
 
     {:ok, raw, block}
   end
