@@ -1,0 +1,9 @@
+# Only what the Dockerfile copies: no _build, deps, vendor or priv/native from
+# the checkout.
+*
+!mix.exs
+!mix.lock
+!Makefile
+!native
+!lib
+!rel

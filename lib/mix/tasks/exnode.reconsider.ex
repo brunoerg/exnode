@@ -25,57 +25,6 @@ defmodule Mix.Tasks.Exnode.Reconsider do
   """
   use Mix.Task
 
-  alias Exnode.Crypto.Hash
-  alias Exnode.Store.KV
-
   @impl true
-  def run(argv) do
-    {opts, args} =
-      OptionParser.parse!(argv,
-        strict: [chain: :string, datadir: :string, all: :boolean, clear_halt: :boolean]
-      )
-
-    chain = Keyword.get(opts, :chain, "mainnet")
-    datadir = opts |> Keyword.get(:datadir, "~/.exnode") |> Path.expand()
-    {:ok, kv} = KV.open(Path.join([datadir, chain, "index"]))
-
-    clear_halt? = Keyword.get(opts, :clear_halt, false)
-
-    case Exnode.Chain.State.halt_mark(kv) do
-      nil ->
-        Mix.shell().info("block connection not halted")
-
-      m when clear_halt? ->
-        :ok = KV.write(kv, [{:delete, :meta, "halt"}], sync: true)
-        Mix.shell().info("cleared halt: #{inspect(m.reason)} (height #{m.height})")
-
-      m ->
-        Mix.shell().info(
-          "HALTED since #{m.time} at height #{m.height} (#{Hash.to_hex(m.hash)}): #{inspect(m.reason)} " <>
-            "(clear with --clear-halt)"
-        )
-    end
-
-    marks =
-      KV.fold_prefix(kv, :poisoned, <<>>, [], fn {k, v}, acc ->
-        [{k, :erlang.binary_to_term(v)} | acc]
-      end)
-
-    targets =
-      cond do
-        opts[:all] -> Enum.map(marks, &elem(&1, 0))
-        args != [] -> Enum.map(args, &Hash.from_hex/1)
-        true -> []
-      end
-
-    if targets == [] do
-      if marks == [] and not clear_halt?, do: Mix.shell().info("no quarantined blocks")
-
-      for {h, m} <- marks,
-          do: Mix.shell().info("#{Hash.to_hex(h)} height #{m.height} at #{m.time}: #{m.error}")
-    else
-      :ok = KV.write(kv, for(h <- targets, do: {:delete, :poisoned, h}), sync: true)
-      for h <- targets, do: Mix.shell().info("cleared #{Hash.to_hex(h)}")
-    end
-  end
+  def run(argv), do: Exnode.CLI.reconsider(argv)
 end

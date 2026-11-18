@@ -6,13 +6,34 @@ ERTS_INCLUDE_DIR ?= $(shell erl -noshell -eval 'io:format("~ts/erts-~ts/include"
 PRIV := $(CURDIR)/priv/native
 
 CFLAGS ?= -O2 -Wall -Wextra -Werror
+# BUNDLE_KERNEL=1 (release builds): copy libbitcoinkernel into priv/native and
+# find it there ($ORIGIN) instead of in the Core checkout, whose absolute path
+# would otherwise be written into the binaries.
+ifeq ($(BUNDLE_KERNEL),1)
+KERNEL_RPATH := $$ORIGIN
+# The library under its SONAME, the name the binaries ask the loader for.
+KERNEL_SONAME := $(shell objdump -p $(KERNEL_LIB)/libbitcoinkernel.so | awk '/SONAME/ {print $$2}')
+KERNEL_BUNDLED := $(PRIV)/$(KERNEL_SONAME)
+else
+KERNEL_RPATH := $(KERNEL_LIB)
+KERNEL_BUNDLED :=
+endif
+
 NIF_CFLAGS := $(CFLAGS) -fPIC -std=c11 -I$(ERTS_INCLUDE_DIR) -I$(KERNEL_INC)
-NIF_LDFLAGS := -shared -L$(KERNEL_LIB) -lbitcoinkernel -Wl,-rpath,$(KERNEL_LIB)
+NIF_LDFLAGS := -shared -L$(KERNEL_LIB) -lbitcoinkernel -Wl,-rpath,'$(KERNEL_RPATH)'
 
 SECP_INC := $(CORE_DIR)/src/secp256k1/include
 SECP_LIB := $(CORE_DIR)/build-kernel/src/secp256k1/lib/libsecp256k1.a
 
-all: $(PRIV)/kernel_nif.so $(PRIV)/shadow_validator $(PRIV)/secp_nif.so
+all: $(PRIV)/kernel_nif.so $(PRIV)/shadow_validator $(PRIV)/secp_nif.so $(KERNEL_BUNDLED)
+
+# A regular file (cp -L): no symlinks in the release.
+ifeq ($(BUNDLE_KERNEL),1)
+$(KERNEL_BUNDLED): $(KERNEL_LIB)/libbitcoinkernel.so
+	@test -n "$(KERNEL_SONAME)" || { echo "no SONAME in $<" >&2; exit 1; }
+	@mkdir -p $(PRIV)
+	cp -L $< $@
+endif
 
 # ElligatorSwift for BIP324: the libsecp256k1 built with the pinned Core.
 $(PRIV)/secp_nif.so: native/secp_nif/secp_nif.c $(SECP_LIB)
@@ -25,7 +46,7 @@ $(PRIV)/kernel_nif.so: native/kernel_nif/kernel_nif.c $(KERNEL_INC)/bitcoinkerne
 
 $(PRIV)/shadow_validator: native/shadow_validator/shadow_validator.c $(KERNEL_INC)/bitcoinkernel.h
 	@mkdir -p $(PRIV)
-	$(CC) $(CFLAGS) -std=c11 -D_POSIX_C_SOURCE=200809L -I$(KERNEL_INC) $< -o $@ -L$(KERNEL_LIB) -lbitcoinkernel -Wl,-rpath,$(KERNEL_LIB)
+	$(CC) $(CFLAGS) -std=c11 -D_POSIX_C_SOURCE=200809L -I$(KERNEL_INC) $< -o $@ -L$(KERNEL_LIB) -lbitcoinkernel -Wl,-rpath,'$(KERNEL_RPATH)'
 
 compile_flags.txt:
 	printf -- '-std=c11\n-I$(ERTS_INCLUDE_DIR)\n-I$(KERNEL_INC)\n' > $@

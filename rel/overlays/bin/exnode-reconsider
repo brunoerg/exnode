@@ -1,0 +1,6 @@
+#!/bin/sh
+# Lists or clears quarantined blocks: the options of `mix exnode.reconsider`.
+# Run it with the node stopped.
+set -e
+SELF=$(readlink -f "$0")
+exec "$(dirname "$SELF")/exnode" eval 'Exnode.CLI.reconsider(System.argv())' "$@"

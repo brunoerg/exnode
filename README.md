@@ -279,6 +279,37 @@ mix deps.get
 mix compile        # also builds the NIFs (Makefile, via elixir_make)
 ```
 
+## Reproducible release
+
+`contrib/release/build.sh` builds a self-contained release (Erlang runtime,
+NIFs and Core's kernel library included) for Linux in Docker, and anyone
+building the same commit gets the same bytes:
+
+```sh
+contrib/release/build.sh                            # this machine's architecture
+PLATFORM=linux/amd64 contrib/release/build.sh       # or a given one
+cat dist/SHA256SUMS                                 # compare with other builders
+```
+
+Every input is pinned (`contrib/release/Dockerfile`): the Debian bookworm
+image by digest, its packages by snapshot.debian.org date, and the Erlang/OTP,
+Elixir, Hex, rebar3 and Bitcoin Core v32.1 sources by hash; Hex packages by
+`mix.lock`. The build uses fixed paths and takes its time stamps from the
+commit (`SOURCE_DATE_EPOCH`). The `Reproducible release` workflow builds each
+change twice on separate runners and fails if the outputs differ.
+
+The tarball needs glibc 2.36 or later (Debian 12, Ubuntu 23.04) and
+libstdc++ and liblz4 (present on any Debian or Ubuntu); OpenSSL is linked
+in. Unpack it anywhere and run:
+
+```sh
+exnode-<version>-<arch>-linux-gnu/bin/exnoded --chain testnet4 --datadir ~/exnode-testnet4
+exnode-<version>-<arch>-linux-gnu/bin/exnode-reconsider --chain testnet4 --datadir ~/exnode-testnet4
+```
+
+They take the options of `mix exnode.node` and `mix exnode.reconsider`. The
+node runs without Erlang distribution, and no cookie ships with the release.
+
 ## Running
 
 ```sh
