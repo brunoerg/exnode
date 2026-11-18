@@ -9,7 +9,10 @@ defmodule Exnode.P2P.Peer do
   Isolation: protocol violations, malformed frames and decode failures end
   only this process. `Misbehaving` in v32.1 means disconnect and discourage
   (there is no score). The peer exits with `{:shutdown, {:misbehaving, why}}`
-  and the connection manager discourages the address.
+  and the connection manager discourages the address; a manual peer is
+  kept, as Core's `MaybeDiscourageAndDisconnect` does. A message that fails
+  to decode is dropped, not punished, as Core drops one that fails to
+  deserialize.
 
   `node` (passed at start) is a map:
     params, headers, addrman, sync, connman (optional), nonce, services,
@@ -1319,7 +1322,9 @@ defmodule Exnode.P2P.Peer do
 
   defp compact_block(st, payload) do
     case CompactBlock.decode(payload) do
-      {:error, _} -> misbehaving(st, "malformed cmpctblock")
+      # Core: a deserialization failure drops the message (AUD-A1-5); an
+      # invalid but well-formed one is misbehaving (CompactBlock.init/2).
+      {:error, why} -> dropped(st, "cmpctblock", why)
       {:ok, c} -> compact_block_decoded(st, c)
     end
   end
@@ -1470,8 +1475,8 @@ defmodule Exnode.P2P.Peer do
   # Core ProcessMessage BLOCKTXN -> ProcessCompactBlockTxns.
   defp block_txn(st, payload) do
     case CompactBlock.decode_blocktxn(payload) do
-      {:error, _} ->
-        misbehaving(st, "malformed blocktxn")
+      {:error, why} ->
+        dropped(st, "blocktxn", why)
 
       {:ok, hash, txs} ->
         case Map.pop(st.partials, hash) do
@@ -1767,8 +1772,8 @@ defmodule Exnode.P2P.Peer do
   # answer with the requested txs; older ones with the full block.
   defp serve_getblocktxn(st, payload) do
     case CompactBlock.decode_getblocktxn(payload) do
-      {:error, _} ->
-        misbehaving(st, "malformed getblocktxn")
+      {:error, why} ->
+        dropped(st, "getblocktxn", why)
 
       # Core: "getblocktxn received with no transaction indexes": disconnect.
       {:ok, _hash, []} ->
@@ -2031,7 +2036,21 @@ defmodule Exnode.P2P.Peer do
     (services &&& want) == want
   end
 
+  # Core Misbehaving + MaybeDiscourageAndDisconnect: disconnect (Connman
+  # discourages), except a manual peer, which Core never disconnects or
+  # discourages (AUD-A2-5).
+  defp misbehaving(%{conn_type: :manual} = st, why) do
+    Logger.info("peer #{inspect(st.target)}: misbehaving (#{why}), but manual: kept")
+    {:ok, st}
+  end
+
   defp misbehaving(st, why), do: {:stop, {:shutdown, {:misbehaving, why}}, st}
+
+  # Core: a message that fails to deserialize is logged and dropped.
+  defp dropped(st, cmd, why) do
+    Logger.debug("peer #{inspect(st.target)}: #{cmd} decode error #{inspect(why)}")
+    {:ok, st}
+  end
 
   defp push(st, msg) do
     {cmd, payload} = Message.encode(msg)

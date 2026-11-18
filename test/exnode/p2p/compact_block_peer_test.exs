@@ -4,7 +4,8 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
   `ProcessMessage` CMPCTBLOCK / BLOCKTXN, `PartiallyDownloadedBlock`),
   over a socket, with a high-bandwidth peer and a stub mempool:
 
-  * a malformed cmpctblock or blocktxn is misbehaviour; a compact block
+  * a malformed cmpctblock or blocktxn is dropped, the peer kept (Core
+    drops a message that fails to deserialize; AUD-A1-5); a compact block
     whose prefilled index is out of range is invalid (misbehaviour);
   * a compact block on an unknown parent makes us sync headers instead;
   * an invalid header via cmpctblock is punished; a cached-invalid header
@@ -122,10 +123,12 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
 
   defp tip(n), do: State.tip(n.chain_state)
 
-  test "a malformed cmpctblock is misbehaviour", %{n: n, bs: bs} do
-    {_pid, sock, _clock, ref} = hb_peer(n, bs)
+  test "a malformed cmpctblock is dropped, the peer kept", %{n: n, bs: bs} do
+    {pid, sock, _clock, ref} = hb_peer(n, bs)
     send_raw(sock, "cmpctblock", <<1, 2, 3>>)
-    assert_stopped(ref, {:misbehaving, "malformed cmpctblock"})
+    before_pong(sock)
+    refute_received {:DOWN, ^ref, _, _, _}
+    assert Process.alive?(pid)
   end
 
   test "a compact block on an unknown parent: headers are synced instead", %{n: n, bs: bs} do
@@ -250,12 +253,14 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     wait_until(fn -> tip(n).hash == b.header.hash end)
   end
 
-  test "a malformed blocktxn is misbehaviour", %{n: n, bs: bs, b151: b} do
-    {_pid, sock, _clock, ref} = hb_peer(n, bs)
+  test "a malformed blocktxn is dropped, the peer kept", %{n: n, bs: bs, b151: b} do
+    {pid, sock, _clock, ref} = hb_peer(n, bs)
     :ok = FakePeer.send_msgs(sock, cmpct(b))
     FakePeer.recv(sock, ["getblocktxn"], 1)
     send_raw(sock, "blocktxn", <<1, 2, 3>>)
-    assert_stopped(ref, {:misbehaving, "malformed blocktxn"})
+    before_pong(sock)
+    refute_received {:DOWN, ^ref, _, _, _}
+    assert Process.alive?(pid)
   end
 
   test "a blocktxn with the wrong number of txs is misbehaviour", %{n: n, bs: bs, b151: b} do

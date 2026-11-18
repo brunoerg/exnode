@@ -8,8 +8,10 @@ defmodule Exnode.DoS.GetblocktxnDecodeTest do
   index list disconnects, as in Core.
 
   Regression (found by fuzzamoto): a payload shorter than the block hash
-  matched no clause of `decode_getblocktxn/1`, so the peer process crashed
-  instead of disconnecting the peer as misbehaving.
+  matched no clause of `decode_getblocktxn/1`, so the peer process crashed.
+  Such a payload, like an index overflow, fails Core's deserialization: the
+  message is dropped and the peer kept (AUD-A1-5; it used to be
+  misbehaviour).
   """
   use Exnode.NodeCase
   @moduletag :dos
@@ -53,19 +55,19 @@ defmodule Exnode.DoS.GetblocktxnDecodeTest do
     end
   end
 
-  test "a getblocktxn shorter than the block hash is misbehaviour, not a crash",
-       %{tmp_dir: dir} do
+  test "a getblocktxn shorter than the block hash is dropped, not a crash", %{tmp_dir: dir} do
     %{n: n} = TestNode.start(dir)
     {pid, sock} = FakePeer.connect_from(n)
     FakePeer.recv(sock, ["verack"], 1)
     ref = Process.monitor(pid)
-    :ok = FakePeer.send_msgs(sock, [{:getblocktxn, @short}])
-
-    assert_receive {:DOWN, ^ref, _, _, {:shutdown, {:misbehaving, "malformed getblocktxn"}}},
-                   5_000
+    :ok = FakePeer.send_msgs(sock, [{:getblocktxn, @short}, {:ping, 1}])
+    FakePeer.recv(sock, ["pong"], 1)
+    refute_received {:DOWN, ^ref, _, _, _}
+    assert Process.alive?(pid)
   end
 
-  test "an oversized getblocktxn costs no memory spike; an empty one disconnects", %{tmp_dir: dir} do
+  test "an oversized getblocktxn costs no memory spike and is dropped; an empty one disconnects",
+       %{tmp_dir: dir} do
     %{n: n} = TestNode.start(dir)
     {pid, sock} = FakePeer.connect_from(n)
     FakePeer.recv(sock, ["verack"], 1)
@@ -73,8 +75,12 @@ defmodule Exnode.DoS.GetblocktxnDecodeTest do
     test = self()
     sampler = spawn(fn -> sample(pid, 0, test) end)
     ref = Process.monitor(pid)
-    :ok = FakePeer.send_msgs(sock, [{:getblocktxn, payload(@n, :binary.copy(<<0>>, @n))}])
-    assert_receive {:DOWN, ^ref, _, _, _}, 10_000
+
+    :ok =
+      FakePeer.send_msgs(sock, [{:getblocktxn, payload(@n, :binary.copy(<<0>>, @n))}, {:ping, 1}])
+
+    FakePeer.recv(sock, ["pong"], 1)
+    refute_received {:DOWN, ^ref, _, _, _}
     send(sampler, :stop)
     assert_receive {:peak, peak}, 2_000
     IO.puts("peer process peak memory on a 3 MB getblocktxn: #{div(peak, 1_000_000)} MB")

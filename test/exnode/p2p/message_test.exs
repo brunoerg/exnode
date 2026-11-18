@@ -105,8 +105,15 @@ defmodule Exnode.P2P.MessageTest do
                Message.decode("headers", CompactSize.encode(2001))
     end
 
-    test "inv larger than MAX_INV_SZ" do
-      assert {:error, {:inv_too_large, 50001}} = Message.decode("inv", CompactSize.encode(50001))
+    # Core checks the size after reading the whole vector (AUD-A1-5).
+    test "inv larger than MAX_INV_SZ: too large if complete, else truncated" do
+      items = :binary.copy(<<1::little-32, 0::256>>, 50_001)
+      count = IO.iodata_to_binary(CompactSize.encode(50_001))
+      assert {:error, {:inv_too_large, 50_001}} = Message.decode("inv", count <> items)
+      assert {:error, :truncated} = Message.decode("inv", count)
+
+      assert {:error, {:notfound_too_large, 50_001}} =
+               Message.decode("notfound", count <> items)
     end
 
     test "user agent longer than 256" do
