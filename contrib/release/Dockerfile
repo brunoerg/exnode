@@ -69,11 +69,15 @@ RUN mix archive.install /tmp/hex.ez --force && \
     mix local.rebar rebar3 /tmp/rebar3 --force && \
     rm /tmp/hex.ez /tmp/rebar3
 
-# Bitcoin Core's kernel library, from the release tarball (hash as in
-# https://bitcoincore.org/bin/bitcoin-core-32.1/SHA256SUMS).
+# Bitcoin Core's kernel library, from GitHub's archive of the v32.1 tag
+# (commit f0de87f040621468b956f01f526a43a010310501). Its files are those of
+# the release tarball, bitcoincore.org's bitcoin-32.1.tar.gz (sha256
+# a5f2f61e32cf7f790641c9ec306a3c88ca7b5a556946956b1f35ffd7e27813f9 in its
+# SHA256SUMS); only the compression differs. GitHub, like the other
+# downloads, so the build does not also depend on bitcoincore.org.
 FROM toolchain AS core
-ADD --checksum=sha256:a5f2f61e32cf7f790641c9ec306a3c88ca7b5a556946956b1f35ffd7e27813f9 \
-    https://bitcoincore.org/bin/bitcoin-core-32.1/bitcoin-32.1.tar.gz /tmp/core.tar.gz
+ADD --checksum=sha256:36324b7529dc37e5026336521dffa730e4ab61663cbe2dac6d1ff4581b244c7e \
+    https://github.com/bitcoin/bitcoin/archive/refs/tags/v32.1.tar.gz /tmp/core.tar.gz
 RUN mkdir -p /src/bitcoin && tar xzf /tmp/core.tar.gz -C /src/bitcoin --strip-components=1 && \
     rm /tmp/core.tar.gz && cd /src/bitcoin && \
     cmake -B build-kernel -DCMAKE_BUILD_TYPE=Release \
