@@ -3,8 +3,9 @@ defmodule Exnode.P2P.TxRelayTest do
   TxRelay resource bounds (per-peer state and per-item work on `inv` are
   bounded, not unbounded and O(global)), with a stub mempool that counts calls and an
   injected clock:
-  * the per-peer known-inventory set is bounded (Core
-    `m_tx_inventory_known_filter`, 50,000), oldest first;
+  * the per-peer known-inventory filter is Core's rolling bloom filter
+    (`m_tx_inventory_known_filter`, 50,000 at 10⁻⁶): fixed size, the last
+    50,000 always known, older generations forgotten;
   * announcements per peer are capped (Core `MAX_PEER_TX_ANNOUNCEMENTS`),
     also on the orphan-parent path;
   * in-flight accounting still applies the overloaded delay;
@@ -21,6 +22,7 @@ defmodule Exnode.P2P.TxRelayTest do
 
   alias Exnode.Codec.Tx
   alias Exnode.P2P.TxRelay
+  alias Exnode.Util.RollingBloom
 
   @known_cap 50_000
   @max_announcements 5_000
@@ -81,6 +83,7 @@ defmodule Exnode.P2P.TxRelayTest do
 
     def handle_call(:sequence, _f, st), do: {:reply, map_size(st.txs), st}
     def handle_call({:has, _, _}, _f, st), do: {:reply, false, st}
+    def handle_call({:has_many, _, _}, _f, st), do: {:reply, MapSet.new(), st}
 
     def handle_call({:accept, tx, _}, {origin, _}, st) do
       send(st.relay, {:mempool_accepted, tx, %{}, origin})
@@ -141,23 +144,23 @@ defmodule Exnode.P2P.TxRelayTest do
 
   defp state(relay), do: :sys.get_state(relay)
   defp ann(relay, peer), do: Map.get(state(relay).ann, peer, %{})
-  defp known(relay, peer), do: state(relay).peers[peer].known
+  defp known(relay, peer), do: state(relay).peers[peer].known_in
 
-  test "known: bounded at 50,000 per peer, oldest evicted first, membership exact" do
+  test "known: a fixed-size rolling filter; the last 50,000 known, older generations forgotten" do
     %{relay: r} = start()
     p = peer(r, %{})
-    hs = hashes(@known_cap + 10_000, 1)
-    {first, second} = Enum.split(hs, @known_cap)
-    inv(r, p, first)
-    inv(r, p, second)
+    # 90,000: past the start of a fourth generation of 25,000 (at 75,000),
+    # which clears the first.
+    hs = hashes(@known_cap + 40_000, 1)
+    for chunk <- Enum.chunk_every(hs, @known_cap), do: inv(r, p, chunk)
     k = known(r, p)
-    assert MapSet.size(k.set) == @known_cap
-    # The 10,000 oldest were evicted; everything newer is still known.
-    refute Enum.any?(Enum.take(hs, 10_000), &MapSet.member?(k.set, &1))
-    assert Enum.all?(Enum.drop(hs, 10_000), &MapSet.member?(k.set, &1))
-    # An evicted hash is unknown again, so it may be announced to the peer
-    # once more (intended: extra bandwidth only).
-    refute MapSet.member?(k.set, hd(hs))
+    assert RollingBloom.bytes(k) == 539_168
+    # Core's guarantee: the newest 50,000 are always known.
+    assert Enum.all?(Enum.take(hs, -@known_cap), &RollingBloom.contains?(k, &1))
+    # The first generation is gone (a false positive or two at 10^-6 is
+    # possible in principle): such a hash may be announced to the peer again
+    # (extra bandwidth only).
+    assert Enum.count(Enum.take(hs, 25_000), &RollingBloom.contains?(k, &1)) <= 1
   end
 
   test "announcements: capped at 5,000 per peer; another peer is unaffected" do
@@ -246,7 +249,7 @@ defmodule Exnode.P2P.TxRelayTest do
     assert_received {:mp, :has_many, :wtxid, 50_000}
     refute_received {:mp, :has_many, :txid, _}
     refute_received {:mp, :has, _}
-    assert MapSet.size(known(r, p).set) <= @known_cap
+    assert RollingBloom.bytes(known(r, p)) == 539_168
     assert map_size(ann(r, p)) <= @max_announcements
   end
 
@@ -277,6 +280,36 @@ defmodule Exnode.P2P.TxRelayTest do
     assert_receive {:peer, ^other, {:send, {:inv, items}}}, 2_000
     assert Enum.map(items, & &1.hash) == [tx.wtxid]
     refute_receive {:peer, ^source, {:send, {:inv, _}}}, 300
+  end
+
+  test "AUD-A4-3: a peer's own known filter is read, not written, and keeps its txs from being announced back" do
+    clock = :atomics.new(1, [])
+    :atomics.put(clock, 1, 1_000_000)
+    {:ok, mp} = AcceptingMempool.start_link(self())
+    {:ok, r} = TxRelay.start_link(mempool: mp, clock: fn -> :atomics.get(clock, 1) end)
+    GenServer.cast(mp, {:listener, r})
+    announcer = peer(r, %{})
+    other = peer(r, %{})
+
+    tx = Exnode.Test.Coins.tx([{<<2::256>>, 0, 10_000}], [{9_000, Exnode.Test.Coins.p2wsh()}])
+
+    # As Peer does: the hash goes into the peer's own filter, which comes
+    # with the inv; TxRelay adds nothing to it.
+    known = TxRelay.new_known_filter()
+    RollingBloom.insert(known, tx.wtxid)
+    :ok = TxRelay.inv(r, announcer, [%{type: :wtx, hash: tx.wtxid}], known)
+    assert state(r).peers[announcer].known_in == known
+    assert :atomics.get(known.a, 1) == 1
+
+    # The tx then arrives from elsewhere (RPC): queued for both peers, but
+    # the announcer, which announced it, is not sent an inv for it.
+    {:ok, _} = GenServer.call(mp, {:accept, tx, nil})
+    _ = state(r)
+    :atomics.add(clock, 1, 600_000)
+    send(r, :tick)
+    assert_receive {:peer, ^other, {:send, {:inv, items}}}, 2_000
+    assert Enum.map(items, & &1.hash) == [tx.wtxid]
+    refute_receive {:peer, ^announcer, {:send, {:inv, _}}}, 300
   end
 
   test "hashes already in the mempool are not announced" do

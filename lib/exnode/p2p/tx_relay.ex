@@ -29,11 +29,11 @@ defmodule Exnode.P2P.TxRelay do
   cap and Core's global latency score cap (`DEFAULT_MAX_ORPHANAGE_LATENCY_SCORE`),
   trimmed from the peer with the highest latency score rather than Core's
   DoS-score heap, and the
-  filters are exact sets bounded by FIFO eviction rather than rolling bloom
-  filters. That includes each peer's known-inventory set (Core
-  `m_tx_inventory_known_filter`, 50,000 entries): when it is full the
-  oldest hash is forgotten, so an old tx may be announced to that peer again
-  (extra bandwidth only).
+  global filters (recent rejects, reconsiderable, confirmed) are exact sets
+  bounded by FIFO eviction rather than rolling bloom filters. Each peer's
+  known-inventory filter is Core's rolling bloom filter
+  (`m_tx_inventory_known_filter`, 50,000 at 10⁻⁶, `Exnode.Util.RollingBloom`):
+  fixed size and off TxRelay's heap, allocated on first use (AUD-A4-3).
 
   Cost per message: announcements are kept per peer (`ann`: peer => hash =>
   entry), so the per-peer cap is an O(1) check; the in-flight count is a
@@ -57,6 +57,7 @@ defmodule Exnode.P2P.TxRelay do
   use GenServer
 
   alias Exnode.P2P.InvBucket
+  alias Exnode.Util.RollingBloom
   require Logger
 
   alias Exnode.Mempool
@@ -79,6 +80,8 @@ defmodule Exnode.P2P.TxRelay do
   @filter_cap 120_000
   # Core: m_tx_inventory_known_filter{50000, 0.000001} (net_processing.cpp).
   @known_cap 50_000
+  # Core m_tx_inventory_known_filter{50000, 0.000001}.
+  @known_fp 1.0e-6
 
   # Mempool answers about its own state at that moment (MP-5 in
   # STATE_MACHINES.md), not about the tx: caching them as fee failures
@@ -98,7 +101,18 @@ defmodule Exnode.P2P.TxRelay do
   `ProcessMessage` runs inline (no timeout; the peer's inactivity timeout
   bounds it).
   """
-  def inv(server, peer, items), do: peer_call(server, {:inv, peer, items}, :ok)
+  def inv(server, peer, items), do: peer_call(server, {:inv, peer, items, nil}, :ok)
+
+  @doc """
+  `inv/3` from a peer that already put the announced tx hashes in its own
+  known filter (`new_known_filter/0`, Core AddKnownTx): TxRelay keeps the
+  handle and reads it, so the inserts run in the peer's process, not here.
+  """
+  def inv(server, peer, items, known),
+    do: peer_call(server, {:inv, peer, items, known}, :ok)
+
+  @doc "A peer's known-inventory filter (Core m_tx_inventory_known_filter{50000, 0.000001})."
+  def new_known_filter, do: RollingBloom.new(@known_cap, @known_fp)
 
   @doc "A tx a peer sent: `ProcessTransaction` inline, as `inv/3` (`:ok`)."
   def received_tx(server, peer, tx), do: peer_call(server, {:tx, peer, tx}, :ok)
@@ -260,6 +274,12 @@ defmodule Exnode.P2P.TxRelay do
 
   defp f_has?(f, h), do: MapSet.member?(f.set, h)
 
+  # Known to the peer: announced by us, or by it.
+  defp known_to?(out, inn, h),
+    do:
+      (out != nil and RollingBloom.contains?(out, h)) or
+        (inn != nil and RollingBloom.contains?(inn, h))
+
   # --- casts ---------------------------------------------------------------------
 
   @impl true
@@ -270,7 +290,13 @@ defmodule Exnode.P2P.TxRelay do
     p =
       Map.merge(
         %{
-          known: new_filter(),
+          # Core m_tx_inventory_known_filter, in two RollingBlooms created on
+          # first use (nil: none yet): `known` what we announced to the peer
+          # (written here), `known_in` what it announced to us (written by
+          # the peer process, which passes the handle with its invs; here
+          # only for inv/3).
+          known: nil,
+          known_in: nil,
           to_send: [],
           feefilter: 0,
           next_inv_at: now + inv_delay(info),
@@ -288,7 +314,7 @@ defmodule Exnode.P2P.TxRelay do
   def handle_cast({:announce, tx, source}, st), do: {:noreply, queue_announce(st, tx, source)}
 
   @impl true
-  def handle_call({:inv, peer, items}, _from, st) do
+  def handle_call({:inv, peer, items, ext_known}, _from, st) do
     case st.peers[peer] do
       nil ->
         {:reply, :ok, st}
@@ -306,15 +332,25 @@ defmodule Exnode.P2P.TxRelay do
           end)
           |> Enum.uniq_by(&{&1.type, &1.hash})
 
-        # Bounded (Core m_tx_inventory_known_filter): oldest hashes are forgotten.
-        peers =
-          put_in(
-            st.peers,
-            [peer, :known],
-            Enum.reduce(items, p.known, &f_insert(&2, &1.hash, @known_cap))
-          )
+        # Core AddKnownTx. The peer did it in its own filter: keep the
+        # handle. Otherwise (inv/3) insert here.
+        st =
+          case {ext_known, p.known_in} do
+            {nil, nil} ->
+              k = new_known_filter()
+              Enum.each(items, &RollingBloom.insert(k, &1.hash))
+              put_in(st.peers[peer].known_in, k)
 
-        st = %{st | peers: peers}
+            {nil, k} ->
+              Enum.each(items, &RollingBloom.insert(k, &1.hash))
+              st
+
+            {ext, ext} ->
+              st
+
+            {ext, _} ->
+              put_in(st.peers[peer].known_in, ext)
+          end
 
         # Invariant over one inv, so computed once: the peer's in-flight count
         # (only send_requests/2, on the tick, marks entries :requested), whether
@@ -1414,12 +1450,14 @@ defmodule Exnode.P2P.TxRelay do
         e.fee < Exnode.Mempool.Policy.fee_for(p.feefilter, e.vsize) ->
           {items, known}
 
-        f_has?(known, hash) ->
+        known_to?(known, p.known_in, hash) ->
           {items, known}
 
         true ->
+          known = known || new_known_filter()
+
           {[%{type: if(p.wtxid_relay, do: :wtx, else: :tx), witness: false, hash: hash} | items],
-           f_insert(known, hash, @known_cap)}
+           RollingBloom.insert(known, hash)}
       end
     end)
     |> then(fn {items, known} -> {Enum.reverse(items), known} end)
