@@ -94,4 +94,54 @@ defmodule Exnode.RPC.MocktimeTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, reason}}
     assert reason in [:send_timeout, :receive_timeout]
   end
+
+  # Core times tx requests on NodeClock (GetTime in ProcessMessage "inv" and
+  # SendMessages), which setmocktime sets: the request delay passes when the
+  # mock time moves past it. (On the monotonic clock, it took 2 s of real
+  # time whatever the mock time.)
+  test "a tx request delay runs on the mock clock", %{tmp_dir: dir} do
+    %{n: n, clock: c, name: name, port: port} = TestNode.start(dir, listen: 0)
+    # An hour after genesis: out of IBD, when tx invs are not ignored.
+    t0 = @p.genesis.header.time + 3600
+    {:ok, nil} = Methods.call("setmocktime", [t0], ctx(n, c))
+
+    # Inbound: not preferred, so the request waits 2 s (Core NONPREF_PEER_TX_DELAY).
+    sock = FakePeer.dial(port, version: %{relay: true})
+    _ = FakePeer.recv(sock, ["verack"], 1)
+    wait_until(fn -> map_size(Connman.peers(n.connman)) == 1 end)
+
+    hash = :crypto.strong_rand_bytes(32)
+    :ok = FakePeer.send_msgs(sock, [{:inv, [%{type: :tx, hash: hash}]}])
+
+    # The inv is in once a ping sent after it is answered.
+    :ok = FakePeer.send_msgs(sock, [{:ping, 7}])
+    [{"pong", <<7::little-64>>}] = FakePeer.recv(sock, ["pong"], 1)
+
+    # 1 s on the mock clock: not yet.
+    {:ok, nil} = Methods.call("setmocktime", [t0 + 1], ctx(n, c))
+    :ok = Exnode.Node.tick(name)
+    refute "getdata" in commands(sock, 200)
+
+    # 2 s: requested at once, long before 2 s of real time have passed.
+    {:ok, nil} = Methods.call("setmocktime", [t0 + 2], ctx(n, c))
+    :ok = Exnode.Node.tick(name)
+    [{"getdata", payload}] = FakePeer.recv(sock, ["getdata"], 1, timeout: 500)
+    assert {:ok, {:getdata, [%{hash: ^hash}]}} = Exnode.P2P.Message.decode("getdata", payload)
+  end
+
+  # The commands of the messages received within `ms`.
+  defp commands(sock, ms, buf \\ <<>>, acc \\ []) do
+    magic = @p.magic
+
+    case Exnode.P2P.Frame.decode(magic, buf) do
+      {:ok, cmd, _payload, rest} ->
+        commands(sock, ms, rest, [cmd | acc])
+
+      _ ->
+        case :gen_tcp.recv(sock, 0, ms) do
+          {:ok, data} -> commands(sock, ms, buf <> data, acc)
+          {:error, :timeout} -> Enum.reverse(acc)
+        end
+    end
+  end
 end

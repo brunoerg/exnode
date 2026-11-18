@@ -426,11 +426,13 @@ defmodule Exnode.Node do
               index_scripts: Keyword.get(opts, :index_scripthash, false),
               listeners: [n.tx_relay]
             },
+            # Core times tx requests, the trickle and the inv buckets on
+            # NodeClock, which setmocktime moves: the node clock, not mono.
             {Exnode.P2P.TxRelay,
              name: n.tx_relay,
              mempool: n.mempool,
              peer_sup: n.peer_sup,
-             clock: fn -> Exnode.Clock.mono(clock, :millisecond) end}
+             clock: fn -> Exnode.Clock.now_ms(clock) end}
           ]),
           group(
             n.p2p_sup,
