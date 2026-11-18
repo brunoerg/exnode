@@ -46,8 +46,9 @@ defmodule Exnode.Test.FakePeer do
     1, services 9, user agent "/t/". Anything else (tx_relay, mempool,
     a clock...) is added here.
   * `:params`: chain params (default regtest).
-  * `:conn_type`: the peer's connection type (default `:manual`), e.g.
-    `:outbound_full_relay` or `:block_relay`.
+  * `:conn_type`: the peer's connection type (default
+    `:outbound_full_relay`), e.g. `:block_relay` or `:manual` (never
+    disconnected for misbehaving, as in Core).
   * `:handshake`: `false` sends nothing; by default version and verack are
     sent, built by `version/1` from `:version`.
   * `:after_handshake`: extra messages sent with the handshake (one write).
@@ -84,7 +85,7 @@ defmodule Exnode.Test.FakePeer do
         {Peer,
          %{
            node: node,
-           conn_type: Keyword.get(opts, :conn_type, :manual),
+           conn_type: Keyword.get(opts, :conn_type, :outbound_full_relay),
            connect: {"127.0.0.1", port}
          }}
       )

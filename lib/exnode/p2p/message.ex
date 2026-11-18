@@ -133,16 +133,31 @@ defmodule Exnode.P2P.Message do
     {:ok, {:headers, headers}}
   end
 
+  # Over-size vectors (AUD-A1-5): Core deserializes the whole vector before
+  # checking its size, so only a complete one is misbehaving; a truncated
+  # one throws in deserialization and is dropped. `notfound` has no size
+  # check that punishes: Core ignores a large one.
   defp do_decode(cmd, payload) when cmd in ["inv", "getdata", "notfound"] do
     {n, rest} = CompactSize.decode(payload)
-    if n > @max_inv_sz, do: throw({:codec_error, {:inv_too_large, n}})
+
+    cond do
+      n <= @max_inv_sz -> :ok
+      byte_size(rest) < n * 36 -> throw({:codec_error, :truncated})
+      cmd == "notfound" -> throw({:codec_error, {:notfound_too_large, n}})
+      true -> throw({:codec_error, {:inv_too_large, n}})
+    end
+
     {items, _} = take_n(n, rest, &take_inv/1)
     {:ok, {String.to_atom(cmd), items}}
   end
 
   defp do_decode("addr", payload) do
     {n, rest} = CompactSize.decode(payload)
-    if n > @max_addr_to_send, do: throw({:codec_error, {:addr_too_large, n}})
+
+    if n > @max_addr_to_send do
+      if byte_size(rest) < n * 30, do: throw({:codec_error, :truncated})
+      throw({:codec_error, {:addr_too_large, n}})
+    end
 
     {addrs, _} =
       take_n(n, rest, fn
@@ -159,7 +174,14 @@ defmodule Exnode.P2P.Message do
 
   defp do_decode("addrv2", payload) do
     {n, rest} = CompactSize.decode(payload)
-    if n > @max_addr_to_send, do: throw({:codec_error, {:addr_too_large, n}})
+
+    if n > @max_addr_to_send do
+      # Entries vary in size: read them all (none kept), as Core does
+      # before its check; a malformed one throws first.
+      skip_n(n, rest, &take_addrv2/1)
+      throw({:codec_error, {:addr_too_large, n}})
+    end
+
     {addrs, _} = take_n(n, rest, &take_addrv2/1)
     {:ok, {:addrv2, Enum.reject(addrs, &is_nil/1)}}
   end
@@ -206,6 +228,21 @@ defmodule Exnode.P2P.Message do
   end
 
   defp take_n(n, bin, f), do: take_n(n, bin, f, [])
+
+  # Reads n items, keeping none.
+  defp skip_n(0, _bin, _f), do: :ok
+
+  defp skip_n(n, bin, f) do
+    {_item, rest} =
+      try do
+        f.(bin)
+      rescue
+        FunctionClauseError -> throw({:codec_error, :truncated})
+      end
+
+    skip_n(n - 1, rest, f)
+  end
+
   defp take_n(0, bin, _f, acc), do: {Enum.reverse(acc), bin}
 
   defp take_n(n, bin, f, acc) do

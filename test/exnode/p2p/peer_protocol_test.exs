@@ -8,8 +8,11 @@ defmodule Exnode.P2P.PeerProtocolTest do
     ourselves (our nonce) are disconnected; a second version or verack is
     ignored, as is anything before version;
   * wtxidrelay or sendaddrv2 after verack disconnects;
-  * after the handshake, oversized headers / inv / addr and a
-    non-continuous headers sequence are misbehaviour; a tx from a
+  * after the handshake, oversized headers (by the count alone), oversized
+    complete inv / getdata / addr / addrv2 and a non-continuous headers
+    sequence are misbehaviour; a truncated oversized vector and an
+    oversized notfound are dropped, and a manual peer is never
+    disconnected for misbehaving (Core; AUD-A1-5 / A2-5); a tx from a
     block-relay-only peer disconnects it;
   * timeouts on a mock clock, run by explicit ticks: no handshake within
     60 s, no pong within 20 min, and the headers-sync deadline: a peer
@@ -179,18 +182,64 @@ defmodule Exnode.P2P.PeerProtocolTest do
   end
 
   describe "after the handshake" do
-    # Only the count is sent: the size check comes before any item is read.
-    for {cmd, n, why} <- [
-          {"headers", 2_001, "headers message size = 2001"},
-          {"inv", 50_001, "inv message size = 50001"},
-          {"addr", 1_001, "addr message size = 1001"}
+    # Core reads the headers count and checks it before any header.
+    test "an oversized headers is misbehaviour from its count alone", %{n: n} do
+      {pid, sock, _clock, ref} = connect(n)
+      handshaked(pid)
+      send_raw(sock, "headers", CompactSize.encode(2_001))
+      assert_stopped(ref, {:misbehaving, "headers message size = 2001"})
+    end
+
+    # Core deserializes the whole vector before checking its size: a
+    # complete oversized one is misbehaviour (AUD-A1-5).
+    for {cmd, n, item, why} <- [
+          {"inv", 50_001, <<1::little-32, 0::256>>, "inv message size = 50001"},
+          {"getdata", 50_001, <<1::little-32, 0::256>>, "inv message size = 50001"},
+          {"addr", 1_001, <<0::32, 1::little-64, 0::80, 0xFFFF::16, 1, 2, 3, 4, 8333::16>>,
+           "addr message size = 1001"},
+          {"addrv2", 1_001, <<0::32, 1, 1, 4, 1, 2, 3, 4, 8333::16>>, "addr message size = 1001"}
         ] do
-      test "an oversized #{cmd} is misbehaviour", %{n: n} do
+      test "a complete oversized #{cmd} is misbehaviour", %{n: n} do
         {pid, sock, _clock, ref} = connect(n)
         handshaked(pid)
-        send_raw(sock, unquote(cmd), CompactSize.encode(unquote(n)))
+        payload = [CompactSize.encode(unquote(n)), :binary.copy(unquote(item), unquote(n))]
+        send_raw(sock, unquote(cmd), payload)
         assert_stopped(ref, {:misbehaving, unquote(why)})
       end
+    end
+
+    # A truncated oversized vector throws in Core's deserialization: the
+    # message is dropped, the peer kept. Before, the count alone was
+    # misbehaviour. An oversized notfound is ignored by Core even complete.
+    test "a truncated oversized vector, or an oversized notfound, is dropped", %{n: n} do
+      {pid, sock, _clock, ref} = connect(n)
+      handshaked(pid)
+      inv = <<1::little-32, 0::256>>
+
+      for {cmd, payload} <- [
+            {"inv", CompactSize.encode(50_001)},
+            {"getdata", CompactSize.encode(50_001)},
+            {"addr", CompactSize.encode(1_001)},
+            {"addrv2", CompactSize.encode(1_001)},
+            {"notfound", [CompactSize.encode(50_001), :binary.copy(inv, 50_001)]}
+          ] do
+        send_raw(sock, cmd, payload)
+        until_pong(sock, System.unique_integer([:positive]))
+        refute_received {:DOWN, ^ref, _, _, _}, cmd
+      end
+
+      assert Process.alive?(pid)
+    end
+
+    # Core MaybeDiscourageAndDisconnect: a manual peer is never disconnected
+    # (nor discouraged) for misbehaving (AUD-A2-5).
+    test "a misbehaving manual peer is kept", %{n: n} do
+      {pid, sock, _clock, ref} = connect(n, conn_type: :manual)
+      handshaked(pid)
+      send_raw(sock, "headers", CompactSize.encode(2_001))
+      until_pong(sock, System.unique_integer([:positive]))
+      refute_received {:DOWN, ^ref, _, _, _}
+      assert Process.alive?(pid)
     end
 
     test "a non-continuous headers sequence is misbehaviour", %{n: n} do

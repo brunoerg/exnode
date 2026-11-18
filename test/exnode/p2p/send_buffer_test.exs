@@ -120,7 +120,7 @@ defmodule Exnode.P2P.SendBufferTest do
     :ok = Clock.tick(pid)
     assert :queue.len(peer_state(pid).getdata_queue) == left
     # The peer process is not blocked in a socket send: calls are answered.
-    assert %{conn_type: :manual} = Task.await(Task.async(fn -> Peer.info(pid) end), 1_000)
+    assert %{conn_type: :outbound_full_relay} = Task.await(Task.async(fn -> Peer.info(pid) end), 1_000)
 
     open(gate)
     got = FakePeer.recv(sock, ["block", "pong"], 11)
