@@ -28,7 +28,7 @@
 # lengths, counts, SHA-256 checksums (REPLAY_CHECKSUMS=0 skips only the
 # hashing), continuity, expected parent and terminal hashes; without one, it
 # is a legacy export, checked as testnet4 headers and blocks from height 1
-# (scripts/replay_manifest.exs writes its manifest). An export starting
+# (Dataset.legacy/2). An export starting
 # above height 1 needs REPLAY_SEED=<seed store at the parent> (a store with
 # seed.json, made by REPLAY_WRITE_SEED=1): it is cloned into <fresh_datadir>
 # (never written itself) and its tip and effects digest are checked against
@@ -236,7 +236,7 @@ setup =
   end
 
 # The index must start where the archive does: complete at the seed's tip
-# (an indexed seed, scripts/index_backfill.exs INDEX_WRITE_SEED=1), or empty
+# (an indexed seed, from an indexed replay with REPLAY_WRITE_SEED=1), or empty
 # from genesis. Checked against the seed's recorded index identity (tip; with
 # REPLAY_INDEX_DIGEST=1 also every row), outside the measured interval.
 setup =

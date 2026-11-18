@@ -232,19 +232,6 @@ are accepted by exnode's mempool. These are documented compatibility differences
 not additional block-validity rules. The gaps are listed in the moduledocs of
 `Exnode.Mempool.Policy`, `Exnode.Mempool.Pool` and `Exnode.P2P.TxRelay`.
 
-## Performance evidence
-
-These choices expose useful concurrency and reduce repeated work, but do not
-establish that exnode is faster than Bitcoin Core. The controlled IBD
-measurements used testnet4, a warm page cache and explicit validation/index
-settings. Mainnet sync observations
-are useful operational evidence, not a matched Core benchmark.
-
-Compare active, durable and index-ready endpoints separately. Worker busy time
-and script latency overlap across jobs and cannot be summed into wall time.
-Assumevalid/full-script mode, cache state, storage and enabled services must be
-recorded with a throughput claim.
-
 ## Building
 
 Requirements: Erlang/OTP 28 and Elixir 1.19 (pinned in `.tool-versions`;
