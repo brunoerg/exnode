@@ -46,6 +46,20 @@ defmodule Exnode.Clock do
     end
   end
 
+  @doc """
+  Unix milliseconds: the mock time if one is set (Core `NodeClock::now()`,
+  as `GetTime<std::chrono::microseconds>()` reads it). With a mock time it
+  moves only by `set/2` and `advance/2`, in whole seconds.
+  """
+  def now_ms(nil), do: System.os_time(:millisecond)
+
+  def now_ms(%__MODULE__{ref: r}) do
+    case :atomics.get(r, 1) do
+      0 -> System.os_time(:millisecond)
+      t -> t * 1000
+    end
+  end
+
   @doc "Monotonic time in `unit`: frozen once `advance/2` was called, then moved only by it."
   def mono(clock, unit \\ :millisecond)
   def mono(nil, unit), do: System.monotonic_time(unit)

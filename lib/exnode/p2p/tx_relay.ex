@@ -204,7 +204,8 @@ defmodule Exnode.P2P.TxRelay do
        orphan_work_peers: :queue.new(),
        orphan_work_set: MapSet.new(),
        orphan_work_scheduled: false,
-       now: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
+       # Milliseconds on the node clock (Core NodeClock: the mock time when set).
+       now: Keyword.get(opts, :clock, fn -> Exnode.Clock.now_ms(nil) end),
        # Core InvToSendBucket: global announcement backlogs and token buckets,
        # one for inbound peers and one for outbound (rate x 2.5).
        inv_in: InvBucket.new(Keyword.get(opts, :tx_send_rate, InvBucket.default_rate()), 1.0),
