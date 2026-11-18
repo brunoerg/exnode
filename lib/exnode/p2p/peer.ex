@@ -30,6 +30,7 @@ defmodule Exnode.P2P.Peer do
   alias Exnode.Consensus.Pow
   alias Exnode.P2P.{AddrMan, BlockDownload, Frame, FrameBuffer, HeadersSync, Message, SyncState}
   alias Exnode.P2P.DecodeBudget
+  alias Exnode.Util.RollingBloom
   alias Exnode.P2P.V2.Transport
 
   # net.cpp m_peer_connect_timeout default (DEFAULT_PEER_CONNECT_TIMEOUT)
@@ -141,6 +142,9 @@ defmodule Exnode.P2P.Peer do
       # (newest first, at most @max_cmpct_seen): Core marks such a block in
       # flight from the peer, so a resend is "already syncing" and ignored.
       cmpct_seen: [],
+      # Core m_tx_inventory_known_filter, the part this peer announced to us:
+      # a RollingBloom written here, read by TxRelay (AUD-A4-3).
+      known_in: nil,
       # Blocks rebuilt from this peer's compact blocks that the chain state
       # stored for a deferred verdict (newest first, at most @max_partials):
       # their {:block_checked, ...} is via_compact_block (Core mapBlockSource
@@ -795,9 +799,19 @@ defmodule Exnode.P2P.Peer do
     tx_items = Enum.filter(items, &(&1.type in [:tx, :wtx]))
 
     # Core: tx announcements are ignored during IBD and from block-relay peers.
-    if tx_items != [] and st.node[:tx_relay] != nil and st.conn_type != :block_relay and
-         not initial_block_download?(st),
-       do: Exnode.P2P.TxRelay.inv(st.node.tx_relay, self(), tx_items)
+    st =
+      if tx_items != [] and st.node[:tx_relay] != nil and st.conn_type != :block_relay and
+           not initial_block_download?(st) do
+        # Core AddKnownTx, here rather than in the shared TxRelay: MSG_WTX
+        # from a wtxid-relay peer, MSG_TX from the others.
+        known = st.known_in || Exnode.P2P.TxRelay.new_known_filter()
+        kind = if st.wtxid_relay, do: :wtx, else: :tx
+        for %{type: ^kind, hash: h} <- tx_items, do: RollingBloom.insert(known, h)
+        Exnode.P2P.TxRelay.inv(st.node.tx_relay, self(), tx_items, known)
+        %{st | known_in: known}
+      else
+        st
+      end
 
     idx = Headers.index(st.node.headers)
 
