@@ -1,6 +1,6 @@
 defmodule Exnode.P2P.GetdataTxAnnouncedTest do
   @moduledoc """
-  AUD-A2-2 (SECURITY_AUDIT_REPORT.md; regression): a tx getdata is served
+  Regression: a tx getdata is served
   as Core's `ProcessGetData` / `FindTxForGetData`:
 
   * only a tx that entered the mempool before the last inv we sent the

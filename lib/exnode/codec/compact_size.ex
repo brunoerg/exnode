@@ -62,7 +62,7 @@ defmodule Exnode.Codec.CompactSize do
   def decode_bytes(bin) do
     case decode(bin) do
       # The empty vector is the shared literal: no heap per item. A witness
-      # stack of millions of empty items (AUD-A1-1) otherwise cost a fresh
+      # stack of millions of empty items otherwise cost a fresh
       # binary each, ~45 B of heap per wire byte.
       {0, rest} ->
         {<<>>, rest}

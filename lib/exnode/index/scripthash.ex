@@ -56,8 +56,8 @@ defmodule Exnode.Index.Scripthash do
   soon as more than `limit` are unspent at any point of the scan (electrs'
   `utxo_delta`, `--utxos-limit`). The rows are folded in chain order, a
   spend always after the funding it spends, so only the outputs unspent so
-  far are held: memory is bounded by `limit`, not by the history's length
-  (AUD-A7-1). In the caller, like `history/2`.
+  far are held: memory is bounded by `limit`, not by the history's length.
+  In the caller, like `history/2`.
   """
   def utxos(server, sh, limit) do
     unspent =
@@ -281,7 +281,7 @@ defmodule Exnode.Index.Scripthash do
 
   # The indexed chain contains `hash` (at its height), not only as its tip:
   # a caller waiting for a tip the index has already passed used to wait
-  # until its timeout (SVC-5 in STATE_MACHINES.md).
+  # until its timeout.
   defp indexed?(st, hash) do
     case Follower.tip(st.kv, @cf) do
       {_, ^hash} ->

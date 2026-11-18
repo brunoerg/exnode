@@ -109,7 +109,7 @@ defmodule Exnode.Archive.PruneColdTest do
     stop(n)
   end
 
-  # CS-3 (STATE_MACHINES.md): with a mempool, disconnect_to read each
+  # Regression: with a mempool, disconnect_to read each
   # disconnected block raw for the mempool's re-add; a block below the
   # pruning horizon gave {:error, :witness_pruned} and a MatchError, so a
   # reorg deeper than the kept blocks crashed the chain state on every
@@ -138,7 +138,7 @@ defmodule Exnode.Archive.PruneColdTest do
     stop(n)
   end
 
-  # SVC-7 (STATE_MACHINES.md): a reader carries the prune point of its
+  # Regression: a reader carries the prune point of its
   # commit. A prune after it deleted witness files the reader still thought
   # present, and its next read of them crashed on the missing file (REST
   # answered 500).

@@ -62,7 +62,7 @@ defmodule Exnode.DoS.ListenerAcceptTest do
     def handle_call({:accept_inbound?, _}, _f, test), do: {:stop, :normal, true, test}
   end
 
-  # P2P-4 (STATE_MACHINES.md): registration was a cast, dropped while
+  # Regression: registration was a cast, dropped while
   # Connman restarted, and the peer then ran untracked (outside the inbound
   # limit and eviction). Now it is a call; with no Connman the connection
   # is refused.

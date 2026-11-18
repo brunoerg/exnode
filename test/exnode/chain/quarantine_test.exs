@@ -122,7 +122,7 @@ defmodule Exnode.Chain.QuarantineTest do
     assert KV.get(kv, :poisoned, hash) == :not_found
   end
 
-  # CS-4 (STATE_MACHINES.md): a block quarantined while being reconnected
+  # Regression: a block quarantined while being reconnected
   # from the archive (after a reorg away from it) has no pending copy.
   # reconsider_poisoned re-held pending copies only, so it was no candidate
   # again until a restart rebuilt the candidates.
@@ -158,7 +158,7 @@ defmodule Exnode.Chain.QuarantineTest do
     assert State.tip(cs).hash == hash
   end
 
-  # CS-5 (STATE_MACHINES.md): during startup replay, init waits in a
+  # Regression: during startup replay, init waits in a
   # selective receive that ignored the private script executor's DOWN: if
   # the executor died there, init waited forever for its job results.
   test "the private script executor dying during startup replay fails the start instead of hanging",
@@ -184,7 +184,7 @@ defmodule Exnode.Chain.QuarantineTest do
              Task.yield(task, 10_000) || Task.shutdown(task, :brutal_kill)
   end
 
-  # BD-1 (STATE_MACHINES.md): BlockDownload selects blocks the chain
+  # Regression: BlockDownload selects blocks the chain
   # view does not "have". A quarantined block's body stays in `pending` and
   # resubmission is refused, so it must count as had: otherwise it is the
   # earliest missing block and every peer downloads it again, forever.
@@ -309,7 +309,7 @@ defmodule Exnode.Chain.QuarantineTest do
     assert State.tip(cs3).hash == hash
   end
 
-  # CS-1 (STATE_MACHINES.md): the crashing callback had already made a
+  # Regression: the crashing callback had already made a
   # durable commit; terminate/2 must not write its older pre-callback state
   # (meta tip/ends) over it.
   test "a crash after a commit in the same turn: terminate keeps the newer commit, the restart resumes past it",

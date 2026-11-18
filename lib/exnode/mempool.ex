@@ -146,7 +146,7 @@ defmodule Exnode.Mempool do
     GenServer.call(server, {:match_short_ids, keys, wanted}, :infinity)
   catch
     # Called by peers: a mempool restarting under them is an empty mempool
-    # pass (the missing txs are requested), not a dropped peer (MP-3).
+    # pass (the missing txs are requested), not a dropped peer.
     :exit, _ -> %{}
   end
 
@@ -390,8 +390,7 @@ defmodule Exnode.Mempool do
 
   # Core removeUnchecked: a tx leaving the mempool leaves the unbroadcast
   # set. Readers filtered stale entries, but one evicted and later accepted
-  # again from P2P still read as unbroadcast, and the set only grew (MP-6 in
-  # STATE_MACHINES.md). Run after every handler that changes the pool; the
+  # again from P2P still read as unbroadcast, and the set only grew. Run after every handler that changes the pool; the
   # set holds only local submissions.
   defp prune_unbroadcast(st) do
     if Enum.all?(st.unbroadcast, &Pool.exists?(st.state.pool, &1)),
@@ -529,7 +528,7 @@ defmodule Exnode.Mempool do
           # Nothing changed since prepare/4 (same tip, and the very same
           # state term: `===` is a pointer check then): it would decide the
           # same, so its workspace stands. An attempt that fails its scripts
-          # then costs one prepare, not two (AUD-F2).
+          # then costs one prepare, not two.
           prepared =
             if st.tip_hash == job.tip_hash and st.state === job.state,
               do: {:ok, job.ws},
@@ -690,7 +689,7 @@ defmodule Exnode.Mempool do
       end)
 
     # Re-added txs merged their in-pool children's clusters without a limit
-    # check; trim before anything linearizes them (MP-1b).
+    # check; trim before anything linearizes them.
     readded = for tx <- txs, Pool.exists?(s.pool, tx.txid), do: tx.txid
     {pool, _trimmed} = Pool.trim_oversized(s.pool, readded)
     s = %{s | pool: pool}

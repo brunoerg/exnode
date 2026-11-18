@@ -411,7 +411,7 @@ defmodule Exnode.Mempool.Pool do
   Core `TxGraph::Trim` after a reorg re-add (`UpdateTransactionsFromBlock`):
   a re-added tx joins the clusters of its in-pool children with no limit
   check, so one disconnected tx with many spent outputs can merge any number
-  of full clusters (MP-1b in STATE_MACHINES.md). Linearizing such a cluster
+  of full clusters. Linearizing such a cluster
   takes seconds to hours and blocks the mempool process.
 
   For every cluster containing one of `txids` that exceeds the count or
@@ -607,7 +607,7 @@ defmodule Exnode.Mempool.Pool do
     # added tx's come from its inputs; a pool tx spending an added tx's
     # output (a reorg re-add) is found through the spenders index. Reading
     # the entries instead of every input of every touched tx keeps this
-    # cheap for the ~6,400 txs of 100 full clusters (AUD-F2).
+    # cheap for the ~6,400 txs of 100 full clusters.
     added_children =
       for e <- adds,
           vout <- 0..(length(e.tx.outputs) - 1)//1,
@@ -685,8 +685,7 @@ defmodule Exnode.Mempool.Pool do
   Core `GetMainStagingDiagrams`: chunk feerates of the touched main clusters
   and of the staging clusters, each sorted by decreasing feerate.
 
-  The work is bounded, as Core's TxGraph bounds it (AUD-F2 in
-  STATE_MACHINES.md: invalid-witness RBF attempts made the mempool process
+  The work is bounded, as Core's TxGraph bounds it (invalid-witness RBF attempts made the mempool process
   linearize ~200 64-tx clusters from scratch per attempt, seconds each,
   before the scripts were checked). Main clusters come from the
   linearization cache; a stale one is linearized within `budget`. Staging

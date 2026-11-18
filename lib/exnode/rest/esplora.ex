@@ -45,7 +45,7 @@ defmodule Exnode.REST.Esplora do
   alias Exnode.Index.Scripthash
   alias Exnode.Mempool.Policy
 
-  # Each connection process is an archive reader the fd budget counts (IDX-2).
+  # Each connection process is an archive reader the fd budget counts.
   plug(:limit_reads)
   plug(:match)
   plug(:dispatch)
@@ -657,7 +657,7 @@ defmodule Exnode.REST.Esplora do
       )
 
   # electrs' default `--utxos-limit`: `/utxo` answers at most this many
-  # confirmed outputs (AUD-A7-1).
+  # confirmed outputs.
   @utxos_limit 500
   defp utxos_limit(opts), do: ctx(opts)[:utxos_limit] || @utxos_limit
 
@@ -665,8 +665,7 @@ defmodule Exnode.REST.Esplora do
   # whose indexed block is that one. Between a disconnect and the index's
   # rewind (≤ 200 ms) the index can hold rows above the tip, or of a block
   # no longer active: those heights are left out (the rows were skipped,
-  # not answered with a 500 or another block's hash; SVC-3 in
-  # STATE_MACHINES.md).
+  # not answered with a 500 or another block's hash).
   defp active_index_blocks(opts, t, rows) do
     index = ctx(opts).scripthash_index
 
@@ -727,7 +726,7 @@ defmodule Exnode.REST.Esplora do
     Scripthash.totals(index, sh) || history_totals(index, sh)
   end
 
-  # The totals from one pass over the rows, none held (AUD-A7-1). Rows come
+  # The totals from one pass over the rows, none held. Rows come
   # in chain order, so a tx's rows are adjacent.
   defp history_totals(index, sh) do
     {fc, fs, sc, ss, txs, _} =
@@ -806,7 +805,7 @@ defmodule Exnode.REST.Esplora do
 
   # The script's unspent outputs, or {:error, :too_many} past the limit:
   # the index's rows are streamed, holding only the outputs unspent so far
-  # (`Scripthash.utxos/3`), never the whole history (AUD-A7-1).
+  # (`Scripthash.utxos/3`), never the whole history.
   defp utxos(opts, {sh, _} = script) do
     with {:ok, rows} <- Scripthash.utxos(ctx(opts).scripthash_index, sh, utxos_limit(opts)) do
       {:ok, utxos(opts, script, rows)}

@@ -10,8 +10,7 @@ defmodule Exnode.DoS.GetblocktxnDecodeTest do
   Regression (found by fuzzamoto): a payload shorter than the block hash
   matched no clause of `decode_getblocktxn/1`, so the peer process crashed.
   Such a payload, like an index overflow, fails Core's deserialization: the
-  message is dropped and the peer kept (AUD-A1-5; it used to be
-  misbehaviour).
+  message is dropped and the peer kept (it used to be misbehaviour).
   """
   use Exnode.NodeCase
   @moduletag :dos

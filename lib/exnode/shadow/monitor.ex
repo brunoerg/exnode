@@ -22,7 +22,7 @@ defmodule Exnode.Shadow.Monitor do
   is re-sent to the caller of every `round/4`, `shadow_tip/1` and
   `set_ahead/2`, so a halt cast that was lost (the chain state was
   restarting, its name unregistered) reaches the restarted one before its
-  first round: CS-6 (STATE_MACHINES.md).
+  first round.
 
   Backpressure: `round/4` returns at once while fewer than `max_lag` blocks
   are queued, and blocks the caller otherwise.

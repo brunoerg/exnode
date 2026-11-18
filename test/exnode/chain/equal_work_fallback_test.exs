@@ -1,6 +1,6 @@
 defmodule Exnode.Chain.EqualWorkFallbackTest do
   @moduledoc """
-  CS-8 (STATE_MACHINES.md; regression, found by the consensus differential
+  Regression (found by the consensus differential
   property): A and B are equal-work siblings, A received first and active.
   C, an invalid child of B, makes the node reorg to B and then fail C. Core
   (CBlockIndexWorkComparator keeps A, the earlier body, ranked above the

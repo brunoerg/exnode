@@ -12,7 +12,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
     complete inv / getdata / addr / addrv2 and a non-continuous headers
     sequence are misbehaviour; a truncated oversized vector and an
     oversized notfound are dropped, and a manual peer is never
-    disconnected for misbehaving (Core; AUD-A1-5 / A2-5); a tx from a
+    disconnected for misbehaving (Core); a tx from a
     block-relay-only peer disconnects it;
   * timeouts on a mock clock, run by explicit ticks: no handshake within
     60 s, no pong within 20 min, and the headers-sync deadline: a peer
@@ -191,7 +191,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
     end
 
     # Core deserializes the whole vector before checking its size: a
-    # complete oversized one is misbehaviour (AUD-A1-5).
+    # complete oversized one is misbehaviour.
     for {cmd, n, item, why} <- [
           {"inv", 50_001, <<1::little-32, 0::256>>, "inv message size = 50001"},
           {"getdata", 50_001, <<1::little-32, 0::256>>, "inv message size = 50001"},
@@ -232,7 +232,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
     end
 
     # Core MaybeDiscourageAndDisconnect: a manual peer is never disconnected
-    # (nor discouraged) for misbehaving (AUD-A2-5).
+    # (nor discouraged) for misbehaving.
     test "a misbehaving manual peer is kept", %{n: n} do
       {pid, sock, _clock, ref} = connect(n, conn_type: :manual)
       handshaked(pid)

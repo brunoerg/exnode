@@ -1,7 +1,6 @@
 defmodule Exnode.P2P.DecodeBudget do
   @moduledoc """
-  A node-wide budget of payload bytes being decoded and handled at once
-  (AUD-A1-1, SECURITY_AUDIT_REPORT.md).
+  A node-wide budget of payload bytes being decoded and handled at once.
 
   Core processes every peer's messages on one thread (`ThreadMessageHandler`),
   so at most one message is ever decoded at a time. exnode decodes in each

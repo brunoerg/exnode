@@ -1,6 +1,6 @@
 defmodule Exnode.REST.UtxoLimitTest do
   @moduledoc """
-  AUD-A7-1 (SECURITY_AUDIT_REPORT.md; regression): `/address/:addr/utxo`
+  Regression: `/address/:addr/utxo`
   and `/scripthash/:sh/utxo` loaded the script's whole confirmed history
   into the request's process (a list of row maps, then a set of every
   spent outpoint): the heaviest mainnet scripts cost over a gigabyte per

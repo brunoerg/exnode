@@ -104,7 +104,7 @@ defmodule Exnode.P2P.V2.Transport do
   def received(%__MODULE__{} = t, data) do
     # Linear buffering: new bytes are appended to the binary `tail`
     # (amortised in-place append, ~1-2 bytes held per byte; an iodata list
-    # cost ~48 B per byte for 1-byte segments, AUD-F3) and joined to `buf`
+    # cost ~48 B per byte for 1-byte segments) and joined to `buf`
     # only when the current state can make progress (need/1), so a packet
     # costs O(its size) however the stream is split. All checks (v1 prefix,
     # wrong network, garbage limit, packet length) stay in step/3.
@@ -255,7 +255,7 @@ defmodule Exnode.P2P.V2.Transport do
   # A remainder is copied when its binary is more than twice its size, so it
   # does not keep the packets before it alive while the next one fills (and
   # is not appended to in place behind them). Before, only a remainder under
-  # 4 KiB was: one of 4 KiB or more kept a ~4 MB packet (AUD-A1-3). Each
+  # 4 KiB was: one of 4 KiB or more kept a ~4 MB packet. Each
   # copy is at most the bytes consumed since the last, so receiving stays
   # linear.
   defp done(t, out, msgs) do

@@ -69,7 +69,7 @@ defmodule Exnode.RPC.Server do
 
   @impl Plug
   def call(conn, opts) do
-    # Each connection process is an archive reader the fd budget counts (IDX-2).
+    # Each connection process is an archive reader the fd budget counts.
     Exnode.Archive.Segments.limit_read_handles(Exnode.FdBudget.api_read_handles())
     conn = Plug.Conn.put_resp_content_type(conn, "application/json")
 

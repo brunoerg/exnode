@@ -1,6 +1,6 @@
 defmodule Exnode.DoS.BlockStallingTest do
   @moduledoc """
-  AUD-F1 (STATE_MACHINES.md; regression, real sockets, full node): an
+  Regression (real sockets, full node): an
   attacker that announces the real chain, is asked for the window's first
   16 blocks and withholds only the first, keeps free slots and so is itself
   window-blocked on every request. It used to be exempt from stall

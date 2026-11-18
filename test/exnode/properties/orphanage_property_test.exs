@@ -6,8 +6,7 @@ defmodule Exnode.Properties.OrphanagePropertyTest do
   conflicting, and peers connecting and disconnecting. After every step:
 
   * the incremental accounting (age order, per-peer weight, latency score
-    and announcements, total score) equals a recount from the orphans
-    (AUD-H1);
+    and announcements, total score) equals a recount from the orphans;
   * the limits hold: at most 1,000 orphans, each peer's weight at most
     404,000 WU, the total latency score at most 3,000;
   * the parent index matches the orphans;

@@ -38,7 +38,7 @@ defmodule Exnode.Archive.Overlay do
   ]
 
   # The budget counts real memory, as Core's -dbcache counts its cache's
-  # dynamic usage (CS-9). Measured on OTP 28, 64-bit:
+  # dynamic usage. Measured on OTP 28, 64-bit:
   # * a coin entry in ETS, {{txid, vout}, gen, coin map} with a typical
   #   22-34 byte script: about 301 bytes (rounded up);
   # * the generation queue: each block's outpoints packed in one off-heap

@@ -282,7 +282,7 @@ defmodule Exnode.P2P.TxRelayTest do
     refute_receive {:peer, ^source, {:send, {:inv, _}}}, 300
   end
 
-  test "AUD-A4-3: a peer's own known filter is read, not written, and keeps its txs from being announced back" do
+  test "a peer's own known filter is read, not written, and keeps its txs from being announced back" do
     clock = :atomics.new(1, [])
     :atomics.put(clock, 1, 1_000_000)
     {:ok, mp} = AcceptingMempool.start_link(self())
@@ -439,7 +439,7 @@ defmodule Exnode.P2P.TxRelayTest do
     defp put_peer(ann, peer, m), do: Map.put(ann, peer, m)
 
     # Core: an expired request becomes COMPLETED; a hash with no uncompleted
-    # announcement left is forgotten (AUD-A4-1).
+    # announcement left is forgotten.
     defp expire_requests(st, now) do
       ann =
         for {peer, m} <- st.ann, into: %{} do
@@ -560,7 +560,7 @@ defmodule Exnode.P2P.TxRelayTest do
 
     assert Enum.all?(Map.keys(st.waiting), &Map.has_key?(st.requested, &1))
 
-    # AUD-A4-1: the by-hash index matches `ann`, and no hash is kept with
+    # The by-hash index matches `ann`, and no hash is kept with
     # every announcement completed (Core forgets it).
     by_hash =
       for {p, m} <- st.ann, {h, _} <- m, reduce: %{} do

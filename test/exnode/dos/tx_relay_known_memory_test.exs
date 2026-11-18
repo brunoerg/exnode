@@ -1,6 +1,6 @@
 defmodule Exnode.DoS.TxRelayKnownMemoryTest do
   @moduledoc """
-  AUD-A4-3 (SECURITY_AUDIT_REPORT.md; regression): each peer's
+  Regression: each peer's
   known-inventory filter was an exact set of up to 50,000 32-byte hashes
   plus a FIFO queue, ~141 B per entry (6.9 MB per peer) on the singleton
   TxRelay's heap, filled by one 50,000-item inv. With the default 200

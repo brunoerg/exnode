@@ -1,6 +1,6 @@
 defmodule Exnode.DoS.RecvBufferMemoryTest do
   @moduledoc """
-  AUD-F3 (STATE_MACHINES.md; regression): a peer that announces a 4 MB
+  Regression: a peer that announces a 4 MB
   frame and trickles its payload in 1-byte TCP segments must cost about one
   byte of memory per byte held, as Core's ~4 MB per connection. The receive
   buffers used to cons each segment onto an iodata list, ~48 B of heap per

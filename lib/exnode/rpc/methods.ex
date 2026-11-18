@@ -51,7 +51,7 @@ defmodule Exnode.RPC.Methods do
   catch
     # A node component restarting (its name unregistered, or it died during
     # the call): an error for this request only, not a dropped connection
-    # and lost batch (SVC-4 in STATE_MACHINES.md).
+    # and lost batch.
     :exit, reason ->
       require Logger
       Logger.warning("RPC #{method}: node component unavailable: #{inspect(reason, limit: 5)}")

@@ -79,7 +79,7 @@ defmodule Exnode.P2P.Message do
     {nonce, rest} = optional(rest, fn <<n::little-64, r::binary>> -> {n, r} end, 0)
     {ua, rest} = optional(rest, &limited_string(&1, @max_subversion_length), "")
     # Kept for the connection's lifetime (Peer `version`): a slice of 64 bytes
-    # or more would keep the whole payload, up to 4 MB, alive (AUD-A1-2).
+    # or more would keep the whole payload, up to 4 MB, alive.
     ua = :binary.copy(ua)
     {height, rest} = optional(rest, fn <<h::little-signed-32, r::binary>> -> {h, r} end, -1)
     {relay, _rest} = optional(rest, fn <<b, r::binary>> -> {b != 0, r} end, true)
@@ -133,7 +133,7 @@ defmodule Exnode.P2P.Message do
     {:ok, {:headers, headers}}
   end
 
-  # Over-size vectors (AUD-A1-5): Core deserializes the whole vector before
+  # Over-size vectors: Core deserializes the whole vector before
   # checking its size, so only a complete one is misbehaving; a truncated
   # one throws in deserialization and is dropped. `notfound` has no size
   # check that punishes: Core ignores a large one.

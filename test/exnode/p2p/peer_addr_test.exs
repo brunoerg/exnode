@@ -8,7 +8,7 @@ defmodule Exnode.P2P.PeerAddrTest do
     bucket (1 address);
   * addrv2 carries networks addr cannot (here TorV3), but only reachable
     networks are stored (IPv4, IPv6), as in Core;
-  * AUD-A2-1 (regression): each address is sanitised as in Core
+  * (regression) each address is sanitised as in Core
     `ProcessAddrs` before the address book sees it: a time before 1973 or
     more than 10 minutes ahead becomes 5 days ago (a future time made an
     entry, even a tried one, `terrible?` and evictable), addresses without
@@ -109,7 +109,7 @@ defmodule Exnode.P2P.PeerAddrTest do
   defp addr(i, time, services \\ 9),
     do: %{time: time, services: services, net: :ipv4, addr: <<2, i, 0, 1>>, port: 18444}
 
-  test "AUD-A2-1: a far-future or ancient time is clamped to 5 days ago; a known entry stays usable",
+  test "a far-future or ancient time is clamped to 5 days ago; a known entry stays usable",
        %{n: n} do
     now = System.os_time(:second)
     known = addr(1, now - 3600)
@@ -138,7 +138,7 @@ defmodule Exnode.P2P.PeerAddrTest do
     end
   end
 
-  test "AUD-A2-1: addresses without NODE_NETWORK or NODE_NETWORK_LIMITED are not stored",
+  test "addresses without NODE_NETWORK or NODE_NETWORK_LIMITED are not stored",
        %{n: n} do
     now = System.os_time(:second)
     {pid, sock} = FakePeer.connect_from(n, node: %{addrman: n.addrman})
@@ -155,7 +155,7 @@ defmodule Exnode.P2P.PeerAddrTest do
     assert stored == [3, 4]
   end
 
-  test "AUD-A2-1: discouraged addresses are not stored", %{n: n} do
+  test "discouraged addresses are not stored", %{n: n} do
     now = System.os_time(:second)
     bad = addr(1, now)
 

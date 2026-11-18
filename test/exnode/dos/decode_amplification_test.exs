@@ -1,6 +1,6 @@
 defmodule Exnode.DoS.DecodeAmplificationTest do
   @moduledoc """
-  AUD-A1-1 (SECURITY_AUDIT_REPORT.md; regression): a decoded message is
+  Regression: a decoded message is
   several times its wire size. Measured on 4 MB block payloads:
 
   * a realistic segwit block ~6.5 B of heap per wire byte;

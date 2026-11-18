@@ -1,6 +1,6 @@
 defmodule Exnode.REST.DisabledIndexTest do
   @moduledoc """
-  SVC-1 (STATE_MACHINES.md): with address indexing disabled the node passed
+  Regression: with address indexing disabled the node passed
   `scripthash_index: false` to the Esplora routes; `/tx/:txid/outspends`
   treated `false` as an index and answered 500 for every tx with an output
   not spent in the mempool. Confirmed spenders now come from the archive,

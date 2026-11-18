@@ -239,7 +239,7 @@ defmodule Exnode.Shadow.MonitorTest do
       GenServer.stop(mon)
     end
 
-    # CS-6 (STATE_MACHINES.md): the halt cast went to the chain state's
+    # Regression: the halt cast went to the chain state's
     # registered name once. While the chain state was restarting (name
     # unregistered) it was dropped, and the restarted chain state, finding
     # the shadow ahead, tolerated the divergence and kept connecting.

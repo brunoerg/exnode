@@ -120,7 +120,8 @@ defmodule Exnode.P2P.SendBufferTest do
     :ok = Clock.tick(pid)
     assert :queue.len(peer_state(pid).getdata_queue) == left
     # The peer process is not blocked in a socket send: calls are answered.
-    assert %{conn_type: :outbound_full_relay} = Task.await(Task.async(fn -> Peer.info(pid) end), 1_000)
+    assert %{conn_type: :outbound_full_relay} =
+             Task.await(Task.async(fn -> Peer.info(pid) end), 1_000)
 
     open(gate)
     got = FakePeer.recv(sock, ["block", "pong"], 11)
@@ -164,7 +165,7 @@ defmodule Exnode.P2P.SendBufferTest do
 
   test "tx getdata: no tx is served once paused; the rest are served after, notfound only for misses",
        %{n: n, blocks: blocks, gate: gate} = ctx do
-    # Txs are served only once announced to the peer (AUD-A2-2): connect
+    # Txs are served only once announced to the peer: connect
     # first, then wait for every announcement.
     {pid, sock} = connect(ctx, true)
     # Registered with TxRelay (at verack) before any tx is accepted.

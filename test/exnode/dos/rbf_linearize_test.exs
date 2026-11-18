@@ -1,6 +1,6 @@
 defmodule Exnode.DoS.RbfLinearizeTest do
   @moduledoc """
-  AUD-F2 (STATE_MACHINES.md; regression, Pool level): an RBF attempt
+  Regression (Pool level): an RBF attempt
   that conflicts with a low-fee leaf in each of 100 dense 64-tx clusters
   (and then fails its scripts, so it can be repeated for free) used to make
   the mempool process linearize all 100 main and 100 staging clusters from

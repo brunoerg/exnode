@@ -182,7 +182,7 @@ defmodule Exnode.Mempool.MaintenanceTest do
     assert Mempool.size(mp) == 0
   end
 
-  # MP-6 (STATE_MACHINES.md): the unbroadcast set was pruned only when a
+  # Regression: the unbroadcast set was pruned only when a
   # peer requested the tx. A local tx that left the pool (here expired) and
   # was accepted again from P2P still read as unbroadcast.
   test "a tx that leaves the pool leaves the unbroadcast set", %{
@@ -205,7 +205,7 @@ defmodule Exnode.Mempool.MaintenanceTest do
     refute Mempool.unbroadcast?(mp, t.txid)
   end
 
-  # MP-1 (STATE_MACHINES.md): a reorg re-adds a tx whose child is
+  # Regression: a reorg re-adds a tx whose child is
   # already in the mempool; the two must be linked (Core:
   # UpdateTransactionsFromBlock), or removing the parent leaves the child
   # spending an output that exists nowhere.
@@ -249,7 +249,7 @@ defmodule Exnode.Mempool.MaintenanceTest do
     assert Mempool.size(mp) == 0
   end
 
-  # MP-1b (STATE_MACHINES.md): a re-added tx merges the clusters of all its
+  # Regression: a re-added tx merges the clusters of all its
   # in-pool children with no limit check. Here three 30-tx chains (each a
   # legal cluster) become one 91-tx cluster; with more outputs the merged
   # cluster grows without bound and its linearization blocks the mempool
@@ -301,7 +301,7 @@ defmodule Exnode.Mempool.MaintenanceTest do
         do: assert(Pool.exists?(pool, i.prev_hash), "#{Base.encode16(txid)} lost its parent")
   end
 
-  # MP-2 (STATE_MACHINES.md): a reorg spanning several chain-state turns
+  # Regression: a reorg spanning several chain-state turns
   # reaches the mempool as several updates, while the chain view it re-adds
   # against already includes the later reconnects. A disconnected tx that is
   # confirmed again in that view ("txn-already-known") must not take its

@@ -103,7 +103,7 @@ defmodule Exnode.P2P.Connman do
   peer is tracked before it hands it the socket. As a cast it was dropped
   when Connman was restarting (its name unregistered while PeerSup was
   already back), and the peer ran untracked: outside the inbound limit and
-  eviction (P2P-4 in STATE_MACHINES.md). Exits like any call if Connman is
+  eviction. Exits like any call if Connman is
   not running; waits like `accept_inbound?/2`.
   """
   def register_inbound(server, pid, target),
@@ -486,8 +486,7 @@ defmodule Exnode.P2P.Connman do
 
   # Core AlreadyConnectedToAddress: the address (IP and port) or its IP
   # alone. Inbound peers carry an ephemeral port, so (IP, port) alone let us
-  # open an outbound connection to a node already connected to us
-  # (P2P-2 in STATE_MACHINES.md).
+  # open an outbound connection to a node already connected to us.
   defp connected_targets(st) do
     for %{target: t} <- Map.values(st.peers), t != nil, k = addr_key(t), reduce: MapSet.new() do
       acc -> acc |> MapSet.put(k) |> MapSet.put(ip_only(k))
@@ -702,7 +701,7 @@ defmodule Exnode.P2P.Connman do
   # crash the restart would redial the same peers, every time, in a crash
   # loop. A restart cascade (a ChainState, Headers or P2P sibling crash)
   # stops Connman with `:shutdown` too, so the reason alone cannot tell; the
-  # node's stopping mark does (P2P-3b in STATE_MACHINES.md). `:normal` is a
+  # node's stopping mark does. `:normal` is a
   # direct stop of Connman itself.
   defp write_anchors(reason, %{anchors_path: path} = st)
        when is_binary(path) and (reason == :normal or st.node_name != nil) do
