@@ -350,8 +350,7 @@ defmodule Exnode.Archive.Segments do
   Lowers this process's read-handle cap to `n` (closing the oldest handles
   beyond it). RPC and REST connection handlers use it: each is a reader,
   their number is bounded only by the API connection cap, and the
-  descriptor budget counts `Exnode.FdBudget.api_read_handles/0` for each
-  (IDX-2 in STATE_MACHINES.md).
+  descriptor budget counts `Exnode.FdBudget.api_read_handles/0` for each.
   """
   def limit_read_handles(n) when is_integer(n) and n > 0 do
     Process.put({__MODULE__, :cap}, n)

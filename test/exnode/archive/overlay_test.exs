@@ -95,7 +95,7 @@ defmodule Exnode.Archive.OverlayTest do
     end
   end
 
-  test "CS-9: the budget bounds real memory: ETS entries plus the packed queue" do
+  test "the budget bounds real memory: ETS entries plus the packed queue" do
     budget = 8 * 1024 * 1024
     w = :erlang.system_info(:wordsize)
 

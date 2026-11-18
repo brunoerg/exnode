@@ -1,6 +1,6 @@
 defmodule Exnode.RPC.DisabledIndexTest do
   @moduledoc """
-  SVC-2 (STATE_MACHINES.md): with the filter index disabled the node
+  Regression: with the filter index disabled the node
   used to pass `filter_index: false` (not nil) to the methods, and
   `getblockfilter` crashed with a CaseClauseError (-32603 plus an error log)
   instead of Core's "Index is not enabled for filtertype basic".

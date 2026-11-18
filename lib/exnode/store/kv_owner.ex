@@ -32,8 +32,7 @@ defmodule Exnode.Store.KVOwner do
   # reaches this trapping process as `:killed`). It used to close only on
   # shutdown, and after an abnormal stop the handles kept in persistent_term
   # by the indexes pinned the database and its LOCK for the life of the VM:
-  # a node restarted on the same datadir could not open it (KV-1 in
-  # STATE_MACHINES.md). erlang-rocksdb only flags the close; the database
+  # a node restarted on the same datadir could not open it. erlang-rocksdb only flags the close; the database
   # is closed once NIF calls in progress have released their references.
   @impl true
   def terminate(_reason, kv), do: KV.close(kv)

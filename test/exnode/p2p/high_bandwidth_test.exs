@@ -1,6 +1,6 @@
 defmodule Exnode.P2P.HighBandwidthTest do
   @moduledoc """
-  BD-6 (STATE_MACHINES.md): BIP152 high-bandwidth selection had no
+  Regression: BIP152 high-bandwidth selection had no
   outbound protection (Core keeps the last outbound HB peer when an inbound
   one is added), and a select for a peer that had already exited demoted a
   live peer, then left the slot to the dead one.

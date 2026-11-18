@@ -146,7 +146,7 @@ defmodule Exnode.P2P.Peer do
       # flight from the peer, so a resend is "already syncing" and ignored.
       cmpct_seen: [],
       # Core m_tx_inventory_known_filter, the part this peer announced to us:
-      # a RollingBloom written here, read by TxRelay (AUD-A4-3).
+      # a RollingBloom written here, read by TxRelay.
       known_in: nil,
       # Blocks rebuilt from this peer's compact blocks that the chain state
       # stored for a deferred verdict (newest first, at most @max_partials):
@@ -480,7 +480,7 @@ defmodule Exnode.P2P.Peer do
   end
 
   # A large message is decoded and handled holding its size from the
-  # node-wide DecodeBudget (AUD-A1-1): decoded terms are several times their
+  # node-wide DecodeBudget: decoded terms are several times their
   # wire size, and Core decodes one message at a time on one thread.
   defp process_message(st, cmd, payload) do
     case DecodeBudget.with_budget(st.node[:decode_budget], byte_size(payload), fn ->
@@ -1169,7 +1169,7 @@ defmodule Exnode.P2P.Peer do
 
   # Core SendMessages block download. `preferred` is Core fPreferredDownload
   # (outbound); in IBD a non-preferred (inbound) peer is used only when no
-  # preferred peer is connected or nothing is in flight (AUD-F1).
+  # preferred peer is connected or nothing is in flight.
   # The call is made without a best known header too, so BlockDownload
   # counts preferred peers from the handshake on.
   defp maybe_request_blocks(%{node: %{block_download: bd}} = st) when bd != nil do
@@ -1221,7 +1221,7 @@ defmodule Exnode.P2P.Peer do
     # Core: forceProcessing = IsBlockRequested(hash); RemoveBlockRequest(hash).
     # The request becomes a checking reservation (BlockDownload) until the
     # outcome below: nobody re-requests the block while it is checked here.
-    # A rebuilt block takes over whoever's request it had (BD-4).
+    # A rebuilt block takes over whoever's request it had.
     in_flight =
       st.node[:block_download] != nil and
         if(rebuilt,
@@ -1322,7 +1322,7 @@ defmodule Exnode.P2P.Peer do
 
   defp compact_block(st, payload) do
     case CompactBlock.decode(payload) do
-      # Core: a deserialization failure drops the message (AUD-A1-5); an
+      # Core: a deserialization failure drops the message; an
       # invalid but well-formed one is misbehaving (CompactBlock.init/2).
       {:error, why} -> dropped(st, "cmpctblock", why)
       {:ok, c} -> compact_block_decoded(st, c)
@@ -1395,7 +1395,7 @@ defmodule Exnode.P2P.Peer do
 
         cond do
           # Received and being processed by a peer: Core has its data
-          # already (BLOCK_HAVE_DATA), so no mempool pass or getblocktxn (BD-4).
+          # already (BLOCK_HAVE_DATA), so no mempool pass or getblocktxn.
           checking ->
             {:ok, st}
 
@@ -1534,7 +1534,7 @@ defmodule Exnode.P2P.Peer do
 
   # Core BlockRequested for a compact block's reconstruction or its full
   # fallback: in flight from this peer, so parallel download does not fetch
-  # it too (BD-4 in STATE_MACHINES.md). A no-op if another peer holds it.
+  # it too. A no-op if another peer holds it.
   defp mark_in_flight(st, hash) do
     if bd = st.node[:block_download], do: BlockDownload.mark(bd, self(), hash)
     :ok
@@ -1706,7 +1706,7 @@ defmodule Exnode.P2P.Peer do
 
   # Core ProcessGetData: no TxRelay for a block-relay-only peer or one that
   # sent fRelay = false (we offer no NODE_BLOOM): its tx items are skipped,
-  # with no notfound (AUD-A2-2).
+  # with no notfound.
   defp serve_txs(st, tx_items) do
     if st.node[:tx_relay] != nil and st.conn_type != :block_relay and st.version.relay do
       # Found txs come back in request order (Mempool.get_txs).
@@ -2038,7 +2038,7 @@ defmodule Exnode.P2P.Peer do
 
   # Core Misbehaving + MaybeDiscourageAndDisconnect: disconnect (Connman
   # discourages), except a manual peer, which Core never disconnects or
-  # discourages (AUD-A2-5).
+  # discourages.
   defp misbehaving(%{conn_type: :manual} = st, why) do
     Logger.info("peer #{inspect(st.target)}: misbehaving (#{why}), but manual: kept")
     {:ok, st}
@@ -2178,8 +2178,8 @@ defmodule Exnode.P2P.Peer do
     end
   end
 
-  # Core ProcessAddrs, for each address the token bucket let through
-  # (AUD-A2-1): only full nodes (NODE_NETWORK or NODE_NETWORK_LIMITED); a
+  # Core ProcessAddrs, for each address the token bucket let through:
+  # only full nodes (NODE_NETWORK or NODE_NETWORK_LIMITED); a
   # time before 1973 or more than 10 minutes ahead becomes 5 days ago (a
   # future time would make the entry, even a tried one, terrible and
   # evictable); not discouraged; only reachable networks are stored.

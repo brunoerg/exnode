@@ -66,7 +66,7 @@ defmodule Exnode.FdBudgetTest do
     KV.close(kv)
   end
 
-  # IDX-2 (STATE_MACHINES.md): every RPC/REST keep-alive connection is an
+  # Regression: every RPC/REST keep-alive connection is an
   # archive reader with up to 16 segment handles, and nothing bounded the
   # connections, so clients could exhaust the descriptors the budget gives
   # RocksDB and the chain state. Both servers are capped, and each

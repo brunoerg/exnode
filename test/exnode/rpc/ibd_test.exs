@@ -1,6 +1,6 @@
 defmodule Exnode.RPC.IBDTest do
   @moduledoc """
-  SVC-6 (STATE_MACHINES.md): `initialblockdownload` was computed apart by
+  Regression: `initialblockdownload` was computed apart by
   RPC (tip age only, committed tip) and peers (age or minimum work), and
   never latched: once caught up, a tip older than 24 h put the node back in
   IBD. Core latches it (`m_cached_finished_ibd`); both read

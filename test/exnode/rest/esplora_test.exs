@@ -323,7 +323,7 @@ defmodule Exnode.REST.EsploraTest do
     assert Mempool.size(n.mp) == 0
   end
 
-  # SVC-3 (STATE_MACHINES.md): /utxo took each row's block from the active
+  # Regression: /utxo took each row's block from the active
   # chain at the row's height. Between a disconnect and the index's rewind
   # the index still holds the rows of the replaced blocks: they were
   # reported under the new blocks' hashes, or with a 500 when the height
@@ -373,7 +373,7 @@ defmodule Exnode.REST.EsploraTest do
              MapSet.member?(heights.(after_reorg), 130)
   end
 
-  # SVC-5 (STATE_MACHINES.md): Scripthash.sync_to waited for the indexed
+  # Regression: Scripthash.sync_to waited for the indexed
   # tip to equal the hash, so a caller asking for a block the index had
   # already passed waited until its timeout.
   test "Scripthash.sync_to returns at once for a block below the indexed tip", %{tmp_dir: dir} do

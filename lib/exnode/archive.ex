@@ -38,7 +38,7 @@ defmodule Exnode.Archive do
   # every reader made from this archive) is the same prune point, raised
   # before the files are deleted: readers carry a copy of `wpruned` from
   # their commit, and a read racing a prune used to open a deleted file and
-  # crash (SVC-7 in STATE_MACHINES.md).
+  # crash.
   # `epoch` counts changes to the committed archive (each commit and each
   # disconnect): answers computed against the committed state (prefetch)
   # are valid only while it is unchanged.
@@ -1888,7 +1888,7 @@ defmodule Exnode.Archive do
       _ ->
         a = %{a | wpruned: List.last(segs), wseg_max: Map.drop(a.wseg_max, segs)}
         write_with_meta(a, [])
-        # Readers see the prune before the files go (SVC-7).
+        # Readers see the prune before the files go.
         :atomics.put(a.wpruned_live, 1, a.wpruned)
         Enum.each(segs, &Segments.remove(a.segs.witness, &1))
         a
@@ -1986,7 +1986,7 @@ defmodule Exnode.Archive do
 
     # Core ContextualCheckBlock: a commitment is expected once segwit is
     # active, whatever the coinbase looks like. A pre-segwit block may carry
-    # a commitment-shaped output without a coinbase witness (AUD-B5-1).
+    # a commitment-shaped output without a coinbase witness.
     :ok = BlockRules.check_witness_malleation(block, rec.height >= a.segwit_height)
 
     {:ok, raw, block}

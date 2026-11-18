@@ -151,7 +151,7 @@ defmodule Exnode.NodeSupervisionTest do
     Exnode.Store.KV.close(kv)
   end
 
-  # KV-1 (STATE_MACHINES.md): the owner closed the store only on shutdown;
+  # Regression: the owner closed the store only on shutdown;
   # after the root was killed, the index handles kept in persistent_term
   # held the database and its LOCK, and a new node on the datadir failed.
   test "a killed node has closed its store too: it reopens at once", %{tmp_dir: dir, name: name} do

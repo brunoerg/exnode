@@ -1,6 +1,6 @@
 defmodule Exnode.Chain.HaltTest do
   @moduledoc """
-  CS-2 (STATE_MACHINES.md): a shadow-divergence halt is durable. Before, it
+  Regression: a shadow-divergence halt is durable. Before, it
   lived only in memory: any chain-state restart replayed every held
   `pending` block (descendants of the divergent one included) and committed
   them before the shadow could halt again, and a restart without `--shadow`

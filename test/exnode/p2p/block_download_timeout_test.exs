@@ -223,7 +223,7 @@ defmodule Exnode.P2P.BlockDownloadTimeoutTest do
     assert [_ | _] = BlockDownload.request(bd, peer(), best, ibd)
   end
 
-  # BD-7 (STATE_MACHINES.md): every delivered block decayed the stall
+  # Regression: every delivered block decayed the stall
   # timeout ×0.85, so five deliveries undid a doubling while the window's
   # first block was still missing and slow honest holders were dropped
   # every ~2 s. Core decays it only in BlockConnected.

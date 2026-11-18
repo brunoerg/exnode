@@ -1,7 +1,6 @@
 defmodule Exnode.DoS.OrphanFanoutTest do
   @moduledoc """
-  AUD-H1 (STATE_MACHINES.md; regression, real sockets, full node):
-  orphanage fan-out against the shared TxRelay.
+  Regression (real sockets, full node):   orphanage fan-out against the shared TxRelay.
 
   Before the fix the orphanage had no global announcement bound (only an
   orphan count cap and a per-peer weight cap), and `limit_orphans/1` walked
@@ -123,7 +122,7 @@ defmodule Exnode.DoS.OrphanFanoutTest do
   end
 
   @tag :bench
-  test "AUD-H1: orphan fan-out does not stall the shared TxRelay", %{tmp_dir: dir} do
+  test "orphan fan-out does not stall the shared TxRelay", %{tmp_dir: dir} do
     node = Exnode.Test.Node.start(dir, listen: 0)
     port = node.port
     n_orphans = String.to_integer(System.get_env("FANOUT_ORPHANS", "400"))

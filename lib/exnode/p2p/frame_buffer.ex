@@ -6,7 +6,7 @@ defmodule Exnode.P2P.FrameBuffer do
   with spare capacity), so appending is amortised O(segment) and the buffer
   costs about 1-2 bytes per byte held. An iodata list instead cost about 48
   bytes of heap per byte for 1-byte segments, ~200 MB for one trickled 4 MB
-  frame (AUD-F3). Decoding happens only when it can make
+  frame. Decoding happens only when it can make
   progress: once the 24-byte header is complete (to learn the length, and
   refuse a bad magic or an oversized length right there, as `Frame.decode/2`
   does), and once the whole frame is there.
@@ -90,8 +90,8 @@ defmodule Exnode.P2P.FrameBuffer do
   `rest`, the unread end of a receive buffer, copied when its binary is
   more than twice its size: the frames before it are not kept alive while
   the next one fills, nor appended to in place behind them. Before, only a
-  remainder under 4 KiB was copied: one of 4 KiB or more kept a ~4 MB frame
-  (AUD-A1-3). A copy is at most the bytes consumed since the last one, so
+  remainder under 4 KiB was copied: one of 4 KiB or more kept a ~4 MB frame.
+  A copy is at most the bytes consumed since the last one, so
   receiving stays linear. Used by both transports.
   """
   def own_rest(rest) do

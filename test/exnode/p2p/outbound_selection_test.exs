@@ -86,7 +86,7 @@ defmodule Exnode.P2P.OutboundSelectionTest do
     assert Enum.any?(Connman.peers(cm), fn {_, p} -> p.target == {"250.0.3.1", 18_003} end)
   end
 
-  # P2P-2 (STATE_MACHINES.md): "already connected" compared (IP, port),
+  # Regression: "already connected" compared (IP, port),
   # and an inbound peer carries an ephemeral port, so the node dialled out to
   # a peer already connected to it (Core AlreadyConnectedToAddress also
   # matches the IP alone).
@@ -175,7 +175,7 @@ defmodule Exnode.P2P.OutboundSelectionTest do
              Exnode.P2P.PeerFile.read(path, @p.magic)
   end
 
-  # P2P-3 (STATE_MACHINES.md): terminate/2 also runs when Connman
+  # Regression: terminate/2 also runs when Connman
   # crashes; anchors written then are redialled by the restart, every time.
   test "anchors are not written when Connman stops abnormally", %{tmp_dir: dir} do
     path = Path.join(dir, "anchors.dat")
@@ -232,7 +232,7 @@ defmodule Exnode.P2P.OutboundSelectionTest do
     capture_log(fn -> GenServer.stop(cm, {:crashed, :boom}) end)
     refute File.exists?(path)
 
-    # P2P-3b (STATE_MACHINES.md): a supervisor restart cascade (a crash of
+    # Regression: a supervisor restart cascade (a crash of
     # ChainState, Headers or a P2P sibling) stops Connman with :shutdown,
     # as a node stop does; anchors were written then too.
     cm = start.()
@@ -272,7 +272,7 @@ defmodule Exnode.P2P.OutboundSelectionTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :feeler_done}}, 5_000
   end
 
-  # P2P-1 (STATE_MACHINES.md): an oversized inv/headers/addr before the
+  # Regression: an oversized inv/headers/addr before the
   # handshake was decoded and punished (misbehaving: disconnect and a 24 h
   # discouragement of the IP); Core ignores any such message before verack.
   test "an oversized message before the handshake is ignored, not punished", %{tmp_dir: dir} do

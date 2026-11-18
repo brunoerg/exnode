@@ -5,8 +5,7 @@ defmodule Exnode.Index.FollowerReorgRaceTest do
   built: the batch stored the old branch's block at height C (its rows and
   `"h"` entry) under the new branch's tip hash, so the next rewind saw an
   active tip and kept the stale rows forever (scripthash: phantom history;
-  block filters: stuck on the missing parent). See STATE_MACHINES.md
-  (SM-IDX, bug IDX-1).
+  block filters: stuck on the missing parent).
   """
   use ExUnit.Case, async: true
   import Exnode.Test.Wait

@@ -1,6 +1,6 @@
 defmodule Exnode.RPC.ComponentRestartTest do
   @moduledoc """
-  SVC-4 (STATE_MACHINES.md): `Methods.call` rescued exceptions but not
+  Regression: `Methods.call` rescued exceptions but not
   exits, so a method reaching a process that was restarting (a Relay or
   Services subtree restart) exited the HTTP handler: the client lost the
   connection, and with it every answer of a batch.

@@ -5,7 +5,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
   over a socket, with a high-bandwidth peer and a stub mempool:
 
   * a malformed cmpctblock or blocktxn is dropped, the peer kept (Core
-    drops a message that fails to deserialize; AUD-A1-5); a compact block
+    drops a message that fails to deserialize); a compact block
     whose prefilled index is out of range is invalid (misbehaviour);
   * a compact block on an unknown parent makes us sync headers instead;
   * an invalid header via cmpctblock is punished; a cached-invalid header
@@ -177,7 +177,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     # Still connected: it answers the ping.
     before_pong(inbound)
 
-    # B9-1: Core exempts it (via_compact_block) from an outbound peer too.
+    # Core exempts it (via_compact_block) from an outbound peer too.
     {_pid, sock, _clock, ref} = hb_peer(n, bs)
     :ok = FakePeer.send_msgs(sock, {:cmpctblock, payload})
     before_pong(sock)
@@ -186,7 +186,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
 
   test "an invalid block rebuilt from a compact block does not punish its peer; it is marked failed",
        %{n: n, bs: bs} do
-    # B9-1. Core's NewPoWValidBlock announces a block to high-bandwidth
+    # Core's NewPoWValidBlock announces a block to high-bandwidth
     # peers before ConnectBlock, so honest peers relay blocks with valid PoW
     # that turn out invalid. Every tx is prefilled: it is rebuilt at once.
     bad = BB.build(List.last(bs).header, [BB.coinbase(151, 100 * 100_000_000)])
@@ -326,7 +326,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     assert :sys.get_state(pid).partials == %{}
   end
 
-  # BD-4 (STATE_MACHINES.md): a reconstruction was not registered with
+  # Regression: a reconstruction was not registered with
   # BlockDownload, so parallel download requested the same block whole
   # from another peer (Core BlockRequested with a partial block); a rebuilt
   # block now takes over any other request for it.

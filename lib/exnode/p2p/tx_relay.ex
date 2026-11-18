@@ -33,7 +33,7 @@ defmodule Exnode.P2P.TxRelay do
   bounded by FIFO eviction rather than rolling bloom filters. Each peer's
   known-inventory filter is Core's rolling bloom filter
   (`m_tx_inventory_known_filter`, 50,000 at 10⁻⁶, `Exnode.Util.RollingBloom`):
-  fixed size and off TxRelay's heap, allocated on first use (AUD-A4-3).
+  fixed size and off TxRelay's heap, allocated on first use.
 
   Cost per message: announcements are kept per peer (`ann`: peer => hash =>
   entry), so the per-peer cap is an O(1) check; the in-flight count is a
@@ -83,8 +83,7 @@ defmodule Exnode.P2P.TxRelay do
   # Core m_tx_inventory_known_filter{50000, 0.000001}.
   @known_fp 1.0e-6
 
-  # Mempool answers about its own state at that moment (MP-5 in
-  # STATE_MACHINES.md), not about the tx: caching them as fee failures
+  # Mempool answers about its own state at that moment, not about the tx: caching them as fee failures
   # suppressed the tx until the next block, and 128 pending REST
   # submissions made every relayed tx "busy". Core has no such answers.
   @transient ["mempool busy", "tip-changed", "script-check-crashed"]
@@ -137,8 +136,7 @@ defmodule Exnode.P2P.TxRelay do
   # A Mempool or TxRelay crash restarts only the Relay subtree and peers stay
   # connected (they register again on `:tx_relay_resync`). A peer blocked in
   # one of these calls, or calling while the name is unregistered, used to
-  # exit with the server: every busy peer was dropped (MP-3 in
-  # STATE_MACHINES.md). It gets a neutral answer instead: the tx, inv or
+  # exit with the server: every busy peer was dropped. It gets a neutral answer instead: the tx, inv or
   # notfound is lost, as when Core drops a message, and getdata items are
   # answered notfound. A late reply cannot arrive (calls use an alias).
   defp peer_call(server, msg, fallback) do
@@ -394,7 +392,7 @@ defmodule Exnode.P2P.TxRelay do
   end
 
   # Core FindTxForGetData: only txs in the mempool before the last inv sent
-  # to this peer (AUD-A2-2); an unregistered caller gets none.
+  # to this peer; an unregistered caller gets none.
   def handle_call({:lookup, items}, {peer, _}, st) do
     before = get_in(st.peers, [peer, :last_inv_seq]) || 0
     # One mempool call for the whole getdata.
@@ -908,7 +906,7 @@ defmodule Exnode.P2P.TxRelay do
   # Core AddChildrenToWorkSet: each orphan spending `txids` goes to the work
   # set of one of its announcers, chosen at random, unless already queued.
   # Reconsidering it costs a mempool accept with script checks, so nothing
-  # is reconsidered here: the work is drained by :orphan_work steps (AUD-A4-2).
+  # is reconsidered here: the work is drained by :orphan_work steps.
   defp add_children_to_work_set(st, txids) do
     st
     |> orphan_children(txids)
@@ -1004,7 +1002,7 @@ defmodule Exnode.P2P.TxRelay do
           {:error, %{result: :missing_inputs}} ->
             {:continue, orphan_put(st, w, o)}
 
-          # Not a verdict on the orphan: keep it for the next parent or retry (MP-5).
+          # Not a verdict on the orphan: keep it for the next parent or retry.
           {:error, e} when e.result == :reconsiderable and e.reason in @transient ->
             {:decisive, orphan_put(st, w, o)}
 
@@ -1036,13 +1034,13 @@ defmodule Exnode.P2P.TxRelay do
 
   # Core: MempoolRejectedTx
   # A transient answer leaves no trace: the tx is fetched again on its next
-  # announcement (MP-5).
+  # announcement.
   defp rejected(st, _tx, e, _peer, _first_time)
        when e.result == :reconsiderable and e.reason in @transient,
        do: st
 
   # Another submitter (RPC submitpackage, REST) added it while this accept
-  # was pending: it is had, not rejected (MP-7). Its submitter's
+  # was pending: it is had, not rejected. Its submitter's
   # :mempool_accepted notification announces it.
   defp rejected(st, tx, %{reason: "txn-already-in-mempool"}, _peer, _first_time),
     do: orphans_drop(st, [tx.wtxid])
@@ -1124,7 +1122,7 @@ defmodule Exnode.P2P.TxRelay do
 
   # Core LimitOrphans. Each limit is tested in O(1) per peer from the
   # incremental accounting, and the work done is proportional to the
-  # evictions, never to orphans x announcers (AUD-H1):
+  # evictions, never to orphans x announcers:
   # 1. the oldest orphans go beyond the count cap;
   # 2. per announcer, a weight budget (Core DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER
   #    = 404,000): like Core's per-peer usage, every announcer of an orphan is
@@ -1331,7 +1329,7 @@ defmodule Exnode.P2P.TxRelay do
           # failed: a parent accepted on its own is in the mempool (and only
           # TxRelay would announce it: the mempool's notification names us
           # as origin), and a child that failed for a reason of its own
-          # leaves the orphanage (TXR-1 in STATE_MACHINES.md). The child
+          # leaves the orphanage. The child
           # goes first, so the parent's orphan reconsideration skips it.
           st = %{st | reconsiderable: f_insert(st.reconsiderable, package_hash([parent, child]))}
 

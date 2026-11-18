@@ -103,7 +103,7 @@ defmodule Exnode.P2P.Listener do
                 send(pid, {:socket_ready, sock})
               else
                 # Connman is restarting: an untracked peer would escape the
-                # inbound limit and eviction (P2P-4). Refuse the connection.
+                # inbound limit and eviction. Refuse the connection.
                 :gen_tcp.close(sock)
                 Process.exit(pid, :kill)
               end

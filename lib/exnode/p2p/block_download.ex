@@ -13,11 +13,11 @@ defmodule Exnode.P2P.BlockDownload do
     stalling, from then. A marked peer is disconnected once the mark is
     older than the stall timeout (2 s, doubled on each stall up to 64 s,
     decayed ×0.85 on each connected block, as Core's `BlockConnected`; a
-    delivery alone does not decay it, BD-7 in STATE_MACHINES.md); any
+    delivery alone does not decay it); any
     requested block it delivers clears the mark. The staller's own state
     does not matter: it used to be exempt while it was itself
     window-blocked, so a peer withholding one block while it had free slots
-    stalled IBD until the 600 s download timeout (AUD-F1).
+    stalled IBD until the 600 s download timeout.
   * Preferred download (Core `sync_blocks_and_headers_from_peer`): in IBD, a
     peer that is not preferred (inbound) gets blocks only while no preferred
     peer is connected or nothing is in flight.
@@ -126,7 +126,7 @@ defmodule Exnode.P2P.BlockDownload do
   another peer does or the header is unknown. It counts as one of the
   peer's blocks in transit and is subject to the download timeout. Without
   it a reconstruction was invisible here and the block was also requested
-  whole by parallel download (BD-4 in STATE_MACHINES.md).
+  whole by parallel download.
   """
   def mark(server, peer, hash), do: GenServer.call(server, {:mark, peer, hash}, :infinity)
 
@@ -408,7 +408,7 @@ defmodule Exnode.P2P.BlockDownload do
   # Core BlockConnected also decays the stall timeout: a block connecting
   # means the window moved. Deliveries while the window's first block is
   # missing do not, or the doubled timeout falls back to 2 s and slow
-  # honest holders of that block are disconnected one after another (BD-7).
+  # honest holders of that block are disconnected one after another.
   def handle_info({:block_connected, _hash, _height}, st),
     do:
       {:noreply, maybe_wake(%{st | stall_ms: max(round(st.stall_ms * 0.85), @stall_default_ms)})}
@@ -416,8 +416,8 @@ defmodule Exnode.P2P.BlockDownload do
   def handle_info({:block_disconnected, _hash}, st), do: {:noreply, maybe_wake(st)}
   # A block that failed on connect is no longer held. With `:mutated` its
   # header is not invalidated (the data was wrong, not the block), so it
-  # must be downloaded again; a cursor at or above it would skip it forever
-  # (BD-5 in STATE_MACHINES.md). Cursors there restart from below.
+  # must be downloaded again; a cursor at or above it would skip it forever.
+  # Cursors there restart from below.
   def handle_info({:block_invalid, hash, _r}, st) do
     cursors =
       case HeaderIndex.lookup(Headers.index(st.headers), hash) do
@@ -618,8 +618,7 @@ defmodule Exnode.P2P.BlockDownload do
             # block, and that one only while nothing below it is in flight:
             # once requested, it is progressing, and the next peer's walk
             # sees it in flight. Exempting each walk's first missing block
-            # let every woken peer take one block past the budget (BD-3 in
-            # STATE_MACHINES.md).
+            # let every woken peer take one block past the budget.
             exempt = e.height == first and not acc.saw_in_flight
 
             if not exempt and acc.bytes + st.estimate > st.max_bytes do

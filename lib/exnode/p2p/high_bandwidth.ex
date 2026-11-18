@@ -9,7 +9,7 @@ defmodule Exnode.P2P.HighBandwidth do
   displaces the last outbound one: it is moved to the second slot first, as
   in Core. A select for a peer that is already gone changes nothing; it
   used to demote a live peer and then leave its slot to the dead one until
-  the DOWN (BD-6 in STATE_MACHINES.md).
+  the DOWN.
   """
   use GenServer
 

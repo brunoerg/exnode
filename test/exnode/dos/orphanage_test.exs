@@ -13,7 +13,7 @@ defmodule Exnode.DoS.OrphanageTest do
   * #6 (regression): only registered (monitored) peers own orphans, so a
     disconnect always erases them (Core EraseForPeer), and every announcer
     is charged an orphan's weight against its per-peer budget;
-  * AUD-H1 (regression): the total latency score is capped as Core's, and
+  * (regression) the total latency score is capped as Core's, and
     the per-peer accounting is incremental, so the limits cost O(evictions).
   """
   use ExUnit.Case, async: false
@@ -258,7 +258,7 @@ defmodule Exnode.DoS.OrphanageTest do
         Enum.sort(for {w, o} <- st.orphans, do: {o.seq, w})
   end
 
-  test "AUD-H1: announcements fanned out by many peers are capped by the global latency score" do
+  test "announcements fanned out by many peers are capped by the global latency score" do
     %{relay: r} = start()
     sender = peer(r)
     orphans = for i <- 1..200, do: tx(hashes(1, 10_000 + i), i)
@@ -299,7 +299,7 @@ defmodule Exnode.DoS.OrphanageTest do
     assert accounting_ok?(r)
   end
 
-  test "AUD-H1: count-cap and weight-cap evictions keep the accounting in step" do
+  test "count-cap and weight-cap evictions keep the accounting in step" do
     %{relay: r} = start()
     a = peer(r)
     b = peer(r)
@@ -358,7 +358,7 @@ defmodule Exnode.DoS.OrphanageTest do
     assert MapSet.equal?(st.orphans[o2.wtxid].announcers, MapSet.new([a, b]))
   end
 
-  # MP-4 (STATE_MACHINES.md): accepting a 1p1c package used to accept the
+  # Regression: accepting a 1p1c package used to accept the
   # parent while the child was still an orphan; the parent's reconsideration
   # then resubmitted the child (already in the mempool) and put its wtxid in
   # `rejects`, blocking it until the next block.
@@ -466,7 +466,7 @@ defmodule Exnode.DoS.OrphanageTest do
     end
   end
 
-  # TXR-1 (STATE_MACHINES.md): a failed 1p1c package can still have accepted
+  # Regression: a failed 1p1c package can still have accepted
   # the parent alone (the child then fails on its own). TxRelay looked only
   # at the package state: the parent sat in the mempool unannounced (the
   # mempool's notification names TxRelay as origin, which TxRelay ignores)
@@ -506,7 +506,7 @@ defmodule Exnode.DoS.OrphanageTest do
     assert MapSet.member?(:sys.get_state(r).rejects.set, child.wtxid)
   end
 
-  # MP-7 (STATE_MACHINES.md): an accept that finds its tx already added by
+  # Regression: an accept that finds its tx already added by
   # another submitter (RPC submitpackage during the script check) answers
   # txn-already-in-mempool; TxRelay put the in-mempool tx in `rejects`.
   test "txn-already-in-mempool is not a rejection" do
@@ -516,7 +516,7 @@ defmodule Exnode.DoS.OrphanageTest do
     refute MapSet.member?(:sys.get_state(r).rejects.set, a.wtxid)
   end
 
-  # MP-5 (STATE_MACHINES.md): "mempool busy" (and "tip-changed",
+  # Regression: "mempool busy" (and "tip-changed",
   # "script-check-crashed") describe the mempool at that moment. They were
   # cached as fee failures, so the tx was not fetched again until the next
   # block, and 128 pending REST submissions blacked out tx relay.
@@ -574,7 +574,7 @@ defmodule Exnode.DoS.OrphanageTest do
     assert TxRelay.orphans(r) == [child.wtxid]
   end
 
-  # MP-3 (STATE_MACHINES.md): a Mempool or TxRelay crash restarts only the
+  # Regression: a Mempool or TxRelay crash restarts only the
   # Relay subtree, so peers should stay connected; but a peer blocked in a
   # TxRelay call (or calling while the name is unregistered) exited with it.
   test "a peer blocked in a TxRelay call survives the relay's death; calls to a missing relay are neutral" do

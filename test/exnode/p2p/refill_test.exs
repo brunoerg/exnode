@@ -223,7 +223,7 @@ defmodule Exnode.P2P.RefillTest do
     s = BlockDownload.stats(t.bd)
     assert s.over_estimate == 1 and s.bytes == 50_000 + 2 * 1_000
 
-    # BD-3 (STATE_MACHINES.md): over budget, with the earliest blocks
+    # Regression: over budget, with the earliest blocks
     # already progressing (1 checking, 2 and 3 in transit), other peers get
     # nothing. Each walk's first missing block used to be exempt: one block
     # past the budget per woken peer.
@@ -328,7 +328,7 @@ defmodule Exnode.P2P.RefillTest do
   defp by_links(_idx, %{height: h} = e, h), do: e
   defp by_links(idx, e, h), do: by_links(idx, HeaderIndex.prev(idx, e), h)
 
-  # BD-5 (STATE_MACHINES.md): a block found mutated on connect is un-held
+  # Regression: a block found mutated on connect is un-held
   # without its header being invalidated. Peers whose cursor had passed it
   # never selected it again.
   test "a held block failed as mutated is selected again by a peer whose cursor passed it" do

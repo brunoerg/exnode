@@ -20,8 +20,7 @@ defmodule Exnode.FdBudget do
     (one socket and `api_read_handles/0` segment handles per connection
     process). Uncapped, every keep-alive connection was a reader of 16
     handles that the budget did not count: enough of them exhausted the
-    limit, and the chain state failed its next segment open (IDX-2 in
-    STATE_MACHINES.md);
+    limit, and the chain state failed its next segment open;
   * RocksDB table files: the rest, at most `@max_table_files`, at least
     `@min_table_files`.
   """

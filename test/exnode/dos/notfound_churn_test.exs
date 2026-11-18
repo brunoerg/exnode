@@ -1,6 +1,6 @@
 defmodule Exnode.DoS.NotfoundChurnTest do
   @moduledoc """
-  AUD-A4-1 (SECURITY_AUDIT_REPORT.md; regression): a response to a tx
+  Regression: a response to a tx
   request (`notfound`, the tx itself) and a request's expiry deleted the
   peer's announcement. Core (`TxRequestTracker::ReceivedResponse`,
   `MakeCompleted`) marks it COMPLETED instead, and `ReceivedInv` from the same

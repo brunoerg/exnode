@@ -1,6 +1,6 @@
 defmodule Exnode.DoS.OrphanReconsiderStallTest do
   @moduledoc """
-  AUD-A4-2 (SECURITY_AUDIT_REPORT.md; regression): orphans spending an
+  Regression: orphans spending an
   accepted tx used to be reconsidered inline, one synchronous
   `Mempool.accept` per child (script verification included) inside the
   single TxRelay handler that accepted the parent. Attackers filling the

@@ -55,7 +55,7 @@ defmodule Exnode.Chain.State do
   alias Exnode.Validation.ScriptExec
 
   @batch_blocks 128
-  # KV `meta` key of the durable halt mark (CS-2).
+  # KV `meta` key of the durable halt mark.
   @halt_key "halt"
   @batch_bytes 64 * 1024 * 1024
   @batch_ms 5_000
@@ -263,8 +263,7 @@ defmodule Exnode.Chain.State do
   at `now` (seconds). Once false it stays false for this chain state's
   life (Core `m_cached_finished_ibd`), latched in the view. Peers and RPC
   used to compute it apart (RPC without the work check, on the committed
-  tip), unlatched: an old tip flipped them back into IBD (SVC-6 in
-  STATE_MACHINES.md). `idx` is the header index.
+  tip), unlatched: an old tip flipped them back into IBD. `idx` is the header index.
   """
   def view_ibd?(view, idx, now, params) do
     if :ets.member(view, :ibd_done) do
@@ -326,7 +325,7 @@ defmodule Exnode.Chain.State do
   def poisoned(server), do: GenServer.call(server, :poisoned, 5_000)
 
   @doc """
-  Clears a durable halt (shadow divergence, CS-2 in STATE_MACHINES.md):
+  Clears a durable halt (shadow divergence):
   deletes the mark and resumes block connection, held blocks included.
   Returns the halt reason cleared, or `:not_halted`. Only an operator should
   call it, after deciding which engine was wrong (see the divergence
@@ -955,7 +954,7 @@ defmodule Exnode.Chain.State do
     # Still in pending: held again, so activation can retry it. Archived
     # but off the active chain (quarantined while being reconnected after
     # a reorg): a candidate again, as load_candidates/1 makes it at start
-    # (CS-4 in STATE_MACHINES.md: it used to wait for a restart).
+    # (it used to wait for a restart).
     st =
       Enum.reduce(hashes, st, fn h, st ->
         id = Archive.block_id(st.a, h)
@@ -1075,7 +1074,7 @@ defmodule Exnode.Chain.State do
 
   defp do_handle_cast({:halt, reason}, %{halted: false} = st) do
     Logger.error("block connection halted: #{inspect(reason)}")
-    # Durable first (CS-2): a restart, with or without the shadow, must not
+    # Durable first: a restart, with or without the shadow, must not
     # replay `pending` past the divergence. Cleared only by clear_halt/1 or
     # `mix exnode.reconsider --clear-halt`.
     tip = Archive.tip(st.a)
@@ -1100,7 +1099,7 @@ defmodule Exnode.Chain.State do
         {:noreply, st}
       )
 
-  # The halt is durable: the monitor stops re-sending its pending one (CS-6).
+  # The halt is durable: the monitor stops re-sending its pending one.
   defp ack_halt(%{monitor: nil}), do: :ok
   defp ack_halt(st), do: Exnode.Shadow.Monitor.halt_ack(st.monitor)
 
@@ -2480,8 +2479,7 @@ defmodule Exnode.Chain.State do
 
   # Startup's selective receive: the preparation worker or a prefetch
   # worker; the private executor's death is fatal, as after init (its
-  # outstanding jobs never answer: init used to wait for them forever,
-  # CS-5 in STATE_MACHINES.md).
+  # outstanding jobs never answer: init used to wait for them forever).
   defp any_down(%{exec_private: {_, mref}}, mref, reason, _down),
     do: exit({:script_exec_down, reason})
 
@@ -2671,7 +2669,7 @@ defmodule Exnode.Chain.State do
   # A candidate with the tip's work but an earlier body also ranks above the
   # tip (Core keeps it in setBlockIndexCandidates): after a reorg to a branch
   # whose next block then fails, the node returns to the first-seen
-  # equal-work branch (CS-8).
+  # equal-work branch.
   defp work_key(st, e) do
     seq =
       case :ets.lookup(st.availability, e.hash) do
@@ -2755,7 +2753,7 @@ defmodule Exnode.Chain.State do
       # witness-pruning horizon comes back without witnesses: its segwit
       # spends then fail the re-add and leave the mempool with their
       # descendants. Reading the raw block crashed the disconnect, and the
-      # restart replayed the same reorg (CS-3 in STATE_MACHINES.md).
+      # restart replayed the same reorg.
       st =
         if st.mempool do
           {:ok, b} = Archive.read_block_txs(st.a, Archive.tip(st.a).id)

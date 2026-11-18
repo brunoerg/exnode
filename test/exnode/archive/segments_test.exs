@@ -291,7 +291,7 @@ defmodule Exnode.Archive.SegmentsHandlesTest do
     Segments.close(s)
   end
 
-  # IDX-2 (STATE_MACHINES.md): API connection processes keep fewer handles.
+  # Regression: API connection processes keep fewer handles.
   test "limit_read_handles/1 lowers this process's cap and closes the excess", %{tmp_dir: root} do
     s = Segments.open(root, :outputs, max: 200)
     {s, locs} = write(s, 0, 100)

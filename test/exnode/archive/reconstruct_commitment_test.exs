@@ -1,6 +1,6 @@
 defmodule Exnode.Archive.ReconstructCommitmentTest do
   @moduledoc """
-  AUD-B5-1 (SECURITY_AUDIT_REPORT.md; regression): reading a block back
+  Regression: reading a block back
   re-checks it against its witness commitment, as a guard against storage
   faults. Whether a commitment is expected used to be guessed from the
   presence of a commitment-shaped coinbase output. A block below segwit
