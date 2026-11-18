@@ -252,10 +252,14 @@ defmodule Exnode.P2P.V2.Transport do
     end
   end
 
-  # A small remainder is copied so it does not keep a large packet's binary alive.
+  # A remainder is copied when its binary is more than twice its size, so it
+  # does not keep the packets before it alive while the next one fills (and
+  # is not appended to in place behind them). Before, only a remainder under
+  # 4 KiB was: one of 4 KiB or more kept a ~4 MB packet (AUD-A1-3). Each
+  # copy is at most the bytes consumed since the last, so receiving stays
+  # linear.
   defp done(t, out, msgs) do
-    t = if byte_size(t.buf) < 4096, do: %{t | buf: :binary.copy(t.buf)}, else: t
-    {:ok, t, out, Enum.reverse(msgs)}
+    {:ok, %{t | buf: Exnode.P2P.FrameBuffer.own_rest(t.buf)}, out, Enum.reverse(msgs)}
   end
 
   # Core GetMessageType.

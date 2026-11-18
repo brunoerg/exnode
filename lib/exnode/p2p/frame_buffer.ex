@@ -16,9 +16,8 @@ defmodule Exnode.P2P.FrameBuffer do
 
   alias Exnode.P2P.Frame
 
-  # A remainder smaller than this, left after a large frame, is copied so it
-  # does not keep the large binary alive. Likewise a payload that would leave
-  # at least this many bytes of its parent binary referenced is copied: a
+  # A payload that would leave at least this many bytes of its parent binary
+  # referenced is copied (the remainder: `own_rest/1`): a
   # small message (e.g. a tx kept as an orphan or in the mempool) must not
   # pin the ~4 MB receive buffer it was sliced from. Each
   # payload is copied at most once, so receiving stays linear.
@@ -85,12 +84,19 @@ defmodule Exnode.P2P.FrameBuffer do
       else: payload
   end
 
-  defp rest_buffer(rest, parent) do
-    rest =
-      if byte_size(rest) < @copy_below and byte_size(parent) > 2 * @copy_below,
-        do: :binary.copy(rest),
-        else: rest
+  defp rest_buffer(rest, _parent), do: from_binary(own_rest(rest))
 
-    from_binary(rest)
+  @doc """
+  `rest`, the unread end of a receive buffer, copied when its binary is
+  more than twice its size: the frames before it are not kept alive while
+  the next one fills, nor appended to in place behind them. Before, only a
+  remainder under 4 KiB was copied: one of 4 KiB or more kept a ~4 MB frame
+  (AUD-A1-3). A copy is at most the bytes consumed since the last one, so
+  receiving stays linear. Used by both transports.
+  """
+  def own_rest(rest) do
+    if :binary.referenced_byte_size(rest) > 2 * byte_size(rest),
+      do: :binary.copy(rest),
+      else: rest
   end
 end
