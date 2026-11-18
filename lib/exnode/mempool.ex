@@ -127,6 +127,17 @@ defmodule Exnode.Mempool do
   def get_txs(server, items), do: GenServer.call(server, {:get_txs, items}, :infinity)
 
   @doc """
+  `get_txs/2` for a peer's getdata (Core `info_for_relay`): only entries
+  whose sequence is below `before`, the mempool sequence at the last inv
+  sent to that peer (Core `m_last_inv_sequence`).
+  """
+  def get_txs(server, items, before),
+    do: GenServer.call(server, {:get_txs, items, before}, :infinity)
+
+  @doc "The sequence the next entry gets (Core `GetSequence`)."
+  def sequence(server), do: GenServer.call(server, :sequence, :infinity)
+
+  @doc """
   BIP152 reconstruction (Core `InitData` mempool pass): the mempool txs
   whose short id (SipHash keyed `{k0, k1}`, of the wtxid) is in `wanted`.
   Returns `%{short_id => tx | :collided}`.
@@ -318,26 +329,33 @@ defmodule Exnode.Mempool do
     {:reply, hashes |> Enum.filter(has?) |> MapSet.new(), st}
   end
 
-  def handle_call({:get_txs, items}, _from, st) do
+  def handle_call({:get_txs, items}, from, st), do: handle_call({:get_txs, items, nil}, from, st)
+
+  def handle_call({:get_txs, items, before}, _from, st) do
     {found, missing} =
       Enum.reduce(items, {[], []}, fn i, {found, missing} ->
-        case pool_tx(st, i.hash, if(i.type == :wtx, do: :wtxid, else: :txid)) do
-          nil -> {found, [i | missing]}
-          tx -> {[tx | found], missing}
+        case pool_entry(st, i.hash, if(i.type == :wtx, do: :wtxid, else: :txid)) do
+          %{sequence: seq} = e when before == nil or seq < before -> {[e.tx | found], missing}
+          _ -> {found, [i | missing]}
         end
       end)
 
     {:reply, {Enum.reverse(found), Enum.reverse(missing)}, st}
   end
 
+  def handle_call(:sequence, _from, st), do: {:reply, st.state.pool.sequence, st}
+
   def handle_call({:sync_to, tip_hash}, _from, st) do
     {:reply, :ok, sync_until(st, tip_hash)}
   end
 
   defp pool_tx(st, h, kind) do
-    e = if kind == :wtxid, do: Pool.by_wtxid(st.state.pool, h), else: Pool.get(st.state.pool, h)
+    e = pool_entry(st, h, kind)
     e && e.tx
   end
+
+  defp pool_entry(st, h, :wtxid), do: Pool.by_wtxid(st.state.pool, h)
+  defp pool_entry(st, h, _txid), do: Pool.get(st.state.pool, h)
 
   @impl true
   def handle_cast({:remove_unbroadcast, txids}, st),

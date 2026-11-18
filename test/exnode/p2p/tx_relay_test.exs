@@ -49,6 +49,8 @@ defmodule Exnode.P2P.TxRelayTest do
           {:reply, nil, st}
         )
 
+    def handle_call({:get_txs, items, _before}, f, st), do: handle_call({:get_txs, items}, f, st)
+
     def handle_call({:get_txs, items}, _f, st) do
       send(st.test, {:mp, :get_txs, length(items)})
       {found, missing} = Enum.split_with(items, &Map.has_key?(st.txs, &1.hash))
@@ -77,6 +79,7 @@ defmodule Exnode.P2P.TxRelayTest do
 
     def handle_cast({:listener, relay}, st), do: {:noreply, %{st | relay: relay}}
 
+    def handle_call(:sequence, _f, st), do: {:reply, map_size(st.txs), st}
     def handle_call({:has, _, _}, _f, st), do: {:reply, false, st}
 
     def handle_call({:accept, tx, _}, {origin, _}, st) do
@@ -293,7 +296,7 @@ defmodule Exnode.P2P.TxRelayTest do
     def start_link(_), do: GenServer.start_link(__MODULE__, nil)
     def init(_), do: {:ok, nil}
 
-    def handle_call({:get_txs, items}, _f, st) do
+    def handle_call({:get_txs, items, _before}, _f, st) do
       receive do
         :open -> {:reply, {[], items}, st}
       end

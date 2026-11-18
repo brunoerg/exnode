@@ -269,7 +269,15 @@ defmodule Exnode.P2P.TxRelay do
 
     p =
       Map.merge(
-        %{known: new_filter(), to_send: [], feefilter: 0, next_inv_at: now + inv_delay(info)},
+        %{
+          known: new_filter(),
+          to_send: [],
+          feefilter: 0,
+          next_inv_at: now + inv_delay(info),
+          # Core m_last_inv_sequence: the mempool sequence at the last inv
+          # sent; getdata is served only for older entries (0: none yet).
+          last_inv_seq: 0
+        },
         info
       )
 
@@ -349,9 +357,12 @@ defmodule Exnode.P2P.TxRelay do
       else: {:reply, :ok, st}
   end
 
-  def handle_call({:lookup, items}, _from, st) do
+  # Core FindTxForGetData: only txs in the mempool before the last inv sent
+  # to this peer (AUD-A2-2); an unregistered caller gets none.
+  def handle_call({:lookup, items}, {peer, _}, st) do
+    before = get_in(st.peers, [peer, :last_inv_seq]) || 0
     # One mempool call for the whole getdata.
-    {txs, missing} = Mempool.get_txs(st.mempool, items)
+    {txs, missing} = Mempool.get_txs(st.mempool, items, before)
     # Core ProcessGetData: a tx requested by a peer leaves the unbroadcast set.
     if txs != [], do: Mempool.remove_unbroadcast(st.mempool, Enum.map(txs, & &1.txid))
     {:reply, {txs, missing}, st}
@@ -1366,12 +1377,21 @@ defmodule Exnode.P2P.TxRelay do
   defp exp_delay(mean), do: round(-mean * :math.log(1.0 - :rand.uniform()))
 
   defp trickle(st, now) do
+    # Core sets m_last_inv_sequence when it builds a non-empty inv: read the
+    # mempool sequence once, before the entries are extracted, so nothing
+    # entering after it counts as announced.
+    seq =
+      if Enum.any?(st.peers, fn {_, p} -> p.next_inv_at <= now and p.to_send != [] end),
+        do: Mempool.sequence(st.mempool)
+
     peers =
       Map.new(st.peers, fn {pid, p} ->
         if p.next_inv_at <= now and p.to_send != [] do
           {items, known} = inventory(st, p)
           items |> Enum.chunk_every(@max_inv_sz) |> Enum.each(&send(pid, {:send, {:inv, &1}}))
-          {pid, %{p | to_send: [], known: known, next_inv_at: now + inv_delay(p)}}
+
+          {pid,
+           %{p | to_send: [], known: known, next_inv_at: now + inv_delay(p), last_inv_seq: seq}}
         else
           {pid, if(p.next_inv_at <= now, do: %{p | next_inv_at: now + inv_delay(p)}, else: p)}
         end
