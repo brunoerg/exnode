@@ -1368,7 +1368,9 @@ defmodule Exnode.Archive do
     ops = a.batch.ops |> Enum.reverse() |> Enum.concat()
     ops = with_meta(a, ops ++ extra_ops)
     tm = System.monotonic_time(:microsecond)
-    :ok = KV.write(a.kv, ops, sync: true, stats: true)
+    # Key-ordered `spends` and `txindex` runs: an IBD commit's millions of
+    # rows insert into the memtable several times faster (Store.PackedSort).
+    :ok = KV.write(a.kv, ops, sync: true, stats: true, sort_packed: true)
     t2 = System.monotonic_time(:microsecond)
     count(:commit_blocks, a.batch.n)
     count(:commit_materialize_us, tm - t1)

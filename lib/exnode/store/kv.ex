@@ -226,6 +226,9 @@ defmodule Exnode.Store.KV do
   heap differs (one binary instead of one tuple and two binaries per put).
   `{:merge, cf, key, operand}` applies the family's merge operator (only
   `:scripthash` has one).
+  `sort_packed: true` writes each column family that only `put_packed`
+  ops of one shape touch as one key-ordered run (see `sort_packed/1`
+  below); the store written is the same, the memtable inserts are faster.
   `sync: true` (the default)
   fsyncs the WAL before returning. `stats: true` adds this write to the
   calling process's counters (`take_stats/0`): native batch construction
@@ -235,6 +238,7 @@ defmodule Exnode.Store.KV do
   def write(%__MODULE__{db: db, cfs: cfs}, ops, opts \\ []) do
     stats = Keyword.get(opts, :stats, false)
     t0 = if stats, do: System.monotonic_time(:microsecond)
+    ops = if Keyword.get(opts, :sort_packed, false), do: sort_packed(ops), else: ops
     {:ok, batch} = :rocksdb.batch()
 
     try do
@@ -274,6 +278,46 @@ defmodule Exnode.Store.KV do
       result
     after
       :rocksdb.release_batch(batch)
+    end
+  end
+
+  # `sort_packed: true`: in each column family written only by
+  # `put_packed` ops of one record shape, the runs are joined in order and
+  # sorted by key (`Exnode.Store.PackedSort`, stable), so the memtable
+  # takes them in key order. The store written is the same: within such a
+  # family the last put of a key still wins, and families are independent,
+  # so moving the run within the batch changes nothing. A family with any
+  # other op, or runs of two shapes, is left as given.
+  defp sort_packed(ops) do
+    shapes =
+      Enum.reduce(ops, %{}, fn
+        {:put_packed, cf, ks, vs, _}, acc ->
+          Map.update(acc, cf, {ks, vs}, &if(&1 == {ks, vs}, do: &1, else: :mixed))
+
+        op, acc ->
+          Map.put(acc, elem(op, 1), :mixed)
+      end)
+
+    sortable = for {cf, {_, _}} <- shapes, into: MapSet.new(), do: cf
+
+    if MapSet.size(sortable) == 0 do
+      ops
+    else
+      {runs, rest} =
+        Enum.split_with(ops, &(elem(&1, 0) == :put_packed and elem(&1, 1) in sortable))
+
+      sorted =
+        runs
+        |> Enum.group_by(&elem(&1, 1), &elem(&1, 4))
+        |> Enum.sort()
+        |> Enum.map(fn {cf, bins} ->
+          {ks, vs} = Map.fetch!(shapes, cf)
+
+          {:put_packed, cf, ks, vs,
+           Exnode.Store.PackedSort.sort(IO.iodata_to_binary(bins), ks, vs)}
+        end)
+
+      sorted ++ rest
     end
   end
 
