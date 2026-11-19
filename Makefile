@@ -25,7 +25,7 @@ NIF_LDFLAGS := -shared -L$(KERNEL_LIB) -lbitcoinkernel -Wl,-rpath,'$(KERNEL_RPAT
 SECP_INC := $(CORE_DIR)/src/secp256k1/include
 SECP_LIB := $(CORE_DIR)/build-kernel/src/secp256k1/lib/libsecp256k1.a
 
-all: $(PRIV)/kernel_nif.so $(PRIV)/shadow_validator $(PRIV)/secp_nif.so $(PRIV)/sort_nif.so $(KERNEL_BUNDLED)
+all: $(PRIV)/kernel_nif.so $(PRIV)/shadow_validator $(PRIV)/secp_nif.so $(PRIV)/sort_nif.so $(PRIV)/overlay_nif.so $(KERNEL_BUNDLED)
 
 # A regular file (cp -L): no symlinks in the release.
 ifeq ($(BUNDLE_KERNEL),1)
@@ -44,6 +44,11 @@ $(PRIV)/secp_nif.so: native/secp_nif/secp_nif.c $(SECP_LIB)
 $(PRIV)/sort_nif.so: native/sort_nif/sort_nif.c
 	@mkdir -p $(PRIV)
 	$(CC) $(CFLAGS) -fPIC -std=c11 -I$(ERTS_INCLUDE_DIR) $< -o $@ -shared
+
+# The archive overlay's coin tables (Exnode.Archive.Overlay): no libraries.
+$(PRIV)/overlay_nif.so: native/overlay_nif/overlay_nif.c
+	@mkdir -p $(PRIV)
+	$(CC) $(CFLAGS) -fPIC -std=c11 -D_DEFAULT_SOURCE -I$(ERTS_INCLUDE_DIR) $< -o $@ -shared
 
 $(PRIV)/kernel_nif.so: native/kernel_nif/kernel_nif.c $(KERNEL_INC)/bitcoinkernel.h
 	@mkdir -p $(PRIV)

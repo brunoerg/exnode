@@ -157,7 +157,7 @@ defmodule Exnode.Chain.PrefetchTest do
 
     {result, stats} =
       State.peek_archive(n.cs, fn a ->
-        for op <- evicted, do: :ets.delete(a.overlay.coins, op)
+        :ok = Exnode.Archive.Overlay.drop(a.overlay, evicted)
         Archive.take_stats()
         r = Archive.resolve_many(a, ops, answers)
         {r, Archive.take_stats()}

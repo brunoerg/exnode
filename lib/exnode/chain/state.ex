@@ -829,7 +829,8 @@ defmodule Exnode.Chain.State do
       archive_other: w.(%{a | batch: nil}),
       # ETS (not process heap), words.
       ets_chain: :ets.info(a.chain, :memory) + :ets.info(a.onchain, :memory),
-      ets_overlay: :ets.info(a.overlay.coins, :memory) + :ets.info(a.overlay.spent, :memory),
+      # Native tables (not process heap), words.
+      overlay_native: div(Exnode.Archive.Overlay.native_bytes(a.overlay), 8),
       plan_items: length(items),
       item_block: item_part.(:block),
       item_res: item_part.(:res),
@@ -2823,8 +2824,9 @@ defmodule Exnode.Chain.State do
 
   # A crash inside Archive.connect cannot be contained in place like a
   # validation crash: it may have appended to the segment files (the file
-  # position moved) and updated the chain and overlay ETS tables, none of
-  # which the old archive struct reflects. So the block is quarantined (the
+  # position moved) and updated the chain ETS tables and the overlay's
+  # native tables, none of which the old archive struct reflects (the
+  # overlay's are freed once no process holds a reference to them). So the block is quarantined (the
   # same durable mark, crash report and :crash to its source) and the chain
   # state exits: its restart reopens the archive at the last commit
   # (segments truncated to the committed ends), replays the uncommitted
