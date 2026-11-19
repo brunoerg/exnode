@@ -179,11 +179,10 @@ defmodule Exnode.P2P.Peer do
         {:error, _} -> {to_charlist(host), []}
       end
 
-    case :gen_tcp.connect(
+    case connect(
            host,
            port,
-           family ++ [:binary, active: :once, packet: :raw, nodelay: true] ++ send_opts(st),
-           5_000
+           family ++ [:binary, active: :once, packet: :raw, nodelay: true] ++ send_opts(st)
          ) do
       {:ok, sock} ->
         st = start_session(%{st | socket: sock})
@@ -192,6 +191,17 @@ defmodule Exnode.P2P.Peer do
       {:error, reason} ->
         {:stop, {:shutdown, {:connect_failed, reason}}, st}
     end
+  end
+
+  # `:gen_tcp.connect/4` turns the socket's EINVAL into `exit(badarg)`
+  # instead of returning it, e.g. for a link-local IPv6 outside fe80::/64
+  # (Core IsRFC4862 covers only that /64, so such an address is routable
+  # and stored, as in Core): fe80:2::/64 gossiped by a peer crashed the peer
+  # process. Core's connect just fails; so does this one.
+  defp connect(host, port, opts) do
+    :gen_tcp.connect(host, port, opts, 5_000)
+  catch
+    :exit, :badarg -> {:error, :einval}
   end
 
   defp start_session(st) do

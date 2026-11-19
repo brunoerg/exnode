@@ -272,6 +272,36 @@ defmodule Exnode.P2P.OutboundSelectionTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :feeler_done}}, 5_000
   end
 
+  # Regression (mainnet): fe80:2::225:90ff:fe47:9570 from addr gossip is
+  # routable by Core's rules (IsRFC4862 is fe80::/64 only), so it is tried;
+  # :gen_tcp.connect exited with badarg (EINVAL) for it and the peer process
+  # crashed with an error report instead of failing to connect.
+  test "a connect that exits with badarg is a failed connect, not a crash", %{tmp_dir: dir} do
+    %{n: n} = TestNode.start(dir)
+
+    node = %{
+      params: @p,
+      headers: n.headers,
+      addrman: nil,
+      sync: n.sync,
+      nonce: 1,
+      services: 9,
+      user_agent: "/t/",
+      connman: self()
+    }
+
+    host = to_string(:inet.ntoa({0xFE80, 2, 0, 0, 0x225, 0x90FF, 0xFE47, 0x9570}))
+
+    {:ok, pid} =
+      Peer.start_link(%{node: node, conn_type: :outbound_full_relay, connect: {host, 8333}})
+
+    Process.unlink(pid)
+    ref = Process.monitor(pid)
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, {:connect_failed, :einval}}},
+                   5_000
+  end
+
   # Regression: an oversized inv/headers/addr before the
   # handshake was decoded and punished (misbehaving: disconnect and a 24 h
   # discouragement of the IP); Core ignores any such message before verack.
