@@ -20,7 +20,7 @@ defmodule Exnode.Chain.Prefetch do
   `pending`) falls back to the chain state's own path, as before.
 
   Cache-aware: outpoints the overlay answers when the worker runs (cached
-  coins, uncommitted spends; `ctx.hint`, its ETS handles only) are not
+  coins, uncommitted spends; `ctx.hint`, its native tables only) are not
   looked up (`Archive.prefetch_block/4`). They are absent from the
   answers, so if the overlay drops them before use, the chain state looks
   them up itself: the hint saves I/O, it never supplies an answer.

@@ -19,17 +19,25 @@ defmodule Exnode.Archive.Overlay do
   answers `resolve` without the archive. Any disconnect clears everything
   (reorgs are rare; Core's cache is likewise rebuilt from the DB).
 
-  ETS tables owned by the archive's process.
+  The tables live in native memory (`native/overlay_nif`), not ETS: plain
+  allocations in an open-addressing hash table, as Core's `CCoinsMap`, that
+  no garbage collector scans and no lookup copies whole. As ETS tables
+  (about 320 bytes per coin, copied in and out on each access) they held
+  ~100M coins once a 32 GiB cache filled in a mainnet IBD, and the overlay's
+  cost per input grew from 1.1 to 2.5 µs between heights 200k and 700k.
+  The archive's process is the only writer; other processes (prefetch) may
+  test membership with `answerable?/2`. The memory is freed when the last
+  reference to the tables goes (or by `close/1`).
   """
 
+  # `tab`: the native tables (both kinds of entry).
   # `gens`: queue of `{gen, n, packed}`, the outpoints each block created
   # (spent ones included), packed into one off-heap binary (`pack_ops/1`).
   # `queued`: their count; `queued_bytes`: the packed bytes. Charged to the
   # budget too, so a cache larger than the UTXO set does not keep every
   # outpoint ever made.
   defstruct [
-    :coins,
-    :spent,
+    :tab,
     gens: :queue.new(),
     queued: 0,
     queued_bytes: 0,
@@ -38,102 +46,102 @@ defmodule Exnode.Archive.Overlay do
   ]
 
   # The budget counts real memory, as Core's -dbcache counts its cache's
-  # dynamic usage. Measured on OTP 28, 64-bit:
-  # * a coin entry in ETS, {{txid, vout}, gen, coin map} with a typical
-  #   22-34 byte script: about 301 bytes (rounded up);
-  # * the generation queue: each block's outpoints packed in one off-heap
-  #   binary (37 bytes per mainnet outpoint, counted exactly), plus about
-  #   64 bytes per block for the binary and the queue element. Kept as
-  #   tuples on the process heap they cost 88 bytes each, and the heap's
-  #   growth margin and garbage-collection copies about doubled that.
-  # A script over 64 bytes is an off-heap binary and is not counted (rare).
-  @entry_bytes 320
+  # dynamic usage: the native tables report their slots and each entry's
+  # allocation (`malloc_usable_size`), and the generation queue is charged
+  # its packed bytes plus about 64 bytes per block for the binary and the
+  # queue element.
   @gen_bytes 64
 
-  @doc "`max_bytes`: cache budget (Core `-dbcache` role). 0 keeps only uncommitted entries."
-  def new(max_bytes) do
-    %__MODULE__{
-      coins: :ets.new(:overlay_coins, [:set, :protected]),
-      spent: :ets.new(:overlay_spent, [:set, :protected]),
-      max: max_bytes
-    }
+  @on_load :load_nif
+
+  @doc false
+  def load_nif do
+    path = :filename.join(:code.priv_dir(:exnode), ~c"native/overlay_nif")
+    :erlang.load_nif(path, 0)
   end
 
-  @doc "Memory charged against the budget, in bytes: coin entries plus the generation queue."
+  @doc "`max_bytes`: cache budget (Core `-dbcache` role). 0 keeps only uncommitted entries."
+  def new(max_bytes), do: %__MODULE__{tab: new_nif(), max: max_bytes}
+
+  @doc "Memory charged against the budget, in bytes: the native tables plus the generation queue."
   def memory(%__MODULE__{} = ov),
-    do: size(ov) * @entry_bytes + ov.queued_bytes + :queue.len(ov.gens) * @gen_bytes
+    do: native_bytes(ov) + ov.queued_bytes + :queue.len(ov.gens) * @gen_bytes
+
+  @doc "Bytes held by the native tables (slots and entries, both kinds)."
+  def native_bytes(%__MODULE__{tab: t}), do: elem(info_nif(t), 2)
 
   @doc "`{:ok, coin}`, `:spent` (by an uncommitted block) or `:unknown`."
-  def lookup(%__MODULE__{coins: c, spent: s}, op) do
-    case :ets.lookup(c, op) do
-      [{_, _gen, coin}] -> {:ok, coin}
-      [] -> if :ets.member(s, op), do: :spent, else: :unknown
-    end
-  end
+  def lookup(%__MODULE__{tab: t}, {txid, vout}), do: lookup_nif(t, txid, vout)
 
   @doc """
-  The overlay's two ETS handles alone (no generation queue), for another
-  process to test outpoints with `answerable?/2` (prefetch). The tables stay
-  owned and written by the archive's process; other processes only read.
+  The overlay's tables alone (no generation queue), for another process to
+  test outpoints with `answerable?/2` (prefetch). The tables stay written
+  by the archive's process only.
   """
-  def hint(%__MODULE__{coins: c, spent: s}), do: %__MODULE__{coins: c, spent: s}
+  def hint(%__MODULE__{tab: t}), do: %__MODULE__{tab: t}
 
   @doc """
   True if `lookup/2` answers `op` right now (a coin, or a spend by an
   uncommitted block). From another process this is advisory only: the owner
-  may evict or clear entries at any moment.
+  may evict or clear entries at any moment, and while the owner is writing
+  the tables this answers false without waiting (the caller then resolves
+  `op` itself).
   """
-  def answerable?(%__MODULE__{coins: c, spent: s}, op),
-    do: :ets.member(c, op) or :ets.member(s, op)
+  def answerable?(%__MODULE__{tab: t}, {txid, vout}), do: member_nif(t, txid, vout)
 
   @doc """
   Applies a connected block: `spent` outpoints are removed and masked, then
   `created` (`%{op => coin}`, unspendable outputs already excluded) is added.
-  Cached entries (ETS, and the generation queue's packed outpoints) never
-  keep block binaries alive. Since OTP 27 a
-  binary of at most 64 bytes is never a sub-binary (matching or
-  `binary_part/3` copies it), so a txid or a short script cannot reference
-  its block: only larger binaries are copied. The mask and the coins each
-  go in with one insert per block.
+  The tables keep their own copies of keys and scripts, never a reference
+  into a block binary.
   """
   def apply_block(%__MODULE__{} = ov, gen, created, spent),
     do: apply_prepared(ov, prepare_block(gen, created, spent))
 
   @doc """
-  The table-independent part of `apply_block/4`: the mask rows, the coin
-  rows (owned binaries, see above) and the packed outpoints of generation
-  `gen`. Pure, so any process may build it; `apply_prepared/2` applies it.
+  The table-independent part of `apply_block/4`: the block's spent
+  outpoints and created coins packed into binaries, and its created
+  outpoints for the generation queue. Pure, so any process may build it
+  (the archive's preparation workers do); `apply_prepared/2` applies it.
   """
   def prepare_block(gen, created, spent) do
-    mask = for op <- spent, do: {own_op(op)}
+    {coins, ops} =
+      Enum.reduce(created, {[], []}, fn {op, c}, {cs, os} ->
+        spk = c.script_pubkey
 
-    {entries, ops} =
-      Enum.reduce(created, {[], []}, fn {op, coin}, {es, os} ->
-        op = own_op(op)
-        {[{op, gen, own_script(coin)} | es], [op | os]}
+        rec = [
+          op_rec(op),
+          <<c.output_id::64, c.value::64, c.height::32, if(c.coinbase, do: 1, else: 0)::8,
+            byte_size(spk)::32>>,
+          spk
+        ]
+
+        {[rec | cs], [op | os]}
       end)
 
-    %{gen: gen, mask: mask, entries: entries, n: length(ops), packed: pack_ops(ops)}
+    %{
+      gen: gen,
+      mask: pack_ops(spent),
+      coins: IO.iodata_to_binary(coins),
+      n: length(ops),
+      packed: pack_ops(ops)
+    }
   end
 
   @doc "Applies a `prepare_block/3` result: the same effect as `apply_block/4`."
-  def apply_prepared(%__MODULE__{} = ov, %{
+  def apply_prepared(%__MODULE__{tab: t} = ov, %{
         gen: gen,
         mask: mask,
-        entries: entries,
+        coins: coins,
         n: n,
         packed: packed
       }) do
-    t0 = System.monotonic_time(:microsecond)
-    for {op} <- mask, do: :ets.delete(ov.coins, op)
-    :ets.insert(ov.spent, mask)
-    t1 = System.monotonic_time(:microsecond)
-    for {op, _, _} <- entries, do: :ets.delete(ov.spent, op)
-    :ets.insert(ov.coins, entries)
-    t2 = System.monotonic_time(:microsecond)
-    bump(:ov_spent_us, t1 - t0)
-    bump(:ov_created_us, t2 - t1)
-    bump(:ov_spent_n, length(mask))
+    # One call, so a block is applied whole or (malformed) not at all; it
+    # times its two phases itself.
+    {:ok, spent_us, created_us} = apply_nif(t, gen, mask, coins)
+    bump(:ov_spent_us, spent_us)
+    bump(:ov_created_us, created_us)
+    bump(:ov_spent_n, count_ops(mask))
     bump(:ov_created_n, n)
 
     %{
@@ -145,17 +153,14 @@ defmodule Exnode.Archive.Overlay do
   end
 
   # <<txid size, txid, vout::32>> per outpoint (a 32-byte txid on mainnet).
-  defp pack_ops(ops),
-    do: IO.iodata_to_binary(for {txid, vout} <- ops, do: [byte_size(txid), txid, <<vout::32>>])
+  defp pack_ops(ops), do: IO.iodata_to_binary(Enum.map(ops, &op_rec/1))
+  defp op_rec({txid, vout}), do: [byte_size(txid), txid, <<vout::32>>]
 
-  # A binary that may be a sub-binary of its block (over 64 bytes) is copied.
-  defp own_op({txid, vout}) when byte_size(txid) > 64, do: {:binary.copy(txid), vout}
-  defp own_op(op), do: op
+  defp count_ops(packed), do: count_ops(packed, 0)
+  defp count_ops(<<>>, n), do: n
 
-  defp own_script(%{script_pubkey: spk} = coin) when byte_size(spk) > 64,
-    do: %{coin | script_pubkey: :binary.copy(spk)}
-
-  defp own_script(coin), do: coin
+  defp count_ops(<<len, _::binary-size(len), _::32, rest::binary>>, n),
+    do: count_ops(rest, n + 1)
 
   @doc """
   The batch up to `gen` is committed: spend records are on disk, entries
@@ -164,9 +169,9 @@ defmodule Exnode.Archive.Overlay do
   queued generation once committed stays committed; eviction without a
   cache budget relies on this.
   """
-  def committed(%__MODULE__{} = ov, gen) do
+  def committed(%__MODULE__{tab: t} = ov, gen) do
     t0 = System.monotonic_time(:microsecond)
-    :ets.delete_all_objects(ov.spent)
+    :ok = clear_nif(t, :spent)
     t1 = System.monotonic_time(:microsecond)
     ov = evict(%{ov | flushed: gen})
     bump(:ov_mask_clear_us, t1 - t0)
@@ -175,13 +180,32 @@ defmodule Exnode.Archive.Overlay do
   end
 
   @doc "Drops everything (disconnect)."
-  def clear(%__MODULE__{} = ov) do
-    :ets.delete_all_objects(ov.coins)
-    :ets.delete_all_objects(ov.spent)
+  def clear(%__MODULE__{tab: t} = ov) do
+    :ok = clear_nif(t, :all)
     %{ov | gens: :queue.new(), queued: 0, queued_bytes: 0}
   end
 
-  def size(%__MODULE__{coins: c}), do: :ets.info(c, :size)
+  @doc "Coin entries held."
+  def size(%__MODULE__{tab: t}), do: elem(info_nif(t), 0)
+
+  @doc "Masked (spent, uncommitted) outpoints held."
+  def spent_size(%__MODULE__{tab: t}), do: elem(info_nif(t), 1)
+
+  @doc false
+  # The generation a coin entry belongs to, or nil (tests).
+  def gen_of(%__MODULE__{tab: t}, {txid, vout}), do: gen_of_nif(t, txid, vout)
+
+  @doc false
+  # Drops the coin entries of `ops` as an eviction would, without touching
+  # the generation queue (tests: a cache entry gone between preparation
+  # and use).
+  def drop(%__MODULE__{tab: t}, ops) do
+    for op <- ops, gen = gen_of(%__MODULE__{tab: t}, op), gen != nil do
+      evict_nif(t, gen, pack_ops([op]))
+    end
+
+    :ok
+  end
 
   # Evicts the oldest committed blocks' entries while over budget. An entry
   # is removed only if it still belongs to that block (it may have been spent,
@@ -190,13 +214,13 @@ defmodule Exnode.Archive.Overlay do
   # No cache (max 0) and every queued block committed: the loop would evict
   # every block. Each coin entry `{op, gen}` is listed under its own `gen`
   # in the queue (apply_block adds both together; only spending, eviction
-  # and clear/1 remove entries), so the table would end empty: one
-  # delete_all_objects does the same.
+  # and clear/1 remove entries), so the table would end empty: one clear
+  # does the same.
   defp evict(%{max: 0} = ov) do
     if Enum.all?(:queue.to_list(ov.gens), fn {g, _, _} -> g <= ov.flushed end) do
       bump(:ov_evicted, ov.queued)
       bump(:ov_evict_all, 1)
-      :ets.delete_all_objects(ov.coins)
+      :ok = clear_nif(ov.tab, :all)
       %{ov | gens: :queue.new(), queued: 0, queued_bytes: 0}
     else
       evict_oldest(ov)
@@ -208,14 +232,7 @@ defmodule Exnode.Archive.Overlay do
   defp evict_oldest(ov) do
     with true <- memory(ov) > ov.max,
          {{:value, {gen, n, packed}}, rest} when gen <= ov.flushed <- :queue.out(ov.gens) do
-      # The owner is the only writer (:protected), so test-then-delete is
-      # the select_delete of `{op, gen, _}` without a match specification.
-      # The txid is a sub-binary of `packed`, used only as a key here.
-      for <<len, txid::binary-size(len), vout::32 <- packed>>,
-          op = {txid, vout},
-          :ets.lookup_element(ov.coins, op, 2, nil) == gen,
-          do: :ets.delete(ov.coins, op)
-
+      _removed = evict_nif(ov.tab, gen, packed)
       bump(:ov_evicted, n)
 
       evict_oldest(%{
@@ -229,10 +246,17 @@ defmodule Exnode.Archive.Overlay do
     end
   end
 
-  def close(%__MODULE__{coins: c, spent: s}) do
-    :ets.delete(c)
-    :ets.delete(s)
-  end
+  @doc "Frees the tables now (they are freed anyway once unreferenced)."
+  def close(%__MODULE__{tab: t}), do: :ok = clear_nif(t, :all)
+
+  defp new_nif, do: :erlang.nif_error(:nif_not_loaded)
+  defp apply_nif(_t, _gen, _mask, _coins), do: :erlang.nif_error(:nif_not_loaded)
+  defp lookup_nif(_t, _txid, _vout), do: :erlang.nif_error(:nif_not_loaded)
+  defp member_nif(_t, _txid, _vout), do: :erlang.nif_error(:nif_not_loaded)
+  defp gen_of_nif(_t, _txid, _vout), do: :erlang.nif_error(:nif_not_loaded)
+  defp evict_nif(_t, _gen, _ops), do: :erlang.nif_error(:nif_not_loaded)
+  defp clear_nif(_t, _which), do: :erlang.nif_error(:nif_not_loaded)
+  defp info_nif(_t), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   Takes (and resets) this process's overlay work counters (per block or
