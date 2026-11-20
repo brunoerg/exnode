@@ -11,7 +11,10 @@ defmodule Exnode.Chain.Prefetch do
   The chain state uses the answers only when they cannot differ from what
   it would compute itself:
   * the archive's committed state is unchanged (`Archive.epoch/1` equal at
-    prefetch and at use: any commit or disconnect in between voids them);
+    prefetch and at use), or changed by exactly one commit, which
+    `Archive.revalidate/4` checks each answer against: the answers it may
+    have changed are dropped and looked up again, the rest are kept. Two
+    commits, or a disconnect, in between void them;
   * the overlay, the batch and the in-flight blocks still answer first, so
     the answers only stand in for the committed lookup;
   * no prefetch on a path that reconnects already-archived blocks: those

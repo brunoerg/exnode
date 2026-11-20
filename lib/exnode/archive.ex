@@ -60,6 +60,11 @@ defmodule Exnode.Archive do
     committed: nil,
     committed_next: nil,
     epoch: 0,
+    # What the last commit changed in the committed state (see
+    # `revalidate/4`): `%{from: epoch before it, txids: its batch's txindex
+    # map, spent: MapSet of the output ids its blocks spent}`; nil after a
+    # disconnect.
+    last_commit: nil,
     overwritten: MapSet.new(),
     # Blocks at or above it are read back expecting their witness
     # commitment (Core DeploymentActiveAfter(SEGWIT)); 0: every block.
@@ -69,7 +74,16 @@ defmodule Exnode.Archive do
   # The uncommitted batch: KV ops (reversed list of per-block op lists) and
   # the maps reads need before they are committed.
   defp empty_batch,
-    do: %{ops: [], blocks: %{}, blockhash: %{}, txindex: %{}, n: 0, bytes: 0, since: nil}
+    do: %{
+      ops: [],
+      blocks: %{},
+      blockhash: %{},
+      txindex: %{},
+      n: 0,
+      bytes: 0,
+      since: nil,
+      reconnected: false
+    }
 
   # --- open / recovery ---------------------------------------------------------
 
@@ -935,6 +949,57 @@ defmodule Exnode.Archive do
      }, %{epoch: a.epoch, rows: Map.take(rows, txids)}}
   end
 
+  @doc """
+  Carries `prefetch_block/4` results computed at `epoch` over the one
+  commit since, instead of discarding them: `{:ok, answers, history,
+  dropped}` valid at the current epoch, or `:stale`.
+
+  Only when the current epoch is `epoch + 1` and that step was a commit
+  (`flush/2`; a disconnect clears `last_commit`, and so does a commit
+  whose batch reconnected an archived block). A commit adds exactly
+  its batch to the committed state: txindex rows for the batch's txids,
+  spend records for the output ids its blocks spent, and their outputs.
+  A committed answer for `{txid, vout}` reads only the txindex row of
+  `txid`, the spend record of that output's id, the (immutable) output
+  and the on-chain table. So an answer is unchanged unless `txid` is one
+  of the batch's or (`{:ok, coin}`) its output was spent by the batch:
+  those are dropped (absent: `resolve_many/3` looks them up, as for an
+  omitted outpoint), every other one is kept as it is. The same holds for
+  a worker's reads that straddled the commit: every key a kept answer read
+  is equal before and after it. `history` (the block's own txids' rows)
+  is kept, at the current epoch, only if none of its txids is the batch's.
+  """
+  def revalidate(%__MODULE__{epoch: cur, last_commit: lc}, epoch, answers, history) do
+    case lc do
+      %{from: ^epoch, txids: txids, spent: spent} when cur == epoch + 1 ->
+        kept =
+          :maps.filter(
+            fn
+              {txid, _}, _ when is_map_key(txids, txid) -> false
+              _, {:ok, %{output_id: id}} -> not MapSet.member?(spent, id)
+              _, _ -> true
+            end,
+            answers
+          )
+
+        history =
+          case history do
+            %{rows: rows} ->
+              if Enum.any?(Map.keys(rows), &is_map_key(txids, &1)),
+                do: nil,
+                else: %{history | epoch: cur}
+
+            nil ->
+              nil
+          end
+
+        {:ok, kept, history, map_size(answers) - map_size(kept)}
+
+      _ ->
+        :stale
+    end
+  end
+
   @doc "The overlay's read-only hint for `prefetch_answers/3` (nil without an overlay, as on a `reader/1`)."
   def overlay_hint(%__MODULE__{overlay: nil}), do: nil
   def overlay_hint(%__MODULE__{overlay: ov}), do: Overlay.hint(ov)
@@ -956,6 +1021,7 @@ defmodule Exnode.Archive do
     :commit_blocks,
     :commit_sync_us,
     :commit_materialize_us,
+    :commit_last_us,
     :commit_kv_us,
     :commit_us,
     :append_encode_us,
@@ -1309,7 +1375,10 @@ defmodule Exnode.Archive do
           marks =
             MapSet.reject(a.overwritten, &(&1 >= rec.base_out and &1 < rec.base_out + count))
 
-          {add_to_batch(%{a | overwritten: marks}, id, rec, ops, %{}, nil), id}
+          a = add_to_batch(%{a | overwritten: marks}, id, rec, ops, %{}, nil)
+          # Its txids go on chain again without batch txindex lists: the
+          # commit's effect is not what `revalidate/4` checks.
+          {put_in(a.batch.reconnected, true), id}
       end
 
     t1 = System.monotonic_time(:microsecond)
@@ -1376,13 +1445,27 @@ defmodule Exnode.Archive do
     count(:commit_materialize_us, tm - t1)
     count(commit_bucket(t2 - t0), 1)
 
+    t_lc = System.monotonic_time(:microsecond)
+
+    last_commit =
+      if a.batch.reconnected,
+        do: nil,
+        else: %{
+          from: a.epoch,
+          txids: a.batch.txindex,
+          spent: MapSet.new(for {_, rec} <- a.batch.blocks, id <- rec.undo, do: id)
+        }
+
+    count(:commit_last_us, System.monotonic_time(:microsecond) - t_lc)
+
     a = %{
       a
       | batch: empty_batch(),
         overlay: Overlay.committed(a.overlay, a.next.block - 1),
         committed: a.tip,
         committed_next: a.next,
-        epoch: a.epoch + 1
+        epoch: a.epoch + 1,
+        last_commit: last_commit
     }
 
     t3 = System.monotonic_time(:microsecond)
@@ -1443,7 +1526,7 @@ defmodule Exnode.Archive do
       })
 
     write_with_meta(a, ops)
-    {%{a | committed: a.tip, epoch: a.epoch + 1}, id}
+    {%{a | committed: a.tip, epoch: a.epoch + 1, last_commit: nil}, id}
   end
 
   # Only actual live coins are destroyed. A BIP30-allowed duplicate whose
