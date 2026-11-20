@@ -212,7 +212,10 @@ defmodule Exnode.Chain.PrefetchTest do
     assert State.tip(pf.cs).hash == Enum.at(blocks, 10).header.hash
     stats = State.prefetch_stats(pf.cs)
     assert stats.used > 0, "no prefetched answer was used: #{inspect(stats)}"
-    assert stats.stale > 0, "no prefetched answer went stale: #{inspect(stats)}"
+    # Answers that crossed a commit: carried over one (revalidated) or stale.
+    assert stats.stale + stats.revalidated > 0,
+           "no prefetched answer crossed a commit: #{inspect(stats)}"
+
     stats2 = State.prefetch_stats(pf2.cs)
     assert stats2.used >= 10 and stats2.stale == 0 and stats2.revalidated == 0, inspect(stats2)
 

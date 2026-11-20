@@ -151,7 +151,11 @@ defmodule Exnode.Chain.State do
   def check_block(%Block{} = b, p),
     do: BlockRules.check_block(b, p, signet_check: &Exnode.Validation.Signet.check(&1, p))
 
-  @doc "Prefetch counters since the last perf line: `%{used, stale, none}` (tests, diagnostics)."
+  @doc """
+  Prefetch counters since start (tests, diagnostics): blocks whose answers
+  were `used` (same epoch), `revalidated` over one commit (`reval_dropped`
+  answers dropped), `stale`, or `none` (no prefetch for the block).
+  """
   def prefetch_stats(server), do: GenServer.call(server, :prefetch_stats, 5_000)
 
   @doc """
@@ -413,7 +417,9 @@ defmodule Exnode.Chain.State do
       # Blocks prepared ahead by Chain.Prefetch (0 disables it).
       prefetch_depth: Keyword.get(opts, :prefetch_depth, @prefetch_depth),
       pf: nil,
+      # Cumulative; the perf line shows each window's (pf_logged: at the last line).
       pf_stats: %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0},
+      pf_logged: %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0},
       # Cumulative work counters (work_stats/1); the perf line shows each window's.
       pf_work: %{},
       cs_work: %{},
@@ -3098,6 +3104,7 @@ defmodule Exnode.Chain.State do
       c = Map.get(st, :cs_window, %{})
       w = st.pf_window
       g = fn m, k -> Map.get(m, k, 0) end
+      pf = fn k -> st.pf_stats[k] - st.pf_logged[k] end
       v = Map.merge(Process.delete(:perf_vwin) || %{}, Exnode.Validation.Connect.take_split())
 
       # `archive append` is Archive.connect only; commits (segment fsync, KV
@@ -3108,7 +3115,7 @@ defmodule Exnode.Chain.State do
           "validate #{ms(p.validate)}ms (resolve #{ms(p.resolve)}ms), script latency #{ms(p.scripts)}ms (overlapping) " <>
           "archive append #{ms(p.archive)}ms; commit #{g.(c, :commits)}x #{ms(g.(c, :commit_us))}ms " <>
           "(sync #{ms(g.(c, :commit_sync_us))}ms, kv #{ms(g.(c, :commit_kv_us))}ms) over #{Float.round(secs, 1)}s; " <>
-          "prefetch used #{st.pf_stats.used} revalidated #{st.pf_stats.revalidated} (dropped #{st.pf_stats.reval_dropped} answers) stale #{st.pf_stats.stale} none #{st.pf_stats.none} wait #{ms(p.pfwait)}ms; " <>
+          "prefetch used #{pf.(:used)} revalidated #{pf.(:revalidated)} (dropped #{pf.(:reval_dropped)} answers) stale #{pf.(:stale)} none #{pf.(:none)} wait #{ms(p.pfwait)}ms; " <>
           "prefetch ops #{g.(w, :considered)} omitted #{g.(w, :omitted)} sent #{g.(w, :sent)}, " <>
           "worker busy #{ms(g.(w, :worker_us))}ms (overlapping), worker reads #{g.(w, :output_groups)} groups " <>
           "#{g.(w, :preads)} preads #{div(g.(w, :pread_bytes), 1024)}KiB; chain-state committed ops #{g.(c, :committed_ops)}, " <>
@@ -3127,7 +3134,7 @@ defmodule Exnode.Chain.State do
 
       %{
         st
-        | pf_stats: %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0},
+        | pf_logged: st.pf_stats,
           pf_window: %{}
       }
       |> Map.put(:cs_window, %{})
