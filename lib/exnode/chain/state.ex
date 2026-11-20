@@ -413,7 +413,7 @@ defmodule Exnode.Chain.State do
       # Blocks prepared ahead by Chain.Prefetch (0 disables it).
       prefetch_depth: Keyword.get(opts, :prefetch_depth, @prefetch_depth),
       pf: nil,
-      pf_stats: %{used: 0, stale: 0, none: 0},
+      pf_stats: %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0},
       # Cumulative work counters (work_stats/1); the perf line shows each window's.
       pf_work: %{},
       cs_work: %{},
@@ -1778,10 +1778,26 @@ defmodule Exnode.Chain.State do
         }
 
         # The txindex rows go with the item to its append, which checks
-        # their epoch again (a commit may come before it).
-        if epoch == Archive.epoch(st.a),
-          do: {block, answers, history, update_in(st.pf_stats.used, &(&1 + 1))},
-          else: {block, nil, nil, update_in(st.pf_stats.stale, &(&1 + 1))}
+        # their epoch again (a commit may come before it). Answers of the
+        # epoch just before the last commit are carried over it, minus
+        # those it may have changed (Archive.revalidate/4); older ones are
+        # stale.
+        if epoch == Archive.epoch(st.a) do
+          {block, answers, history, update_in(st.pf_stats.used, &(&1 + 1))}
+        else
+          case Archive.revalidate(st.a, epoch, answers, history) do
+            {:ok, answers, history, dropped} ->
+              st =
+                st
+                |> update_in([:pf_stats, :revalidated], &(&1 + 1))
+                |> update_in([:pf_stats, :reval_dropped], &(&1 + dropped))
+
+              {block, answers, history, st}
+
+            :stale ->
+              {block, nil, nil, update_in(st.pf_stats.stale, &(&1 + 1))}
+          end
+        end
 
       :none ->
         {load_block(st, entry), nil, nil,
@@ -3092,7 +3108,7 @@ defmodule Exnode.Chain.State do
           "validate #{ms(p.validate)}ms (resolve #{ms(p.resolve)}ms), script latency #{ms(p.scripts)}ms (overlapping) " <>
           "archive append #{ms(p.archive)}ms; commit #{g.(c, :commits)}x #{ms(g.(c, :commit_us))}ms " <>
           "(sync #{ms(g.(c, :commit_sync_us))}ms, kv #{ms(g.(c, :commit_kv_us))}ms) over #{Float.round(secs, 1)}s; " <>
-          "prefetch used #{st.pf_stats.used} stale #{st.pf_stats.stale} none #{st.pf_stats.none} wait #{ms(p.pfwait)}ms; " <>
+          "prefetch used #{st.pf_stats.used} revalidated #{st.pf_stats.revalidated} (dropped #{st.pf_stats.reval_dropped} answers) stale #{st.pf_stats.stale} none #{st.pf_stats.none} wait #{ms(p.pfwait)}ms; " <>
           "prefetch ops #{g.(w, :considered)} omitted #{g.(w, :omitted)} sent #{g.(w, :sent)}, " <>
           "worker busy #{ms(g.(w, :worker_us))}ms (overlapping), worker reads #{g.(w, :output_groups)} groups " <>
           "#{g.(w, :preads)} preads #{div(g.(w, :pread_bytes), 1024)}KiB; chain-state committed ops #{g.(c, :committed_ops)}, " <>
@@ -3109,7 +3125,11 @@ defmodule Exnode.Chain.State do
           cs_line(Process.delete(:perf_cs) || %{}, round(secs * 1_000_000))
       )
 
-      %{st | pf_stats: %{used: 0, stale: 0, none: 0}, pf_window: %{}}
+      %{
+        st
+        | pf_stats: %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0},
+          pf_window: %{}
+      }
       |> Map.put(:cs_window, %{})
       |> Map.put(:perf, nil)
     else

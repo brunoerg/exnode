@@ -214,8 +214,10 @@ defmodule Exnode.Chain.PrefetchTest do
     assert stats.used > 0, "no prefetched answer was used: #{inspect(stats)}"
     assert stats.stale > 0, "no prefetched answer went stale: #{inspect(stats)}"
     stats2 = State.prefetch_stats(pf2.cs)
-    assert stats2.used >= 10 and stats2.stale == 0, inspect(stats2)
-    assert State.prefetch_stats(ref.cs) == %{used: 0, stale: 0, none: 0}
+    assert stats2.used >= 10 and stats2.stale == 0 and stats2.revalidated == 0, inspect(stats2)
+
+    assert State.prefetch_stats(ref.cs) ==
+             %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0}
 
     # Every coin ever created, and every header status, agree.
     ops = for b <- bs ++ blocks, tx <- b.txs, v <- 0..(length(tx.outputs) - 1), do: {tx.txid, v}
@@ -245,5 +247,69 @@ defmodule Exnode.Chain.PrefetchTest do
     assert State.tip(pf.cs).hash == List.last(back).header.hash
     ops = ops ++ for b <- back, tx <- b.txs, v <- 0..(length(tx.outputs) - 1), do: {tx.txid, v}
     assert coins(pf, ops) == coins(ref, ops) and coins(pf2, ops) == coins(ref, ops)
+  end
+
+  test "answers carried over one commit drop what it changed: a spend of a batch output, a double spend",
+       %{tmp_dir: dir} do
+    bs = for raw <- BB.read_chain(@chain), do: elem(Block.decode_exact(raw), 1)
+    # A commit when the 20th block of the path retires. Preparation (which
+    # takes the prefetched answers) runs at most 8 blocks ahead of
+    # retirement, and prefetch 11 ahead of preparation: blocks 29 and 30
+    # are prefetched before that commit (when block 18, 19 is prepared)
+    # and prepared after it, before the next.
+    pf =
+      node(dir, "pf",
+        batch_blocks: 20,
+        batch_ms: 600_000,
+        batch_ms_behind: 600_000,
+        prefetch_depth: 11,
+        commit_at_tip: false,
+        # No coin cache: after the commit, coins come from the committed
+        # state, not from the overlay.
+        cache_bytes: 0
+      )
+
+    ref = node(dir, "ref", batch_blocks: 1000, prefetch_depth: 0)
+    nodes = [pf, ref]
+    for n <- nodes, b <- bs, do: {:ok, :connected} = State.submit_block(n.cs, b)
+    for n <- nodes, do: State.commit_now(n.cs)
+
+    cb = fn h -> hd(Enum.at(bs, h - 1).txs).txid end
+    spend = for h <- 1..30, into: %{}, do: {h, BB.spend_op_true(cb.(h), 0, 50 * @coin)}
+
+    # Blocks 29 and 30 are prefetched before blocks 19 and 20 connect, so
+    # the hint knows nothing of their effects: block 29 spends an output
+    # block 19 created (prefetched: missing), block 30 double-spends what
+    # block 20 spent (prefetched: unspent). The commit archives both, and
+    # then only the committed state knows: revalidation must drop both
+    # answers.
+    specs =
+      for i <- 1..30 do
+        cond do
+          i == 29 -> [spend[i], BB.spend_op_true(spend[19].txid, 0, 50 * @coin - 1)]
+          i == 30 -> [BB.spend_op_true(cb.(20), 0, 50 * @coin - 3)]
+          true -> [spend[i]]
+        end
+      end
+
+    blocks = chain(List.last(bs).header, 150, specs)
+    results = for n <- nodes, do: submit_path(n, blocks)
+    assert Enum.uniq(results) |> length() == 1
+
+    for _ <- nodes do
+      assert_received {:block_invalid, h, {:consensus, "bad-txns-inputs-missingorspent"}}
+      assert h == List.last(blocks).header.hash
+    end
+
+    assert State.tip(pf.cs) == State.tip(ref.cs)
+    assert State.tip(pf.cs).hash == Enum.at(blocks, 28).header.hash
+
+    stats = State.prefetch_stats(pf.cs)
+    assert stats.revalidated >= 2 and stats.stale == 0, inspect(stats)
+    # Block 29's and block 30's answers the commit changed.
+    assert stats.reval_dropped >= 2, inspect(stats)
+
+    ops = for b <- bs ++ blocks, tx <- b.txs, v <- 0..(length(tx.outputs) - 1), do: {tx.txid, v}
+    assert coins(pf, ops) == coins(ref, ops)
   end
 end
