@@ -2808,9 +2808,17 @@ defmodule Exnode.Chain.State do
     {:ok, a, System.monotonic_time(:microsecond) - t1}
   catch
     kind, reason ->
-      if storage_failure?(__STACKTRACE__), do: :erlang.raise(kind, reason, __STACKTRACE__)
+      if storage_failure?(__STACKTRACE__) or out_of_memory?(kind, reason),
+        do: :erlang.raise(kind, reason, __STACKTRACE__)
+
       {:crash, {kind, reason}, __STACKTRACE__}
   end
+
+  # Native memory exhausted (the overlay's tables, Archive.Overlay): a fault
+  # of this host, not of the block, so fatal like a storage failure, never a
+  # quarantine. The restart discards the half-applied tables.
+  defp out_of_memory?(:error, :enomem), do: true
+  defp out_of_memory?(_kind, _reason), do: false
 
   # The innermost exnode frame is the storage layer.
   defp storage_failure?(stack) do

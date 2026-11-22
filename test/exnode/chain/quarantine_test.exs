@@ -401,6 +401,41 @@ defmodule Exnode.Chain.QuarantineTest do
     assert State.poisoned(cs2) == []
   end
 
+  # The overlay's native tables raise :enomem when an allocation fails
+  # (Archive.Overlay.apply_prepared, inside Archive.connect). A fault of
+  # the host, not the block: fatal like a storage failure, no quarantine.
+  test "out of memory while archiving is not quarantined: fatal, and replayed once memory is back",
+       %{tmp_dir: dir} do
+    %{bs: bs, kv: kv, hs: hs, b151: b} = setup_chain(dir)
+    hash = b.header.hash
+    armed = :atomics.new(1, [])
+    :atomics.put(armed, 1, 1)
+    hook = archive_hook(self(), hash, armed, fn -> :erlang.raise(:error, :enomem, []) end)
+    opts = [test_archive_hook: hook]
+    cs = start_cs(dir, kv, hs, opts)
+    Process.unlink(cs)
+    ref = Process.monitor(cs)
+    for x <- bs, do: {:ok, :connected} = State.submit_block(cs, x)
+
+    log =
+      capture_log(fn ->
+        assert {:ok, :stored} = State.submit_block(cs, b, defer: true, source: self())
+        assert_receive {:DOWN, ^ref, :process, ^cs, reason}, 5_000
+        refute match?({:shutdown, _}, reason)
+      end)
+
+    refute log =~ "block quarantined"
+    assert_received :archived_target
+    assert KV.get(kv, :poisoned, hash) == :not_found
+    refute_received {:block_checked, ^hash, _}
+    refute_received {:block_quarantined, ^hash, _}
+
+    :atomics.put(armed, 1, 0)
+    cs2 = start_cs(dir, kv, hs, opts)
+    wait_until(fn -> State.tip(cs2).hash == hash end)
+    assert State.poisoned(cs2) == []
+  end
+
   test "a consensus-invalid block still fails as before: header invalidated, not quarantined", %{
     tmp_dir: dir
   } do

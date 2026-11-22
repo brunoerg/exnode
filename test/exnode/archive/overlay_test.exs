@@ -173,6 +173,44 @@ defmodule Exnode.Archive.OverlayTest do
     assert Overlay.lookup(ov, {"a", 0}) == :unknown
     assert Overlay.lookup(ov, {"z", 1}) == :unknown
   end
+
+  # An empty table has no slots: new and clear allocate nothing (so they
+  # cannot fail out of memory), and every call works on the empty tables.
+  test "empty tables (new, cleared) hold no memory and answer every call" do
+    ov = Overlay.new(1_000_000)
+    hint = Overlay.hint(ov)
+
+    check_empty = fn ov ->
+      assert Overlay.native_bytes(ov) == 0
+      assert {Overlay.size(ov), Overlay.spent_size(ov)} == {0, 0}
+      assert Overlay.lookup(ov, {"a", 0}) == :unknown
+      assert Overlay.gen_of(ov, {"a", 0}) == nil
+      refute Overlay.answerable?(hint, {"a", 0})
+      assert Overlay.drop(ov, [{"a", 0}]) == :ok
+    end
+
+    check_empty.(ov)
+    # Committing with no blocks clears an empty mask and evicts nothing.
+    ov = Overlay.committed(ov, 0)
+    check_empty.(ov)
+
+    ov = Overlay.apply_block(ov, 1, %{{"a", 0} => coin(1)}, [{"z", 1}])
+    assert Overlay.native_bytes(ov) > 0
+    ov = Overlay.clear(ov)
+    check_empty.(ov)
+
+    # Usable again after a clear: both tables grow back from nothing.
+    ov = Overlay.apply_block(ov, 2, %{{"b", 0} => coin(2)}, [{"y", 1}])
+    assert Overlay.lookup(ov, {"b", 0}) == {:ok, coin(2)}
+    assert Overlay.lookup(ov, {"y", 1}) == :spent
+    assert Overlay.answerable?(hint, {"b", 0})
+    # The mask alone cleared at commit; the coin stays.
+    ov = Overlay.committed(ov, 2)
+    assert Overlay.spent_size(ov) == 0
+    assert Overlay.lookup(ov, {"b", 0}) == {:ok, coin(2)}
+    Overlay.close(ov)
+    assert Overlay.native_bytes(ov) == 0
+  end
 end
 
 defmodule Exnode.Archive.TxindexCodecTest do

@@ -120,12 +120,12 @@ static uint64_t hash_op(const overlay_t *ov, const unsigned char *key, size_t le
 
 /* --- table ------------------------------------------------------------------ */
 
-static int table_init(table_t *t) {
-    t->slots = calloc(MIN_CAP, sizeof(slot_t));
-    if (!t->slots) return 0;
-    t->cap = MIN_CAP;
+/* An empty table holds no slots (cap 0) until its first insert, so
+ * creating or clearing one never allocates and cannot fail. */
+static void table_init(table_t *t) {
+    t->slots = NULL;
+    t->cap = 0;
     t->size = t->tombs = t->entry_bytes = 0;
-    return 1;
 }
 
 static void table_free_entries(table_t *t) {
@@ -139,6 +139,7 @@ static int key_eq(const entry_t *e, const unsigned char *key, size_t len, uint32
 
 /* Slot index holding the key, or -1. */
 static long table_find(const table_t *t, uint64_t h, const unsigned char *key, size_t len, uint32_t vout) {
+    if (t->cap == 0) return -1;
     size_t mask = t->cap - 1, i = h & mask;
     for (;;) {
         entry_t *e = t->slots[i].e;
@@ -170,6 +171,7 @@ static int table_resize(table_t *t, size_t cap) {
 /* Room for one more entry: grow past 70% use, or rehash in place when
  * tombstones are most of it. */
 static int table_reserve(table_t *t) {
+    if (t->cap == 0) return table_resize(t, MIN_CAP);
     if ((t->size + t->tombs + 1) * 10 <= t->cap * 7) return 1;
     size_t cap = (t->size + 1) * 10 > t->cap * 5 ? t->cap * 2 : t->cap;
     return table_resize(t, cap);
@@ -319,14 +321,8 @@ static entry_t *new_entry(const op_t *op, uint32_t gen, const coin_rec_t *c) {
 static void overlay_dtor(ErlNifEnv *env, void *obj) {
     (void)env;
     overlay_t *ov = obj;
-    if (ov->coins.slots) {
-        table_free_entries(&ov->coins);
-        free(ov->coins.slots);
-    }
-    if (ov->spent.slots) {
-        table_free_entries(&ov->spent);
-        free(ov->spent.slots);
-    }
+    table_clear(&ov->coins);
+    table_clear(&ov->spent);
     if (ov->lock) enif_rwlock_destroy(ov->lock);
 }
 
@@ -344,8 +340,9 @@ static ERL_NIF_TERM nif_new(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     memset(ov, 0, sizeof(*ov));
     uint64_t k[2];
     ov->lock = enif_rwlock_create("exnode_overlay");
-    if (!ov->lock || getrandom(k, sizeof(k), 0) != sizeof(k) || !table_init(&ov->coins) ||
-        !table_init(&ov->spent)) {
+    table_init(&ov->coins);
+    table_init(&ov->spent);
+    if (!ov->lock || getrandom(k, sizeof(k), 0) != sizeof(k)) {
         enif_release_resource(ov);
         return enomem(env);
     }
@@ -360,7 +357,8 @@ static ERL_NIF_TERM nif_new(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
  * outpoints leave `coins` and join `spent`; then each created coin leaves
  * `spent` and goes into `coins` under `gen` (replacing an older entry: a
  * BIP30-allowed duplicate). Both binaries are checked first, so a malformed
- * one changes nothing. Returns {ok, spent_us, created_us}: the two phases'
+ * one changes nothing. Out of memory it raises enomem with the block partly
+ * applied; the owner must then discard the tables. Returns {ok, spent_us, created_us}: the two phases'
  * times. */
 static ERL_NIF_TERM nif_apply(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
