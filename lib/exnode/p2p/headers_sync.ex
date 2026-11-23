@@ -268,6 +268,10 @@ defmodule Exnode.P2P.HeadersSync do
           not process_all and rem(next_height, st.commitment_period) == st.commit_offset
 
         with {:ok, st} <- if(check_commitment?, do: check_commitment(st, h), else: {:ok, st}) do
+          # Buffered across messages: an 80-byte slice would keep the whole
+          # (possibly padded) headers payload alive.
+          h = %{h | raw: h.raw && :binary.copy(h.raw)}
+
           {:ok,
            %{
              st
