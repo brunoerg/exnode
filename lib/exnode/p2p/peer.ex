@@ -44,6 +44,7 @@ defmodule Exnode.P2P.Peer do
   @headers_response_time_s 120
   @headers_download_timeout_base_s 15 * 60
   @headers_download_timeout_per_header_ms 1
+  @chain_sync_timeout_s 20 * 60
   @tick_ms 1_000
   # A send blocked this long (peer not reading) fails and closes the socket,
   # so the writer cannot hang; Core's send-side TIMEOUT_INTERVAL.
@@ -135,6 +136,9 @@ defmodule Exnode.P2P.Peer do
       headers_sync: nil,
       last_getheaders_at: nil,
       best_known: nil,
+      # Core ChainSyncTimeoutState (m_timeout, m_work_header,
+      # m_sent_getheaders, m_protect); timeout nil is Core's 0s.
+      chain_sync: %{timeout: nil, work_header: nil, sent_getheaders: false, protect: false},
       getaddr_answered: false,
       # Core m_addr_token_bucket.
       addr_rate: Exnode.P2P.AddrRate.new(Exnode.Clock.mono(node[:clock])),
@@ -1063,7 +1067,7 @@ defmodule Exnode.P2P.Peer do
   defp accept_headers(st, headers, count, have_headers_sync) do
     case Headers.process_headers(st.node.headers, headers, min_pow_checked: true, now: now(st)) do
       {:ok, last} ->
-        st = %{st | best_known: better(st.best_known, last)}
+        st = maybe_protect(%{st | best_known: better(st.best_known, last)})
 
         st =
           if count == Message.max_headers_results() and not have_headers_sync,
@@ -1130,19 +1134,90 @@ defmodule Exnode.P2P.Peer do
   end
 
   # Core: GetAntiDoSWorkThreshold, on the active tip (genesis until blocks connect).
-  defp anti_dos_work_threshold(st) do
-    tip =
-      if cs = st.node[:chain_state] do
-        t =
-          if v = is_atom(cs) && ChainState.view(cs),
-            do: ChainState.view_tip(v),
-            else: ChainState.tip(cs)
+  defp anti_dos_work_threshold(st),
+    do: HeaderIndex.anti_dos_work_threshold(active_tip_header(st), st.p)
 
-        HeaderIndex.lookup(Headers.index(st.node.headers), t.hash)
-      end
+  # The active tip's header entry; nil without a chain state.
+  defp active_tip_header(st) do
+    if cs = st.node[:chain_state] do
+      t =
+        if v = is_atom(cs) && ChainState.view(cs),
+          do: ChainState.view_tip(v),
+          else: ChainState.tip(cs)
 
-    HeaderIndex.anti_dos_work_threshold(tip, st.p)
+      HeaderIndex.lookup(Headers.index(st.node.headers), t.hash)
+    end
   end
+
+  # The active tip, genesis without a chain state.
+  defp chain_sync_tip(st, idx),
+    do: active_tip_header(st) || HeaderIndex.ancestor(idx, HeaderIndex.best(idx), 0)
+
+  # Core: UpdatePeerStateForReceivedHeaders. Up to
+  # MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT (4) outbound full-relay
+  # peers with a chain at least as good as our tip are exempt from
+  # ConsiderEviction; block-relay peers never are.
+  defp maybe_protect(
+         %{conn_type: :outbound_full_relay, chain_sync: %{protect: false}, best_known: b} = st
+       )
+       when b != nil do
+    tip = chain_sync_tip(st, Headers.index(st.node.headers))
+
+    if b.chain_work >= tip.chain_work and SyncState.try_protect(st.node.sync, self()),
+      do: put_in(st.chain_sync.protect, true),
+      else: st
+  end
+
+  defp maybe_protect(st), do: st
+
+  # Core: ConsiderEviction (CHAIN_SYNC_TIMEOUT, HEADERS_RESPONSE_TIME). An
+  # unprotected outbound full-relay or block-relay peer that started sync
+  # and whose best known block has less work than our tip has 20 min to
+  # reach the work of the tip at the time; then it gets one getheaders and
+  # 2 min to answer, else it is disconnected. Without this, a peer that only
+  # answers pings holds an outbound slot forever.
+  defp consider_eviction(
+         {:noreply, %{chain_sync: %{protect: false}, sync_started: true, conn_type: ct} = st},
+         t
+       )
+       when ct in [:outbound_full_relay, :block_relay] do
+    idx = Headers.index(st.node.headers)
+    tip = chain_sync_tip(st, idx)
+    cs = st.chain_sync
+    best = st.best_known
+
+    cond do
+      best != nil and best.chain_work >= tip.chain_work ->
+        {:noreply,
+         %{st | chain_sync: %{cs | timeout: nil, work_header: nil, sent_getheaders: false}}}
+
+      cs.timeout == nil or
+          (cs.work_header != nil and best != nil and
+             best.chain_work >= cs.work_header.chain_work) ->
+        cs = %{cs | timeout: t + @chain_sync_timeout_s, work_header: tip, sent_getheaders: false}
+        {:noreply, %{st | chain_sync: cs}}
+
+      t > cs.timeout and cs.sent_getheaders ->
+        Logger.info(
+          "outbound peer has old chain, best known block = " <>
+            if(best, do: Base.encode16(best.hash, case: :lower), else: "<none>")
+        )
+
+        {:stop, {:shutdown, :chain_sync_timeout}, st}
+
+      t > cs.timeout ->
+        # Core: GetLocator(m_work_header->pprev), through the getheaders throttle.
+        start = HeaderIndex.prev(idx, cs.work_header) || cs.work_header
+        st = maybe_send_getheaders(st, HeaderIndex.locator(idx, start))
+        cs = %{cs | sent_getheaders: true, timeout: t + @headers_response_time_s}
+        {:noreply, %{st | chain_sync: cs}}
+
+      true ->
+        {:noreply, st}
+    end
+  end
+
+  defp consider_eviction(result, _t), do: result
 
   defp continuous?([_]), do: true
   defp continuous?([a, b | rest]), do: b.prev_hash == a.hash and continuous?([b | rest])
@@ -2184,6 +2259,7 @@ defmodule Exnode.P2P.Peer do
         |> maybe_request_blocks()
         |> maybe_announce_blocks()
         |> check_headers_sync_timeout(t)
+        |> consider_eviction(t)
     end
   end
 

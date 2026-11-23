@@ -17,7 +17,11 @@ defmodule Exnode.P2P.PeerProtocolTest do
   * timeouts on a mock clock, run by explicit ticks: no handshake within
     60 s, no pong within 20 min, and the headers-sync deadline: a peer
     that leaves our best header old past it is disconnected once another
-    preferred peer could sync instead.
+    preferred peer could sync instead;
+  * chain-sync eviction (Core ConsiderEviction): an outbound peer whose
+    best known block stays below our tip's work is probed with getheaders
+    after 20 min and disconnected 2 min later; up to 4 outbound full-relay
+    peers with our tip's work are protected.
   """
   use Exnode.NodeCase
 
@@ -260,6 +264,14 @@ defmodule Exnode.P2P.PeerProtocolTest do
     end
   end
 
+  # The peer announces our active tip (genesis): its best known block then
+  # has our tip's work.
+  defp announce_tip(n, pid, sock) do
+    tip = Exnode.Chain.State.view_tip(Exnode.Chain.State.view(n.chain_state))
+    :ok = FakePeer.send_msgs(sock, {:inv, [%{type: :block, hash: tip.hash}]})
+    wait_until(fn -> :sys.get_state(pid).best_known != nil end)
+  end
+
   describe "timeouts" do
     test "no handshake within 60 s", %{n: n} do
       {pid, _sock, clock, ref} = connect(n, handshake: false)
@@ -291,6 +303,8 @@ defmodule Exnode.P2P.PeerProtocolTest do
       bd = %{block_download: n.block_download}
       {pid, sock, clock, ref} = connect(n, node: bd)
       handshaked(pid)
+      # The peer has our tip, so chain-sync eviction leaves it alone.
+      announce_tip(n, pid, sock)
       # The first pass starts headers sync (regtest genesis is years old,
       # deadline = now + 15 min + 1 ms per expected header) and registers
       # the peer as preferred with BlockDownload.
@@ -332,6 +346,85 @@ defmodule Exnode.P2P.PeerProtocolTest do
       :ok = Clock.tick(pid)
       assert Process.alive?(pid)
       assert :sys.get_state(pid).headers_sync_timeout == nil
+    end
+  end
+
+  describe "chain-sync eviction" do
+    # Regression: outbound peers were never checked for chain work. A peer
+    # that completed the handshake and answered pings, but never announced
+    # a block with our tip's work, held its outbound slot forever.
+    for ct <- [:outbound_full_relay, :block_relay] do
+      test "a #{ct} peer that never reaches our tip's work is disconnected", %{n: n} do
+        {pid, sock, clock, ref} = connect(n, conn_type: unquote(ct))
+        handshaked(pid)
+        # The first pass starts sync and sets the 20 min chain-sync deadline.
+        :ok = Clock.tick(pid)
+        deadline = Clock.now(clock) + 20 * 60
+
+        responsive_until(pid, sock, clock, deadline)
+        Clock.advance(clock, deadline - Clock.now(clock))
+        :ok = Clock.tick(pid)
+        msgs = until_pong(sock, System.unique_integer([:positive]))
+        refute Enum.any?(msgs, &match?({:getheaders, _}, &1))
+
+        # Past it: one getheaders probe and 2 more minutes.
+        Clock.advance(clock, 1)
+        :ok = Clock.tick(pid)
+        msgs = until_pong(sock, System.unique_integer([:positive]))
+        assert Enum.any?(msgs, &match?({:getheaders, _}, &1))
+
+        Clock.advance(clock, 120)
+        :ok = Clock.tick(pid)
+        assert Process.alive?(pid)
+        Clock.advance(clock, 1)
+        :ok = Clock.tick(pid)
+        assert_stopped(ref, :chain_sync_timeout)
+      end
+    end
+
+    test "a peer that answers the probe with our tip's work is kept", %{n: n} do
+      {pid, sock, clock, _ref} = connect(n, conn_type: :block_relay)
+      handshaked(pid)
+      :ok = Clock.tick(pid)
+      deadline = :sys.get_state(pid).chain_sync.timeout
+      responsive_until(pid, sock, clock, deadline)
+      Clock.advance(clock, deadline - Clock.now(clock) + 1)
+      :ok = Clock.tick(pid)
+      assert :sys.get_state(pid).chain_sync.sent_getheaders
+
+      announce_tip(n, pid, sock)
+      Clock.advance(clock, 121)
+      :ok = Clock.tick(pid)
+      until_pong(sock, System.unique_integer([:positive]))
+      assert Process.alive?(pid)
+      assert :sys.get_state(pid).chain_sync.timeout == nil
+    end
+
+    test "a manual peer is not checked", %{n: n} do
+      {pid, sock, clock, _ref} = connect(n, conn_type: :manual)
+      handshaked(pid)
+      :ok = Clock.tick(pid)
+      assert :sys.get_state(pid).sync_started
+      assert :sys.get_state(pid).chain_sync.timeout == nil
+      responsive_until(pid, sock, clock, Clock.now(clock) + 30 * 60)
+      assert :sys.get_state(pid).chain_sync.timeout == nil
+    end
+
+    test "at most 4 outbound full-relay peers with our tip's work are protected", %{n: n} do
+      {tip, ""} = Exnode.Codec.Header.decode(Exnode.Chain.Headers.best_header(n.headers).raw)
+      h = BB.next_header(tip)
+
+      peers =
+        for ct <- [:block_relay | List.duplicate(:outbound_full_relay, 5)] do
+          {pid, sock, _clock, _ref} = connect(n, conn_type: ct)
+          handshaked(pid)
+          :ok = FakePeer.send_msgs(sock, {:headers, [h]})
+          wait_until(fn -> :sys.get_state(pid).best_known != nil end)
+          {ct, pid}
+        end
+
+      protected = for {ct, pid} <- peers, :sys.get_state(pid).chain_sync.protect, do: ct
+      assert protected == List.duplicate(:outbound_full_relay, 4)
     end
   end
 end
