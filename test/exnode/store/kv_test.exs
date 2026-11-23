@@ -62,6 +62,26 @@ defmodule Exnode.Store.KVTest do
     assert KV.fold_prefix(kv, :spends, <<9>>, [], fn kv, acc -> [kv | acc] end) == []
     KV.close(kv)
   end
+
+  # Regression: a read error came back as {:error, _}, which callers
+  # matching {:ok, _} | :not_found crashed on outside the storage layer (so
+  # the chain state took it for a bug in the block, not a disk fault).
+  test "a read error raises KV.Error from get and multi_get", %{tmp_dir: dir} do
+    {:ok, kv} = KV.open(dir)
+    :ok = KV.write(kv, [{:put, :pending, "k", :crypto.strong_rand_bytes(100_000)}])
+    :ok = KV.write(kv, [{:put, :pending, "inline", "v"}])
+    :ok = KV.flush(kv, :pending)
+    # The value's blob file is gone: reading it fails inside RocksDB.
+    Enum.each(Path.wildcard(Path.join(dir, "*.blob")), &File.rm!/1)
+
+    assert %KV.Error{op: :get, cf: :pending} = catch_error(KV.get(kv, :pending, "k"))
+
+    assert %KV.Error{op: :multi_get} =
+             catch_error(KV.multi_get(kv, :pending, ["inline", "k"]))
+
+    assert KV.multi_get(kv, :pending, ["inline", "none"]) == [{:ok, "v"}, :not_found]
+    KV.close(kv)
+  end
 end
 
 defmodule Exnode.Store.KVPackedTest do

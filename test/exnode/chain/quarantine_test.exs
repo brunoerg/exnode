@@ -436,6 +436,131 @@ defmodule Exnode.Chain.QuarantineTest do
     assert State.poisoned(cs2) == []
   end
 
+  # A store whose value is unreadable: its blob file is gone, so a read
+  # fails inside RocksDB (as a disk or corruption error would).
+  defp broken_store(dir) do
+    {:ok, kv} = KV.open(Path.join(dir, "broken"))
+    :ok = KV.write(kv, [{:put, :pending, "k", :crypto.strong_rand_bytes(100_000)}])
+    :ok = KV.flush(kv, :pending)
+    Enum.each(Path.wildcard(Path.join([dir, "broken", "*.blob"])), &File.rm!/1)
+    kv
+  end
+
+  # A host fault while the block is checked (before archiving) must stop
+  # the chain state, never quarantine the block, and the block connects on
+  # the restart once the fault is gone.
+  defp assert_fatal_then_replayed(dir, kv, hs, bs, b, armed, opts) do
+    hash = b.header.hash
+    cs = start_cs(dir, kv, hs, opts)
+    Process.unlink(cs)
+    ref = Process.monitor(cs)
+    for x <- bs, do: {:ok, :connected} = State.submit_block(cs, x)
+
+    log =
+      capture_log(fn ->
+        assert {:ok, :stored} = State.submit_block(cs, b, defer: true, source: self())
+        assert_receive {:DOWN, ^ref, :process, ^cs, reason}, 5_000
+        refute match?({:shutdown, _}, reason)
+      end)
+
+    refute log =~ "block quarantined"
+    assert KV.get(kv, :poisoned, hash) == :not_found
+    refute_received {:block_checked, ^hash, _}
+    refute_received {:block_quarantined, ^hash, _}
+    assert status(hs, hash) != :failed
+
+    :atomics.put(armed, 1, 0)
+    cs2 = start_cs(dir, kv, hs, opts)
+    wait_until(fn -> State.tip(cs2).hash == hash end)
+    assert State.poisoned(cs2) == []
+  end
+
+  # Regression: KV.get returned a read error as {:error, _}; its callers
+  # (Archive) failed to match it outside the storage layer, so the crash
+  # was taken for a validation bug and the valid block quarantined.
+  test "a store read error while checking the block is not quarantined: fatal, and replayed",
+       %{tmp_dir: dir} do
+    %{bs: bs, kv: kv, hs: hs, b151: b} = setup_chain(dir)
+    hash = b.header.hash
+    broken = broken_store(dir)
+    armed = :atomics.new(1, [])
+    :atomics.put(armed, 1, 1)
+
+    # Reads the way Archive does: a match on the found value.
+    read = fn block, _entry ->
+      if block.header.hash == hash and :atomics.get(armed, 1) == 1,
+        do: {:ok, _} = KV.get(broken, :pending, "k")
+
+      :ok
+    end
+
+    assert_fatal_then_replayed(dir, kv, hs, bs, b, armed, rule_override: read)
+  end
+
+  # Regression: the kernel NIF raises :kernel_alloc (or :enomem,
+  # :kernel_txdata) when an allocation fails; the executor returns it as a
+  # crash and the block was quarantined.
+  test "out of memory in the kernel's script check is not quarantined: fatal, and replayed",
+       %{tmp_dir: dir} do
+    %{bs: bs, kv: kv, hs: hs, b151: b} = setup_chain(dir)
+    hash = b.header.hash
+    armed = :atomics.new(1, [])
+    :atomics.put(armed, 1, 1)
+
+    script_hook = fn blk ->
+      if blk.header.hash == hash and :atomics.get(armed, 1) == 1,
+        do: :erlang.raise(:error, :kernel_alloc, [])
+    end
+
+    assert_fatal_then_replayed(dir, kv, hs, bs, b, armed, test_script_hook: script_hook)
+  end
+
+  # Regression: a segment roll earlier in the crashing callback closed a
+  # file the pre-callback state still held; terminate/2 committed that
+  # state, its segment sync failed ({:error, :einval}) and terminate
+  # itself crashed, replacing the exit reason and skipping its cleanup.
+  test "a crash after a segment roll in the same turn: terminate does not crash, the restart resumes",
+       %{tmp_dir: dir} do
+    %{bs: bs, kv: kv, hs: hs} = setup_chain(dir)
+    {first, [b148, b149, _b150]} = Enum.split(bs, 147)
+    hash = b149.header.hash
+    armed = :atomics.new(1, [])
+    :atomics.put(armed, 1, 1)
+    hook = archive_hook(self(), hash, armed, fn -> raise "injected archive bug" end)
+    # Every block rolls the segments; nothing is committed before the crash.
+    opts = [
+      test_archive_hook: hook,
+      segment_max: 1,
+      batch_blocks: 1_000,
+      commit_at_tip: false
+    ]
+
+    cs = start_cs(dir, kv, hs, opts)
+    Process.unlink(cs)
+    ref = Process.monitor(cs)
+    for x <- first, do: {:ok, :connected} = State.submit_block(cs, x)
+
+    capture_log(fn ->
+      # 149 first (held), then 148: one turn archives 148 (a roll), then 149 crashes.
+      _ = Headers.process_headers(hs, [b148.header, b149.header])
+      assert {:ok, :stored} = State.submit_block(cs, b149, defer: true, source: self())
+      assert {:ok, :stored} = State.submit_block(cs, b148, defer: true, source: self())
+      assert_receive {:DOWN, ^ref, :process, ^cs, reason}, 5_000
+      assert {:shutdown, {:archive_crashed, _}} = reason
+    end)
+
+    log =
+      capture_log(fn ->
+        cs2 = start_cs(dir, kv, hs, opts)
+        send(self(), {:cs2, cs2})
+      end)
+
+    assert_received {:cs2, cs2}
+    assert log =~ "1 block(s) quarantined"
+    assert wait_until(fn -> State.tip(cs2).height == 148 end)
+    assert State.tip(cs2).hash == b148.header.hash
+  end
+
   test "a consensus-invalid block still fails as before: header invalidated, not quarantined", %{
     tmp_dir: dir
   } do

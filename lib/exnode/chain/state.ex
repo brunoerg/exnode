@@ -1089,14 +1089,22 @@ defmodule Exnode.Chain.State do
     # commit, orphaning committed rows whose pending copies are gone, or
     # restoring a disconnected block's rows without its spends. The restart
     # recovers from the disk and `pending` instead.
+    # A segment roll in the crashed callback (fsynced, not committed) closed
+    # a file this struct still holds: its commit then fails the segment
+    # sync before writing anything, so the failure is logged and the
+    # shutdown goes on.
     if durable_current?(st.a) do
       try do
         commit(st)
       catch
-        # Headers is gone (a rest_for_one restart), so its writes cannot be
-        # flushed first; the restart reconnects the batch from `pending`.
-        :exit, _ ->
-          Logger.warning("chain state stopped without the header tree; not committing")
+        # Also when Headers is gone (a rest_for_one restart): its writes
+        # cannot be flushed first, and the restart reconnects the batch
+        # from `pending`.
+        kind, reason ->
+          Logger.warning(
+            "chain state stopped without committing (the restart resumes from the disk): " <>
+              Exception.format_banner(kind, reason, __STACKTRACE__)
+          )
       end
     else
       Logger.warning(
@@ -1877,7 +1885,8 @@ defmodule Exnode.Chain.State do
     [entry | rest] = st.plan.todo
     idx = Headers.index(st.headers)
 
-    # An exception while loading the block is contained like one in validation.
+    # An exception while loading the block is contained like one in validation
+    # (a host fault among them is re-raised at retirement, retire/2).
     loaded =
       try do
         take_prefetched(st, entry)
@@ -2634,6 +2643,7 @@ defmodule Exnode.Chain.State do
         {:failed, %{quarantine_block(st, item.entry, item.block, crash) | retarget: true}}
 
       {:crash, _, _} = crash ->
+        raise_host_fault(crash)
         st = cancel_plan(st)
         {:failed, %{quarantine_block(st, item.entry, item.block, crash) | retarget: true}}
     end
@@ -2873,8 +2883,8 @@ defmodule Exnode.Chain.State do
   end
 
   # Archive.connect is contained too. An exception or exit
-  # becomes {:crash, error, stacktrace}, unless it comes from the storage layer
-  # itself (segment files, KV): a disk error is not the block's fault, so it
+  # becomes {:crash, error, stacktrace}, unless it is a fault of the host
+  # (host_fault?/3: the storage layer, memory): not the block's fault, so it
   # stays fatal and is not quarantined (as Core AbortNode on a write failure).
   defp archive_connect(st, %{entry: entry, block: block, res: res} = item) do
     t1 = System.monotonic_time(:microsecond)
@@ -2897,19 +2907,42 @@ defmodule Exnode.Chain.State do
     {:ok, a, System.monotonic_time(:microsecond) - t1}
   catch
     kind, reason ->
-      if storage_failure?(__STACKTRACE__) or out_of_memory?(kind, reason),
+      if host_fault?(kind, reason, __STACKTRACE__),
         do: :erlang.raise(kind, reason, __STACKTRACE__)
 
       {:crash, {kind, reason}, __STACKTRACE__}
   end
 
-  # Native memory exhausted (the overlay's tables, Archive.Overlay): a fault
-  # of this host, not of the block, so fatal like a storage failure, never a
-  # quarantine. The restart discards the half-applied tables.
-  defp out_of_memory?(:error, :enomem), do: true
+  # A crash contained while preparing or checking the block (loading it,
+  # its checks, its scripts): a host fault is re-raised, fatal, before it
+  # can quarantine the block.
+  defp raise_host_fault({:crash, error, stack}) do
+    {kind, reason} =
+      case error do
+        {kind, reason} when kind in [:error, :exit, :throw] -> {kind, reason}
+        exception -> {:error, exception}
+      end
+
+    if host_fault?(kind, reason, stack), do: :erlang.raise(kind, reason, stack)
+    :ok
+  end
+
+  # A fault of this host, not of the block: fatal (Core: AbortNode,
+  # FatalError), never a quarantine. The restart resumes from the last
+  # commit (and discards the overlay's half-applied tables).
+  defp host_fault?(kind, reason, stack),
+    do: storage_failure?(stack) or out_of_memory?(kind, reason)
+
+  # Native memory exhausted: the overlay's tables (Archive.Overlay), the
+  # kernel's script check (Exnode.Kernel: its allocations, its precomputed
+  # tx data). A rescued raise arrives wrapped in ErlangError.
+  @out_of_memory [:enomem, :kernel_alloc, :kernel_txdata]
+  defp out_of_memory?(:error, %ErlangError{original: r}), do: r in @out_of_memory
+  defp out_of_memory?(:error, r), do: r in @out_of_memory
   defp out_of_memory?(_kind, _reason), do: false
 
-  # The innermost exnode frame is the storage layer.
+  # The innermost exnode frame is the storage layer (it raises its read
+  # errors itself, Exnode.Store.KV.Error, rather than returning them).
   defp storage_failure?(stack) do
     case Enum.find(stack, fn {m, _, _, _} ->
            String.starts_with?(Atom.to_string(m), "Elixir.Exnode.")
