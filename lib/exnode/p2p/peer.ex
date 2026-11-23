@@ -1519,6 +1519,7 @@ defmodule Exnode.P2P.Peer do
           e.height > tip.height + 2 ->
             {:ok, maybe_request_blocks(st)}
 
+          # Full block, but only while this peer can take it in flight.
           map_size(st.partials) >= @max_partials ->
             {:ok, request_full_block(st, hash)}
 
@@ -1631,17 +1632,22 @@ defmodule Exnode.P2P.Peer do
     end
   end
 
+  # Core falls back to getdata only when this peer is first in flight for
+  # the block; otherwise it gives up on this peer and waits for the others.
+  # A getdata without the request would be untracked here, beyond the
+  # peer's MAX_BLOCKS_IN_TRANSIT_PER_PEER and the byte budget.
   defp request_full_block(st, hash) do
-    mark_in_flight(st, hash)
-    push(st, {:getdata, [%{type: :block, witness: true, hash: hash}]})
+    if mark_in_flight(st, hash),
+      do: push(st, {:getdata, [%{type: :block, witness: true, hash: hash}]}),
+      else: st
   end
 
   # Core BlockRequested for a compact block's reconstruction or its full
   # fallback: in flight from this peer, so parallel download does not fetch
-  # it too. A no-op if another peer holds it.
+  # it too. False if another peer holds it or this peer has
+  # MAX_BLOCKS_IN_TRANSIT_PER_PEER in flight; true without block download.
   defp mark_in_flight(st, hash) do
-    if bd = st.node[:block_download], do: BlockDownload.mark(bd, self(), hash)
-    :ok
+    if bd = st.node[:block_download], do: BlockDownload.mark(bd, self(), hash), else: true
   end
 
   # --- getheaders serving ----------------------------------------------------

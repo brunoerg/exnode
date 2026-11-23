@@ -123,10 +123,11 @@ defmodule Exnode.P2P.BlockDownload do
   Registers `hash` as in flight from `peer` for a compact-block
   reconstruction or its full-block fallback (Core `BlockRequested` with a
   partial block). Returns true if `peer` now holds the request, false if
-  another peer does or the header is unknown. It counts as one of the
-  peer's blocks in transit and is subject to the download timeout. Without
-  it a reconstruction was invisible here and the block was also requested
-  whole by parallel download.
+  another peer does, `peer` already has MAX_BLOCKS_IN_TRANSIT_PER_PEER in
+  transit, or the header is unknown. It counts as one of the peer's blocks
+  in transit and is subject to the download timeout. Without it a
+  reconstruction was invisible here and the block was also requested whole
+  by parallel download.
   """
   def mark(server, peer, hash), do: GenServer.call(server, {:mark, peer, hash}, :infinity)
 
@@ -136,8 +137,10 @@ defmodule Exnode.P2P.BlockDownload do
   @doc """
   The outcome of a block `peer` received: `true` (stored, connected or
   already held) releases its checking reservation; `false` (any failure)
-  releases it and makes the block selectable again. No-op unless `peer`
-  holds a checking reservation for `hash`.
+  releases it and makes the block selectable again. A `true` from a peer
+  that did not hold the request also releases another peer's request for
+  it (Core ProcessBlock: `RemoveBlockRequest(hash, nullopt)`); a `false`
+  from it changes nothing.
   """
   def checked(server, peer, hash, ok?), do: GenServer.cast(server, {:checked, peer, hash, ok?})
 
@@ -253,9 +256,14 @@ defmodule Exnode.P2P.BlockDownload do
         {:reply, false, st}
 
       _ ->
-        case HeaderIndex.lookup(Headers.index(st.headers), hash) do
+        # Core CMPCTBLOCK calls BlockRequested only while the peer has fewer
+        # than MAX_BLOCKS_IN_TRANSIT_PER_PEER in flight.
+        full? = MapSet.size(Map.get(st.per_peer, peer, MapSet.new())) >= @max_per_peer
+        e = if not full?, do: HeaderIndex.lookup(Headers.index(st.headers), hash)
+
+        case e do
           nil ->
-            {:reply, false, st}
+            {:reply, false, count(st, if(full?, do: %{mark_full: 1}, else: %{}))}
 
           e ->
             st = monitor(st, peer)
@@ -385,6 +393,13 @@ defmodule Exnode.P2P.BlockDownload do
         st = release(st, hash)
         st = count(st, if(ok?, do: %{checked_ok: 1}, else: %{checked_failed: 1}))
         {:noreply, maybe_wake(st)}
+
+      # Another peer's request, delivered and held: it would otherwise sit in
+      # that peer's slots and budget until its download timeout.
+      %{^hash => %{state: :requested, peer: owner}} when ok? ->
+        st = release(st, hash)
+        st = %{st | stalling_since: Map.delete(st.stalling_since, owner)}
+        {:noreply, st |> count(%{released_delivered: 1}) |> maybe_wake()}
 
       _ ->
         {:noreply, st}

@@ -366,4 +366,40 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
       not Map.has_key?(BlockDownload.in_flight(n.block_download), b.header.hash)
     end)
   end
+
+  # Regression: every compact block that failed to initialise put its full
+  # block in flight from its peer, past MAX_BLOCKS_IN_TRANSIT_PER_PEER and
+  # each with a byte estimate, so one high-bandwidth peer could hold
+  # hundreds of requests (cheap sibling headers) and exhaust the byte
+  # budget. Core CMPCTBLOCK calls BlockRequested, and so falls back to
+  # getdata, only while the peer has fewer than 16 blocks in flight.
+  test "failed compact blocks put at most MAX_BLOCKS_IN_TRANSIT_PER_PEER requests on their peer",
+       %{n: n, bs: bs} do
+    alias Exnode.P2P.BlockDownload
+    {pid, sock, _clock, _ref} = hb_peer(n, bs, [], %{block_download: n.block_download})
+    spend = BB.spend_op_true(hd(hd(bs).txs).txid, 0, 49 * 100_000_000)
+
+    siblings =
+      for i <- 1..17,
+          do:
+            BB.build(List.last(bs).header, [
+              BB.coinbase(151, 25 * 100_000_000, <<i, 0x51>>),
+              spend
+            ])
+
+    fake = fn b ->
+      c = CompactBlock.from_block(b, 3)
+      [id] = c.short_ids
+      {:cmpctblock, CompactBlock.encode(%{c | short_ids: [id, id]})}
+    end
+
+    :ok = FakePeer.send_msgs(sock, Enum.map(siblings, fake))
+    msgs = before_pong(sock)
+    requested = Enum.filter(siblings, &getdata_block?(msgs, &1.header.hash))
+    assert length(requested) == 16
+    refute getdata_block?(msgs, List.last(siblings).header.hash)
+
+    mine = for {_, {^pid, _, _}} <- BlockDownload.in_flight(n.block_download), do: 1
+    assert length(mine) == 16
+  end
 end
