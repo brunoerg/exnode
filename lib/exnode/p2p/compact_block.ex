@@ -136,7 +136,11 @@ defmodule Exnode.P2P.CompactBlock do
   def decode_getblocktxn(_payload), do: {:error, :malformed}
 
   def encode_blocktxn(hash, txs),
-    do: IO.iodata_to_binary([hash, CompactSize.encode(length(txs)), Enum.map(txs, &Tx.encode/1)])
+    do: encode_blocktxn_raw(hash, Enum.map(txs, &Tx.encode/1))
+
+  @doc "`blocktxn` from already serialized (with witness) transactions."
+  def encode_blocktxn_raw(hash, raw_txs),
+    do: IO.iodata_to_binary([hash, CompactSize.encode(length(raw_txs)), raw_txs])
 
   @doc "Decodes `blocktxn`: `{:ok, block_hash, [tx]}`."
   def decode_blocktxn(<<hash::binary-size(32), rest::binary>>) do

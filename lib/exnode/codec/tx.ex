@@ -182,6 +182,93 @@ defmodule Exnode.Codec.Tx do
     decode_witnesses(tail, rest, [%{txin | witness: stack} | acc])
   end
 
+  @doc """
+  Skips one transaction at the front of `bin` and returns the rest. Accepts
+  exactly what `decode/1` accepts, and throws the same `{:codec_error, _}`,
+  but builds no structs and hashes nothing: only the transaction's extent
+  is wanted.
+  """
+  def skip(<<_version::binary-size(4), rest::binary>>) do
+    {nin, rest} = CompactSize.decode(rest)
+    rest = skip_inputs(nin, rest)
+
+    # As decode/1: an empty vin is the segwit marker, then the flag byte.
+    {flags, nin, rest} =
+      if nin == 0 do
+        case rest do
+          <<flags, rest2::binary>> when flags != 0 ->
+            {nin, rest3} = CompactSize.decode(rest2)
+            rest3 = skip_inputs(nin, rest3)
+            {nout, rest4} = CompactSize.decode(rest3)
+            {flags, nin, skip_outputs(nout, rest4)}
+
+          <<0, rest2::binary>> ->
+            {0, 0, rest2}
+
+          _ ->
+            throw({:codec_error, :truncated})
+        end
+      else
+        {nout, rest} = CompactSize.decode(rest)
+        {0, nin, skip_outputs(nout, rest)}
+      end
+
+    {flags, rest} =
+      if Bitwise.band(flags, 1) == 1 do
+        {any_witness, rest} = skip_witnesses(nin, rest, false)
+        if not any_witness, do: throw({:codec_error, :superfluous_witness_record})
+        {Bitwise.bxor(flags, 1), rest}
+      else
+        {flags, rest}
+      end
+
+    if flags != 0, do: throw({:codec_error, :unknown_tx_optional_data})
+
+    case rest do
+      <<_locktime::binary-size(4), rest2::binary>> -> rest2
+      _ -> throw({:codec_error, :truncated})
+    end
+  end
+
+  def skip(_), do: throw({:codec_error, :truncated})
+
+  defp skip_inputs(0, rest), do: rest
+
+  defp skip_inputs(n, <<_prevout::binary-size(36), rest::binary>>) do
+    case skip_bytes(rest) do
+      <<_sequence::binary-size(4), rest2::binary>> -> skip_inputs(n - 1, rest2)
+      _ -> throw({:codec_error, :truncated})
+    end
+  end
+
+  defp skip_inputs(_, _), do: throw({:codec_error, :truncated})
+
+  defp skip_outputs(0, rest), do: rest
+
+  defp skip_outputs(n, <<_value::binary-size(8), rest::binary>>),
+    do: skip_outputs(n - 1, skip_bytes(rest))
+
+  defp skip_outputs(_, _), do: throw({:codec_error, :truncated})
+
+  defp skip_witnesses(0, rest, any), do: {any, rest}
+
+  defp skip_witnesses(n, bin, any) do
+    {items, rest} = CompactSize.decode(bin)
+    skip_witnesses(n - 1, skip_items(items, rest), any or items > 0)
+  end
+
+  defp skip_items(0, rest), do: rest
+  defp skip_items(n, rest), do: skip_items(n - 1, skip_bytes(rest))
+
+  defp skip_bytes(bin) do
+    {len, rest} = CompactSize.decode(bin)
+
+    case rest do
+      <<_::binary-size(len), rest2::binary>> -> rest2
+      _ -> throw({:codec_error, :truncated})
+    end
+  end
+
   @doc "Decodes a whole binary as exactly one transaction."
   def decode_exact(bin) do
     case decode(bin) do

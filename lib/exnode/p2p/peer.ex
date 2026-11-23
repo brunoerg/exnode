@@ -1799,25 +1799,31 @@ defmodule Exnode.P2P.Peer do
           {:ok, h, raw} when tip_h - h >= @max_blocktxn_depth ->
             {:ok, push(st, {:block, raw})}
 
+          # Only the txs' extents are needed, not the decoded block: a 34-byte
+          # request is below the DecodeBudget, and every peer decoding a
+          # recent 4 MB block at once (tens of MB of heap each) is an OOM.
           {:ok, _h, raw} ->
-            {:ok, b} = Block.decode_exact(raw)
+            {:ok, ranges} = Block.tx_ranges(raw)
 
             # Indexes strictly increase (decode_getblocktxn): the last is the largest.
-            if List.last(indexes) >= length(b.txs) do
+            if List.last(indexes) >= tuple_size(ranges) do
               misbehaving(st, "getblocktxn with out-of-bounds tx indices")
             else
-              txs = select_txs(b.txs, indexes)
-              {:ok, push(st, {:blocktxn, CompactBlock.encode_blocktxn(hash, txs)})}
+              txs = select_txs(raw, ranges, indexes)
+              {:ok, push(st, {:blocktxn, CompactBlock.encode_blocktxn_raw(hash, txs)})}
             end
         end
     end
   end
 
   @doc false
-  # The txs at `indexes` (all in range): one tuple, O(1) per index.
-  def select_txs(txs, indexes) do
-    t = List.to_tuple(txs)
-    Enum.map(indexes, &elem(t, &1))
+  # The serialized txs at `indexes` (all in range), sliced from the block:
+  # O(1) per index, no copy.
+  def select_txs(raw, ranges, indexes) do
+    Enum.map(indexes, fn i ->
+      {offset, len} = elem(ranges, i)
+      binary_part(raw, offset, len)
+    end)
   end
 
   # Core SendMessages block announcements: cmpctblock to peers that asked for

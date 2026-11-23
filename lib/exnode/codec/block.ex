@@ -65,6 +65,33 @@ defmodule Exnode.Codec.Block do
     {:codec_error, reason} -> {:error, reason}
   end
 
+  @doc """
+  The extent of each transaction in a serialized block, without decoding
+  it: `{:ok, {{offset, length}, ...}}` in block order, or `{:error, reason}`
+  where `decode_exact/1` would fail. Costs one small tuple per transaction
+  instead of the decoded block (several times its size).
+  """
+  def tx_ranges(<<_header::binary-size(80), rest::binary>> = bin) do
+    {n, rest} = CompactSize.decode(rest)
+    {ranges, rest} = scan_txs(n, rest, byte_size(bin), [])
+
+    if rest == "",
+      do: {:ok, List.to_tuple(ranges)},
+      else: {:error, :trailing_data}
+  catch
+    {:codec_error, reason} -> {:error, reason}
+  end
+
+  def tx_ranges(_), do: {:error, :truncated}
+
+  defp scan_txs(0, rest, _size, acc), do: {Enum.reverse(acc), rest}
+
+  defp scan_txs(n, rest, size, acc) do
+    rest2 = Tx.skip(rest)
+    start = size - byte_size(rest)
+    scan_txs(n - 1, rest2, size, [{start, byte_size(rest) - byte_size(rest2)} | acc])
+  end
+
   def encode(%__MODULE__{header: h, txs: txs}, opts \\ []) do
     [Header.encode(h), CompactSize.encode(length(txs)), Enum.map(txs, &Tx.encode(&1, opts))]
   end
