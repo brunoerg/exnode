@@ -622,6 +622,11 @@ defmodule Exnode.Chain.State do
 
   defp commit(st) do
     hashes = Enum.map(st.uncommitted, &elem(&1, 0))
+    # Core writes the block index before the chainstate: the headers'
+    # queued (unsynced) writes reach the same KV first, so the synced batch
+    # below makes them durable too and a committed block never lacks its
+    # header at restart.
+    :ok = Headers.flush(st.headers)
     a = Archive.flush(st.a, for(h <- hashes, do: {:delete, :pending, h})) |> note_durable()
     for h <- hashes, do: :ets.delete(st.view, {:held, h})
 
@@ -694,11 +699,13 @@ defmodule Exnode.Chain.State do
     idx = Headers.index(st.headers)
 
     # Under a failed header (Core: not a candidate) a body can never connect.
+    # Without a header (its unsynced write lost in a crash) it could not
+    # link either, and holding it would stop it being downloaded again.
     {dropped, held} =
       Enum.split_with(
         hashes,
         &(Archive.block_id(st.a, &1) != nil or
-            match?(%{status: :failed}, HeaderIndex.lookup(idx, &1)))
+            match?(e when e == nil or e.status == :failed, HeaderIndex.lookup(idx, &1)))
       )
 
     if dropped != [],
@@ -1083,7 +1090,14 @@ defmodule Exnode.Chain.State do
     # restoring a disconnected block's rows without its spends. The restart
     # recovers from the disk and `pending` instead.
     if durable_current?(st.a) do
-      commit(st)
+      try do
+        commit(st)
+      catch
+        # Headers is gone (a rest_for_one restart), so its writes cannot be
+        # flushed first; the restart reconnects the batch from `pending`.
+        :exit, _ ->
+          Logger.warning("chain state stopped without the header tree; not committing")
+      end
     else
       Logger.warning(
         "chain state stopped with an archive state older than its last commit; " <>
