@@ -413,20 +413,18 @@ defmodule Exnode.P2P.BlockDownload do
     do:
       {:noreply, maybe_wake(%{st | stall_ms: max(round(st.stall_ms * 0.85), @stall_default_ms)})}
 
-  def handle_info({:block_disconnected, _hash}, st), do: {:noreply, maybe_wake(st)}
+  # A block a reorg disconnects below the witness-pruning horizon is no
+  # longer held (it must be downloaded again to reconnect), so cursors at or
+  # above it restart from below, as for an invalid block.
+  def handle_info({:block_disconnected, hash}, st),
+    do: {:noreply, maybe_wake(%{st | cursors: drop_cursors_from(st, hash)})}
+
   # A block that failed on connect is no longer held. With `:mutated` its
   # header is not invalidated (the data was wrong, not the block), so it
   # must be downloaded again; a cursor at or above it would skip it forever.
   # Cursors there restart from below.
-  def handle_info({:block_invalid, hash, _r}, st) do
-    cursors =
-      case HeaderIndex.lookup(Headers.index(st.headers), hash) do
-        %{height: h} -> Map.reject(st.cursors, fn {_, {ch, _}} -> ch >= h end)
-        nil -> %{}
-      end
-
-    {:noreply, maybe_wake(%{st | cursors: cursors})}
-  end
+  def handle_info({:block_invalid, hash, _r}, st),
+    do: {:noreply, maybe_wake(%{st | cursors: drop_cursors_from(st, hash)})}
 
   def handle_info(:wake, st) do
     now = now_ms(st)
@@ -453,6 +451,14 @@ defmodule Exnode.P2P.BlockDownload do
   end
 
   def handle_info(_msg, st), do: {:noreply, st}
+
+  # Cursors at or above `hash`'s height (all of them if its header is unknown).
+  defp drop_cursors_from(st, hash) do
+    case HeaderIndex.lookup(Headers.index(st.headers), hash) do
+      %{height: h} -> Map.reject(st.cursors, fn {_, {ch, _}} -> ch >= h end)
+      nil -> %{}
+    end
+  end
 
   # --- selection -----------------------------------------------------------
 

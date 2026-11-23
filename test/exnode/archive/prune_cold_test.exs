@@ -138,6 +138,66 @@ defmodule Exnode.Archive.PruneColdTest do
     stop(n)
   end
 
+  # Regression: an archived block off the active chain whose witness data
+  # was pruned counted as had. A deep reorg onto a branch that failed to
+  # connect left the old branch disconnected below the horizon; it was then
+  # picked to reconnect from the archive, the read raised, and honest block
+  # 101 was durably quarantined: the node stayed at the fork for good. Now
+  # those blocks are missing (downloaded again), and once delivered the old
+  # branch reconnects.
+  test "a failed reorg below the witness-pruning horizon re-downloads the old branch",
+       %{tmp_dir: dir} do
+    bs = blocks()
+    opts = [segment_max: 200, prune_witness: true, prune_keep: 20]
+    n = start(dir, opts)
+    for b <- bs, do: {:ok, :connected} = State.submit_block(n.cs, b)
+
+    State.with_archive(n.cs, fn a ->
+      {:error, :witness_pruned} = Archive.read_block(a, Archive.id_at(a, 101))
+    end)
+
+    # A longer branch from 100 whose first block overpays its coinbase
+    # (bad-cb-amount, found only when connecting it).
+    {fork, _} =
+      Enum.map_reduce(101..151, Enum.at(bs, 99).header, fn h, prev ->
+        value = if h < 150, do: 50 * @coin, else: 25 * @coin
+        value = if h == 101, do: value + 1, else: value
+        b = BB.build(prev, [BB.coinbase(h, value, <<0x52>>)])
+        {b, b.header}
+      end)
+
+    {:ok, _} = Headers.process_headers(n.hs, Enum.map(fork, & &1.header))
+    results = for b <- fork, do: State.submit_block(n.cs, b, requested: true)
+    refute Enum.any?(results, &match?({:error, {:crash, _}}, &1))
+    assert State.poisoned(n.cs) == []
+    assert State.tip(n.cs).height == 100
+
+    # The disconnected blocks whose witnesses are pruned are missing now
+    # (block download fetches them); the others are still had.
+    old = Enum.drop(bs, 100)
+    hashes = Enum.map(old, & &1.header.hash)
+
+    kept =
+      State.with_archive(n.cs, fn a ->
+        for h <- hashes, not Archive.witness_pruned?(a, Archive.block_id(a, h)), do: h
+      end)
+
+    assert hd(hashes) not in kept and length(kept) < length(hashes)
+    assert State.have_many(n.cs, hashes) == MapSet.new(kept)
+    # Blocks still on the active chain stay had, pruned or not.
+    assert State.have_block?(n.cs, Enum.at(bs, 9).header.hash)
+
+    # Delivered again, it reconnects, and survives a restart.
+    for b <- old, do: {:ok, _} = State.submit_block(n.cs, b, requested: true)
+    assert State.tip(n.cs).hash == List.last(bs).header.hash
+    assert State.poisoned(n.cs) == []
+    stop(n)
+    n = start(dir, opts)
+    assert State.tip(n.cs).hash == List.last(bs).header.hash
+    assert State.poisoned(n.cs) == []
+    stop(n)
+  end
+
   # Regression: a reader carries the prune point of its
   # commit. A prune after it deleted witness files the reader still thought
   # present, and its next read of them crashed on the missing file (REST

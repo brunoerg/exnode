@@ -285,17 +285,18 @@ defmodule Exnode.Chain.State do
   end
 
   @doc """
-  Subset of `hashes` whose block data is held in memory, archived, or
-  quarantined (its body stays in `pending`; fetching it again cannot help
-  until the quarantine is cleared) (no call).
+  Subset of `hashes` whose block data is held in memory, archived (see
+  `Archive.have_block_data?/2`), or quarantined (its body stays in
+  `pending`; fetching it again cannot help until the quarantine is cleared)
+  (no call).
   """
   def view_have_many(view, hashes) do
-    kv = :ets.lookup_element(view, :kv, 2)
+    reader = view_reader(view)
 
     MapSet.new(
       Enum.filter(hashes, fn h ->
         :ets.member(view, {:held, h}) or :ets.member(view, {:quarantined, h}) or
-          Exnode.Store.KV.get(kv, :blockhash, h) != :not_found
+          Archive.have_block_data?(reader, h)
       end)
     )
   end
@@ -1267,7 +1268,12 @@ defmodule Exnode.Chain.State do
     {{:error, reason}, st}
   end
 
-  defp have?(st, hash), do: MapSet.member?(st.blocks, hash) or Archive.block_id(st.a, hash) != nil
+  # An archived block off the active chain whose witness data is pruned is
+  # not had: reconnecting it needs the full block again (Core clears
+  # BLOCK_HAVE_DATA when pruning). Counting it had let a failed deep reorg
+  # pick the old branch, crash reading it and quarantine an honest block.
+  defp have?(st, hash),
+    do: MapSet.member?(st.blocks, hash) or Archive.have_block_data?(st.a, hash)
 
   defp failed?(st, hash) do
     case HeaderIndex.lookup(Headers.index(st.headers), hash) do

@@ -1984,6 +1984,20 @@ defmodule Exnode.Archive do
   def witness_pruned(%__MODULE__{wpruned: w, wpruned_live: nil}), do: w
   def witness_pruned(%__MODULE__{wpruned: w, wpruned_live: ref}), do: max(w, :atomics.get(ref, 1))
 
+  @doc """
+  Whether block `hash` is archived with what connecting it needs (Core
+  BLOCK_HAVE_DATA): on the active chain (already connected), or off it with
+  its witness data kept. A block a reorg disconnected below the pruning
+  horizon has lost its witnesses: it cannot be validated again from the
+  archive and must be downloaded again before it is reconnected.
+  """
+  def have_block_data?(%__MODULE__{} = a, hash) do
+    case block_id(a, hash) do
+      nil -> false
+      id -> on_chain?(a, id) or witness_pruned(a) < 0 or not witness_pruned?(a, id)
+    end
+  end
+
   @doc "Whether block `id`'s witness data is pruned (now)."
   def witness_pruned?(%__MODULE__{} = a, id), do: rec_pruned?(a, block_record!(a, id))
 
