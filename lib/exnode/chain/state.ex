@@ -2827,7 +2827,14 @@ defmodule Exnode.Chain.State do
       old = Archive.tip(st.a).hash
       {a, _id} = Archive.disconnect_tip(st.a)
       note_durable(a)
-      :ets.insert(st.view, {:tip, Archive.tip(a)})
+      # The disconnect lowered the committed tip: readers must not keep the
+      # old height while the new branch is connected above it.
+      :ets.insert(st.view, [
+        {:tip, Archive.tip(a)},
+        {:committed, Archive.committed_tip(a).height},
+        {:reader, Archive.reader(a)}
+      ])
+
       notify(st, {:block_disconnected, old})
       disconnect_to(%{st | a: a, disconnected: MapSet.put(st.disconnected, old)}, fork)
     else
