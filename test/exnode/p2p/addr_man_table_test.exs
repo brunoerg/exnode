@@ -310,6 +310,46 @@ defmodule Exnode.P2P.AddrMan.TableTest do
     assert {_, 1} = Table.add(t, [Map.merge(svc("2a01::1", 8333), %{time: @now})], src, 0, @now)
   end
 
+  # Regression: IPv6 addresses with Core's embedded prefixes (IPv4-mapped,
+  # TORv2, internal) were valid and routable, so ::ffff:127.0.0.1 was accepted
+  # and grouped as IPv6; a peers.dat holding one kept it on load.
+  test "IPv6 with an embedded IPv4, TORv2 or internal prefix is invalid, also on load" do
+    src = ip("8.8.8.8")
+
+    embedded =
+      for a <- [
+            <<0::80, 0xFF, 0xFF, 127, 0, 0, 1>>,
+            <<0::80, 0xFF, 0xFF, 192, 168, 1, 1>>,
+            <<0::80, 0xFF, 0xFF, 8, 8, 8, 8>>,
+            <<0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43, 1::80>>,
+            <<0xFD, 0x6B, 0x88, 0xC0, 0x87, 0x24, 1::80>>
+          ],
+          do: %{net: :ipv6, addr: a, port: 8333, time: @now, services: 0}
+
+    for a <- embedded do
+      refute NetAddr.valid?(a)
+      refute NetAddr.routable?(a)
+      assert NetAddr.group(a) == <<0>>
+      assert {_, 0} = add(Table.new(@det_key), a, src)
+    end
+
+    # RFC 6145 (::ffff:0:a.b.c.d) is not the IPv4-mapped prefix.
+    assert NetAddr.valid?(ip("::ffff:0:102:304"))
+
+    # An older peers.dat: forge the entries into a saved table.
+    {t, 1} = add(Table.new(@det_key), caddr("250.1.1.1", 8333), src)
+    term = Table.to_term(t)
+    [e] = term.entries
+
+    forged =
+      for a <- embedded,
+          do: %{e | addr: Map.take(a, [:net, :addr, :port]), refs: [7]}
+
+    t2 = Table.from_term(%{term | entries: [e | forged]})
+    assert Table.size(t2) == 1
+    assert t2.n_new == 1
+  end
+
   test "persistence term round trip keeps buckets and tried state" do
     src = ip("252.2.2.2")
 
