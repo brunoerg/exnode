@@ -459,8 +459,9 @@ defmodule Exnode.Chain.State do
       # activation is idle (newest first), and their blocks kept at hand.
       waiters: [],
       current_blocks: %{},
-      # Blocks fail_block reported to the shadow while waiters were pending.
-      rejected_seen: MapSet.new(),
+      # Blocks fail_block reported to the shadow while waiters were pending:
+      # hash => that block's own failure.
+      rejected_seen: %{},
       pstats: %{},
       # Non-script ConnectBlock: :reference (Connect.connect_block
       # inline), :engine (Prepare.populate + check inline) or :worker (the
@@ -668,6 +669,20 @@ defmodule Exnode.Chain.State do
     %{st | blocks: MapSet.delete(st.blocks, hash), sources: Map.delete(st.sources, hash)}
   end
 
+  # Core InvalidChainFound marks every descendant BLOCK_FAILED_CHILD, which
+  # keeps it out of setBlockIndexCandidates for good: a held body under a
+  # failed header can never connect, so it is dropped with the failed block.
+  defp unhold_failed(st) do
+    idx = Headers.index(st.headers)
+
+    Enum.reduce(st.blocks, st, fn h, st ->
+      case HeaderIndex.lookup(idx, h) do
+        %{status: :failed} -> %{unhold(st, h) | checked: MapSet.delete(st.checked, h)}
+        _ -> st
+      end
+    end)
+  end
+
   # Startup: pending blocks from the previous run are held again (no
   # re-download). Entries already archived are dropped. Keys only: the
   # blocks live in blob files and are not read here.
@@ -676,18 +691,23 @@ defmodule Exnode.Chain.State do
 
     # Quarantined blocks stay in `pending` (for reconsider_poisoned) but are not held.
     hashes = Enum.reject(hashes, &MapSet.member?(st.poisoned, &1))
-    {archived, held} = Enum.split_with(hashes, &(Archive.block_id(st.a, &1) != nil))
+    idx = Headers.index(st.headers)
 
-    if archived != [],
+    # Under a failed header (Core: not a candidate) a body can never connect.
+    {dropped, held} =
+      Enum.split_with(
+        hashes,
+        &(Archive.block_id(st.a, &1) != nil or
+            match?(%{status: :failed}, HeaderIndex.lookup(idx, &1)))
+      )
+
+    if dropped != [],
       do:
         :ok =
-          Exnode.Store.KV.write(st.kv, for(h <- archived, do: {:delete, :pending, h}),
-            sync: false
-          )
+          Exnode.Store.KV.write(st.kv, for(h <- dropped, do: {:delete, :pending, h}), sync: false)
 
     for h <- held, do: :ets.insert(st.view, {{:held, h}})
     st = %{st | blocks: MapSet.new(held)}
-    idx = Headers.index(st.headers)
     # Like Core LoadBlockIndex: availability ties across restarts are not
     # arrival-ordered (active blocks get 0, other loaded blocks get 1).
     held
@@ -1283,7 +1303,7 @@ defmodule Exnode.Chain.State do
 
   defp fail_submitted(st, hash, reason) do
     Headers.invalidate(st.headers, hash, Archive.tip(st.a).hash)
-    {{:error, reason}, st}
+    {{:error, reason}, unhold_failed(st)}
   end
 
   # An archived block off the active chain whose witness data is pruned is
@@ -1292,13 +1312,6 @@ defmodule Exnode.Chain.State do
   # pick the old branch, crash reading it and quarantine an honest block.
   defp have?(st, hash),
     do: MapSet.member?(st.blocks, hash) or Archive.have_block_data?(st.a, hash)
-
-  defp failed?(st, hash) do
-    case HeaderIndex.lookup(Headers.index(st.headers), hash) do
-      %{status: :failed} -> true
-      _ -> false
-    end
-  end
 
   # --- activation --------------------------------------------------------------
   #
@@ -2677,12 +2690,12 @@ defmodule Exnode.Chain.State do
           reply = submit_outcome(st, hash)
 
           # A rejection fail_block already put in a shadow round (possibly
-          # flushed by an earlier turn) is not added again; a quarantine or
-          # an inherited failure is, as the synchronous path did.
+          # flushed by an earlier turn) is not added again; a quarantine is,
+          # as the synchronous path did.
           st =
             case reply do
               {:error, r} ->
-                if MapSet.member?(st.rejected_seen, hash),
+                if Map.has_key?(st.rejected_seen, hash),
                   do: st,
                   else: %{st | round_rejected: [{hash, raw, r} | st.round_rejected]}
 
@@ -2698,16 +2711,19 @@ defmodule Exnode.Chain.State do
           st
       end)
 
-    %{st | current_blocks: %{}, rejected_seen: MapSet.new()} |> flush_round()
+    %{st | current_blocks: %{}, rejected_seen: %{}} |> flush_round()
   end
 
+  # Only a block that itself failed ConnectBlock gets an error, its own (Core
+  # BlockChecked for that block). One failed only through an ancestor was
+  # accepted (Core ProcessNewBlock returns true, nobody is punished for it).
   defp submit_outcome(st, hash) do
     cond do
       MapSet.member?(st.poisoned, hash) ->
         {:error, {:crash, "validation crashed; block quarantined"}}
 
-      failed?(st, hash) ->
-        {:error, st.last_failure || {:consensus, "invalid"}}
+      Map.has_key?(st.rejected_seen, hash) ->
+        {:error, Map.fetch!(st.rejected_seen, hash)}
 
       Archive.on_chain?(st.a, Archive.block_id(st.a, hash) || -1) ->
         {:ok, :connected}
@@ -2974,7 +2990,7 @@ defmodule Exnode.Chain.State do
     # may be punished (MaybePunishNodeForBlock).
     {source, sources} = Map.pop(st.sources, entry.hash)
     if is_pid(source), do: send(source, {:block_checked, entry.hash, {:error, r}})
-    st = unhold(%{st | sources: sources}, entry.hash)
+    st = unhold(%{st | sources: sources}, entry.hash) |> unhold_failed()
 
     %{
       st
@@ -2985,7 +3001,7 @@ defmodule Exnode.Chain.State do
         rejected_seen:
           if(st.waiters == [],
             do: st.rejected_seen,
-            else: MapSet.put(st.rejected_seen, entry.hash)
+            else: Map.put(st.rejected_seen, entry.hash, r)
           )
     }
   end
