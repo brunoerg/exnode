@@ -226,6 +226,8 @@ defmodule Exnode.Node do
         []
 
       port ->
+        budget = Module.concat(n.rpc, RESTBlockBudget)
+
         ctx = %{
           chain_state: n.chain_state,
           headers: n.headers,
@@ -233,10 +235,18 @@ defmodule Exnode.Node do
           params: params,
           # nil when disabled (the routes test for nil, not false).
           scripthash_index:
-            if(Keyword.get(opts, :index_scripthash, false), do: n.scripthash_index)
+            if(Keyword.get(opts, :index_scripthash, false), do: n.scripthash_index),
+          block_budget: budget
         }
 
-        [{Exnode.REST.Esplora, port: port, ctx: ctx, id: Module.concat(n.rpc, REST)}]
+        [
+          Supervisor.child_spec(
+            {Exnode.P2P.DecodeBudget,
+             name: budget, bytes: Exnode.REST.Esplora.block_budget_bytes()},
+            id: budget
+          ),
+          {Exnode.REST.Esplora, port: port, ctx: ctx, id: Module.concat(n.rpc, REST)}
+        ]
     end
   end
 

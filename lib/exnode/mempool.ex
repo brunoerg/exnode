@@ -81,15 +81,27 @@ defmodule Exnode.Mempool do
   The mempool txs paying to or spending from the script with scripthash
   `sh` (`sha256(scriptPubKey)`), oldest first: `[%{txid, tx, spent}]`
   (`spent`: `{value, scripthash}` per input). Needs `index_scripts: true`;
-  else `{:error, :not_indexed}`. Copies only those txs out of the mempool.
+  else `{:error, :not_indexed}`. Copies only those txs out of the mempool;
+  with more than `limit` of them, none (`{:error, :too_many}`), so a
+  popular script (an anchor, say) costs this process no copy and no sort.
   """
-  def script_txs(server, sh), do: GenServer.call(server, {:script_txs, sh}, :infinity)
+  def script_txs(server, sh, limit \\ :infinity),
+    do: GenServer.call(server, {:script_txs, sh, limit}, :infinity)
 
   @doc "The mempool spenders of `outpoints`: `%{outpoint => {txid, input_index}}` (unspent ones absent)."
   def spenders(server, outpoints), do: GenServer.call(server, {:spenders, outpoints}, :infinity)
 
   @doc "`{fee, vsize}` of every mempool tx, and the total vsize: `{pairs, total_vsize}`."
   def fee_rates(server), do: GenServer.call(server, :fee_rates, :infinity)
+
+  @doc """
+  Esplora `/mempool`: `%{count, vsize, total_fee, fee_histogram}`
+  (`fee_histogram`: `[feerate, vsize]` per 0.1 sat/vB band, highest
+  first). `count` and `vsize` are current; the fee figures need a pass
+  over the pool, so as electrs' backlog stats they are computed at most
+  once per 10 s and served from that cache meanwhile.
+  """
+  def backlog(server), do: GenServer.call(server, :backlog, :infinity)
 
   @doc "The pool itself (for RPC views)."
   def pool(server), do: GenServer.call(server, :pool, 5_000)
@@ -182,10 +194,30 @@ defmodule Exnode.Mempool do
       # accepts waiting for a pending one they depend on, oldest first
       deferred: :queue.new(),
       # a :refresh_lin message is in the mailbox
-      refresh_queued: false
+      refresh_queued: false,
+      # {computed_at_ms, backlog/1's fee figures}
+      backlog: nil
     }
 
     {:ok, st}
+  end
+
+  # electrs BACKLOG_STATS_TTL.
+  @backlog_ttl_ms 10_000
+
+  defp backlog_fees(pool) do
+    pairs = for {_, e} <- pool.entries, do: {e.fee, e.vsize}
+
+    hist =
+      pairs
+      |> Enum.map(fn {fee, vsize} -> {fee / vsize, vsize} end)
+      |> Enum.sort(:desc)
+      |> Enum.chunk_by(fn {r, _} -> round(r * 10) end)
+      |> Enum.map(fn group ->
+        [elem(hd(group), 0), Enum.reduce(group, 0, &(&2 + elem(&1, 1)))]
+      end)
+
+    %{total_fee: Enum.reduce(pairs, 0, &(&2 + elem(&1, 0))), fee_histogram: hist}
   end
 
   # Without a supervisor from the node (tests), one linked to this process.
@@ -239,19 +271,25 @@ defmodule Exnode.Mempool do
 
   def handle_call(:txids, _from, st), do: {:reply, Map.keys(st.state.pool.entries), st}
 
-  def handle_call({:script_txs, sh}, _from, st) do
+  def handle_call({:script_txs, sh, limit}, _from, st) do
     st = sync(st)
     pool = st.state.pool
 
+    ids = if Pool.indexes_scripts?(pool), do: Pool.script_txids(pool, sh)
+
     reply =
-      if Pool.indexes_scripts?(pool) do
-        pool
-        |> Pool.script_txids(sh)
-        |> Enum.map(&Pool.get(pool, &1))
-        |> Enum.sort_by(& &1.sequence)
-        |> Enum.map(&%{txid: &1.txid, tx: &1.tx, spent: &1.spent})
-      else
-        {:error, :not_indexed}
+      cond do
+        ids == nil ->
+          {:error, :not_indexed}
+
+        MapSet.size(ids) > limit ->
+          {:error, :too_many}
+
+        true ->
+          ids
+          |> Enum.map(&Pool.get(pool, &1))
+          |> Enum.sort_by(& &1.sequence)
+          |> Enum.map(&%{txid: &1.txid, tx: &1.tx, spent: &1.spent})
       end
 
     {:reply, reply, st}
@@ -274,6 +312,24 @@ defmodule Exnode.Mempool do
     st = sync(st)
     pool = st.state.pool
     {:reply, {for({_, e} <- pool.entries, do: {e.fee, e.vsize}), pool.total_vsize}, st}
+  end
+
+  def handle_call(:backlog, _from, st) do
+    st = sync(st)
+    pool = st.state.pool
+    now = System.monotonic_time(:millisecond)
+
+    {fees, st} =
+      case st.backlog do
+        {at, fees} when now - at < @backlog_ttl_ms ->
+          {fees, st}
+
+        _ ->
+          fees = backlog_fees(pool)
+          {fees, %{st | backlog: {now, fees}}}
+      end
+
+    {:reply, Map.merge(fees, %{count: map_size(pool.entries), vsize: pool.total_vsize}), st}
   end
 
   def handle_call(:pool, _from, st), do: {:reply, st.state.pool, st}

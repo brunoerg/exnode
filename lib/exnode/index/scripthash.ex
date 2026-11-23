@@ -57,17 +57,23 @@ defmodule Exnode.Index.Scripthash do
   `utxo_delta`, `--utxos-limit`). The rows are folded in chain order, a
   spend always after the funding it spends, so only the outputs unspent so
   far are held: memory is bounded by `limit`, not by the history's length.
+  A script that keeps few outputs unspent can still have a history of
+  millions of rows: past `max_rows` rows the scan stops with
+  `{:error, :too_many_rows}`, so time is bounded too (nil: no bound).
   In the caller, like `history/2`.
   """
-  def utxos(server, sh, limit) do
-    unspent =
-      fold_history(server, sh, %{}, fn
-        %{kind: :funding} = r, acc ->
-          acc = Map.put(acc, {r.txid, r.index}, {r.height, r.pos, r.value})
-          if map_size(acc) > limit, do: throw({__MODULE__, :too_many}), else: acc
+  def utxos(server, sh, limit, max_rows \\ nil) do
+    {unspent, _} =
+      fold_history(server, sh, {%{}, 0}, fn
+        _r, {_, n} when n == max_rows ->
+          throw({__MODULE__, :too_many_rows})
 
-        %{kind: :spending, prevout: op}, acc ->
-          Map.delete(acc, op)
+        %{kind: :funding} = r, {acc, n} ->
+          acc = Map.put(acc, {r.txid, r.index}, {r.height, r.pos, r.value})
+          if map_size(acc) > limit, do: throw({__MODULE__, :too_many}), else: {acc, n + 1}
+
+        %{kind: :spending, prevout: op}, {acc, n} ->
+          {Map.delete(acc, op), n + 1}
       end)
 
     {:ok,
@@ -77,7 +83,7 @@ defmodule Exnode.Index.Scripthash do
        %{txid: txid, index: vout, value: value, height: h}
      end)}
   catch
-    {__MODULE__, :too_many} -> {:error, :too_many}
+    {__MODULE__, reason} when reason in [:too_many, :too_many_rows] -> {:error, reason}
   end
 
   @doc """
