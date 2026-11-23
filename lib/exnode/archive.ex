@@ -2183,10 +2183,14 @@ defmodule Exnode.Archive do
     {f.(b), rest}
   end
 
+  # Only truncation means "read more": a corrupt length (non-canonical or
+  # above MAX_SIZE) raises at once instead of growing the read to the
+  # segment's end.
   defp guard(f) do
     f.()
   catch
-    {:codec_error, _} -> :more
+    {:codec_error, :truncated} -> :more
+    {:codec_error, reason} -> raise "corrupt archive record (#{reason})"
   end
 
   @doc false

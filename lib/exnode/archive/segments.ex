@@ -148,9 +148,11 @@ defmodule Exnode.Archive.Segments do
   end
 
   defp do_roll(st) do
+    seg = st.seg + 1
+    # Locations store the segment number in 16 bits: one more would wrap.
+    if seg > 0xFFFF, do: raise("archive #{st.kind} has no segment number left after #{st.seg}")
     :ok = :file.sync(st.fd)
     :ok = :file.close(st.fd)
-    seg = st.seg + 1
     {:ok, fd} = :file.open(path(st.dir, seg), [:raw, :binary, :read, :write])
     # The new file's directory entry is durable before any record is written
     # to it, so a later commit never references a file a power loss can drop.

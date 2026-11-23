@@ -52,6 +52,9 @@ typedef struct {
 #define TOMB ((entry_t *)1)
 #define MIN_CAP 1024
 
+/* Equality only: ordering TOMB against a real entry pointer is undefined. */
+static inline int live(const entry_t *e) { return e != NULL && e != TOMB; }
+
 typedef struct {
     slot_t *slots;
     size_t cap;   /* power of two */
@@ -130,7 +133,7 @@ static void table_init(table_t *t) {
 
 static void table_free_entries(table_t *t) {
     for (size_t i = 0; i < t->cap; i++)
-        if (t->slots[i].e > TOMB) free(t->slots[i].e);
+        if (live(t->slots[i].e)) free(t->slots[i].e);
 }
 
 static int key_eq(const entry_t *e, const unsigned char *key, size_t len, uint32_t vout) {
@@ -155,7 +158,7 @@ static int table_resize(table_t *t, size_t cap) {
     size_t mask = cap - 1;
     for (size_t i = 0; i < t->cap; i++) {
         entry_t *e = t->slots[i].e;
-        if (e > TOMB) {
+        if (live(e)) {
             size_t j = t->slots[i].h & mask;
             while (s[j].e) j = (j + 1) & mask;
             s[j] = t->slots[i];
@@ -210,7 +213,7 @@ static int table_put(table_t *t, uint64_t h, entry_t *e) {
     }
     if (!table_reserve(t)) return 0;
     size_t mask = t->cap - 1, j = h & mask;
-    while (t->slots[j].e > TOMB) j = (j + 1) & mask;
+    while (live(t->slots[j].e)) j = (j + 1) & mask;
     if (t->slots[j].e == TOMB) t->tombs--;
     t->slots[j].h = h;
     t->slots[j].e = e;
@@ -504,8 +507,9 @@ static ERL_NIF_TERM nif_evict(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
 static ERL_NIF_TERM nif_clear(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     overlay_t *ov;
-    if (!get_ov(env, argv[0], &ov) || !enif_is_atom(env, argv[1])) return enif_make_badarg(env);
+    if (!get_ov(env, argv[0], &ov)) return enif_make_badarg(env);
     int all = enif_is_identical(argv[1], enif_make_atom(env, "all"));
+    if (!all && !enif_is_identical(argv[1], atom_spent)) return enif_make_badarg(env);
     enif_rwlock_rwlock(ov->lock);
     table_clear(&ov->spent);
     if (all) table_clear(&ov->coins);
