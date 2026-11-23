@@ -136,8 +136,10 @@ defmodule Exnode.Archive.Overlay do
         n: n,
         packed: packed
       }) do
-    # One call, so a block is applied whole or (malformed) not at all; it
-    # times its two phases itself.
+    # One call, so a malformed block changes nothing; it times its two
+    # phases itself. Out of memory it raises :enomem with the block partly
+    # applied: the owner must not go on with these tables (the chain state
+    # treats it as fatal and restarts from its last commit).
     {:ok, spent_us, created_us} = apply_nif(t, gen, mask, coins)
     bump(:ov_spent_us, spent_us)
     bump(:ov_created_us, created_us)
