@@ -485,7 +485,10 @@ defmodule Exnode.Chain.State do
       last_failure: nil,
       # The mempool process (name or pid) and the block events for it, newest first.
       mempool: Keyword.get(opts, :mempool),
-      mempool_events: []
+      mempool_events: [],
+      # The old tip's chain work while a reorg's events are held back from
+      # the mempool, else nil.
+      reorg_work: nil
     }
 
     # The shared script executor (the node's, by name), or a private one.
@@ -1118,7 +1121,17 @@ defmodule Exnode.Chain.State do
 
   # Sends the block events of this activation to the mempool (Core: ConnectTip
   # calls removeForBlock; ActivateBestChainStep calls MaybeUpdateMempoolForReorg).
+  #
+  # A reorg's events are held until the new chain has more work than the old
+  # tip, or its plan ends: Core keeps the disconnectpool across those
+  # ConnectTip calls, so txs the new blocks confirm again are never re-added
+  # (and never trimmed against).
   defp flush_mempool(%{mempool_events: []} = st), do: st
+
+  defp flush_mempool(%{reorg_work: w, plan: plan} = st) when w != nil and plan != nil do
+    tip = HeaderIndex.lookup(Headers.index(st.headers), Archive.tip(st.a).hash)
+    if tip.chain_work > w, do: flush_mempool(%{st | reorg_work: nil}), else: st
+  end
 
   defp flush_mempool(st) do
     case st.mempool && GenServer.whereis(st.mempool) do
@@ -1129,7 +1142,7 @@ defmodule Exnode.Chain.State do
         :ok
     end
 
-    %{st | mempool_events: []}
+    %{st | mempool_events: [], reorg_work: nil}
   end
 
   defp mempool_event(%{mempool: nil} = st, _ev), do: st
@@ -1448,6 +1461,12 @@ defmodule Exnode.Chain.State do
 
       {target, st} ->
         fork = HeaderIndex.last_common_ancestor(idx, tip_entry, target)
+
+        st =
+          if fork.height < tip_entry.height and st.mempool,
+            do: %{st | reorg_work: max(st.reorg_work || 0, tip_entry.chain_work)},
+            else: st
+
         st = disconnect_to(st, fork)
         path = path(idx, fork, target)
         # The prefetch stage runs only on paths of new blocks (see Chain.Prefetch).

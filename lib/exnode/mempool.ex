@@ -54,9 +54,13 @@ defmodule Exnode.Mempool do
   alias Exnode.Mempool.{Accept, Package, Pool}
   alias Exnode.Validation.ScriptFlags
 
+  import Bitwise, only: [&&&: 2]
+
   @max_pending_verifications 128
   # Txs linearized per idle cache-refresh message (about one full cluster).
   @refresh_lin_txs 64
+  # BIP68 SEQUENCE_LOCKTIME_DISABLE_FLAG
+  @seq_disable 0x80000000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
@@ -753,21 +757,66 @@ defmodule Exnode.Mempool do
     {pool, _trimmed} = Pool.trim_oversized(s.pool, readded)
     s = %{s | pool: pool}
 
-    s = remove_not_final_or_immature(s, chain)
+    moved = for txs <- disconnected, tx <- txs, into: MapSet.new(), do: tx.txid
+    s = remove_not_final_or_immature(s, chain, moved, st.chain_state)
     %{st | state: Accept.limit_size(s, chain.now)}
   end
 
-  # Core: filter_final_and_mature in MaybeUpdateMempoolForReorg.
-  defp remove_not_final_or_immature(s, chain) do
-    bad =
-      for {txid, e} <- s.pool.entries,
-          not Exnode.Validation.Block.final_tx?(e.tx, chain.tip.height + 1, chain.tip.mtp) or
-            not Accept.still_valid_at_tip?(s, e, chain),
-          do: txid
+  # Core: filter_final_and_mature in MaybeUpdateMempoolForReorg. Coins are
+  # read, in one call, only for entries whose check depends on them: a
+  # coinbase spend, a relative lock, or a chain input a disconnected tx
+  # created (Core recomputes those entries' lock points, which needs them).
+  defp remove_not_final_or_immature(s, chain, moved, cs) do
+    {bad, check} =
+      Enum.reduce(s.pool.entries, {[], []}, fn {txid, e}, {bad, check} ->
+        cond do
+          not Exnode.Validation.Block.final_tx?(e.tx, chain.tip.height + 1, chain.tip.mtp) ->
+            {[txid | bad], check}
+
+          coins_matter?(s.pool, e, moved) ->
+            {bad, [e | check]}
+
+          true ->
+            {bad, check}
+        end
+      end)
+
+    ops =
+      for e <- check,
+          i <- e.tx.inputs,
+          not Pool.exists?(s.pool, i.prev_hash),
+          uniq: true,
+          do: {i.prev_hash, i.prev_index}
+
+    chain = if ops == [], do: chain, else: with_coins(chain, cs, ops)
+    bad = for e <- check, not Accept.still_valid_at_tip?(s, e, chain), into: bad, do: e.txid
 
     if bad == [],
       do: s,
       else: %{s | pool: Pool.remove(s.pool, Pool.with_descendants(s.pool, bad))}
+  end
+
+  defp coins_matter?(pool, e, moved) do
+    e.spends_coinbase or
+      Enum.any?(e.tx.inputs, fn i ->
+        (e.tx.version >= 2 and (i.sequence &&& @seq_disable) == 0) or
+          (MapSet.member?(moved, i.prev_hash) and not Pool.exists?(pool, i.prev_hash))
+      end)
+  end
+
+  # `chain` with `ops` read ahead in one chain-state call.
+  defp with_coins(chain, cs, ops) do
+    {_tip, prefetched} = ChainState.mempool_view(cs, ops)
+    lazy = chain.coins
+
+    %{
+      chain
+      | coins: fn ops ->
+          {known, missing} = Enum.split_with(ops, &Map.has_key?(prefetched, &1))
+          more = if missing == [], do: %{}, else: lazy.(missing)
+          Map.merge(Map.take(prefetched, known), more)
+        end
+    }
   end
 
   # A listener may be a registered name that is restarting in another
