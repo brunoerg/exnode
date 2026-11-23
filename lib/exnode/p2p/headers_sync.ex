@@ -83,7 +83,8 @@ defmodule Exnode.P2P.HeadersSync do
       params: p,
       commitment_period: period,
       redownload_buffer_size: buffer,
-      commit_offset: :rand.uniform(period) - 1,
+      # Unpredictable to the peer (Core FastRandomContext).
+      commit_offset: elem(:rand.uniform_s(period, :crypto.rand_seed_s()), 0) - 1,
       key: :crypto.strong_rand_bytes(32),
       chain_start: chain_start,
       chain_start_locator: chain_start_locator,
@@ -268,6 +269,10 @@ defmodule Exnode.P2P.HeadersSync do
           not process_all and rem(next_height, st.commitment_period) == st.commit_offset
 
         with {:ok, st} <- if(check_commitment?, do: check_commitment(st, h), else: {:ok, st}) do
+          # Buffered across messages: an 80-byte slice would keep the whole
+          # (possibly padded) headers payload alive.
+          h = %{h | raw: h.raw && :binary.copy(h.raw)}
+
           {:ok,
            %{
              st

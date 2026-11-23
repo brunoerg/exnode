@@ -24,7 +24,10 @@ defmodule Exnode.Mempool do
     consensus or policy verdict, so neither is punished.
 
   `test_accept/2`, `submit_package/2` and the reorg re-adds stay
-  synchronous (RPC-facing, authenticated, or chain-driven).
+  synchronous, as all of Core's acceptance does under `cs_main`. Packages
+  also come from peers (TxRelay's 1p1c): TxRelay submits one only for a
+  parent that failed alone on its fee, and caches a parent or child that
+  fails in the package, so each such evaluation costs the peer a new tx.
 
   The chain state provides the view (tip, unspent coins, script flags) and
   sends `{:mempool_update, tip_hash, events}` after each activation, with
@@ -51,9 +54,13 @@ defmodule Exnode.Mempool do
   alias Exnode.Mempool.{Accept, Package, Pool}
   alias Exnode.Validation.ScriptFlags
 
+  import Bitwise, only: [&&&: 2]
+
   @max_pending_verifications 128
   # Txs linearized per idle cache-refresh message (about one full cluster).
   @refresh_lin_txs 64
+  # BIP68 SEQUENCE_LOCKTIME_DISABLE_FLAG
+  @seq_disable 0x80000000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
@@ -78,15 +85,27 @@ defmodule Exnode.Mempool do
   The mempool txs paying to or spending from the script with scripthash
   `sh` (`sha256(scriptPubKey)`), oldest first: `[%{txid, tx, spent}]`
   (`spent`: `{value, scripthash}` per input). Needs `index_scripts: true`;
-  else `{:error, :not_indexed}`. Copies only those txs out of the mempool.
+  else `{:error, :not_indexed}`. Copies only those txs out of the mempool;
+  with more than `limit` of them, none (`{:error, :too_many}`), so a
+  popular script (an anchor, say) costs this process no copy and no sort.
   """
-  def script_txs(server, sh), do: GenServer.call(server, {:script_txs, sh}, :infinity)
+  def script_txs(server, sh, limit \\ :infinity),
+    do: GenServer.call(server, {:script_txs, sh, limit}, :infinity)
 
   @doc "The mempool spenders of `outpoints`: `%{outpoint => {txid, input_index}}` (unspent ones absent)."
   def spenders(server, outpoints), do: GenServer.call(server, {:spenders, outpoints}, :infinity)
 
   @doc "`{fee, vsize}` of every mempool tx, and the total vsize: `{pairs, total_vsize}`."
   def fee_rates(server), do: GenServer.call(server, :fee_rates, :infinity)
+
+  @doc """
+  Esplora `/mempool`: `%{count, vsize, total_fee, fee_histogram}`
+  (`fee_histogram`: `[feerate, vsize]` per 0.1 sat/vB band, highest
+  first). `count` and `vsize` are current; the fee figures need a pass
+  over the pool, so as electrs' backlog stats they are computed at most
+  once per 10 s and served from that cache meanwhile.
+  """
+  def backlog(server), do: GenServer.call(server, :backlog, :infinity)
 
   @doc "The pool itself (for RPC views)."
   def pool(server), do: GenServer.call(server, :pool, 5_000)
@@ -179,10 +198,30 @@ defmodule Exnode.Mempool do
       # accepts waiting for a pending one they depend on, oldest first
       deferred: :queue.new(),
       # a :refresh_lin message is in the mailbox
-      refresh_queued: false
+      refresh_queued: false,
+      # {computed_at_ms, backlog/1's fee figures}
+      backlog: nil
     }
 
     {:ok, st}
+  end
+
+  # electrs BACKLOG_STATS_TTL.
+  @backlog_ttl_ms 10_000
+
+  defp backlog_fees(pool) do
+    pairs = for {_, e} <- pool.entries, do: {e.fee, e.vsize}
+
+    hist =
+      pairs
+      |> Enum.map(fn {fee, vsize} -> {fee / vsize, vsize} end)
+      |> Enum.sort(:desc)
+      |> Enum.chunk_by(fn {r, _} -> round(r * 10) end)
+      |> Enum.map(fn group ->
+        [elem(hd(group), 0), Enum.reduce(group, 0, &(&2 + elem(&1, 1)))]
+      end)
+
+    %{total_fee: Enum.reduce(pairs, 0, &(&2 + elem(&1, 0))), fee_histogram: hist}
   end
 
   # Without a supervisor from the node (tests), one linked to this process.
@@ -236,19 +275,25 @@ defmodule Exnode.Mempool do
 
   def handle_call(:txids, _from, st), do: {:reply, Map.keys(st.state.pool.entries), st}
 
-  def handle_call({:script_txs, sh}, _from, st) do
+  def handle_call({:script_txs, sh, limit}, _from, st) do
     st = sync(st)
     pool = st.state.pool
 
+    ids = if Pool.indexes_scripts?(pool), do: Pool.script_txids(pool, sh)
+
     reply =
-      if Pool.indexes_scripts?(pool) do
-        pool
-        |> Pool.script_txids(sh)
-        |> Enum.map(&Pool.get(pool, &1))
-        |> Enum.sort_by(& &1.sequence)
-        |> Enum.map(&%{txid: &1.txid, tx: &1.tx, spent: &1.spent})
-      else
-        {:error, :not_indexed}
+      cond do
+        ids == nil ->
+          {:error, :not_indexed}
+
+        MapSet.size(ids) > limit ->
+          {:error, :too_many}
+
+        true ->
+          ids
+          |> Enum.map(&Pool.get(pool, &1))
+          |> Enum.sort_by(& &1.sequence)
+          |> Enum.map(&%{txid: &1.txid, tx: &1.tx, spent: &1.spent})
       end
 
     {:reply, reply, st}
@@ -271,6 +316,24 @@ defmodule Exnode.Mempool do
     st = sync(st)
     pool = st.state.pool
     {:reply, {for({_, e} <- pool.entries, do: {e.fee, e.vsize}), pool.total_vsize}, st}
+  end
+
+  def handle_call(:backlog, _from, st) do
+    st = sync(st)
+    pool = st.state.pool
+    now = System.monotonic_time(:millisecond)
+
+    {fees, st} =
+      case st.backlog do
+        {at, fees} when now - at < @backlog_ttl_ms ->
+          {fees, st}
+
+        _ ->
+          fees = backlog_fees(pool)
+          {fees, %{st | backlog: {now, fees}}}
+      end
+
+    {:reply, Map.merge(fees, %{count: map_size(pool.entries), vsize: pool.total_vsize}), st}
   end
 
   def handle_call(:pool, _from, st), do: {:reply, st.state.pool, st}
@@ -694,21 +757,66 @@ defmodule Exnode.Mempool do
     {pool, _trimmed} = Pool.trim_oversized(s.pool, readded)
     s = %{s | pool: pool}
 
-    s = remove_not_final_or_immature(s, chain)
+    moved = for txs <- disconnected, tx <- txs, into: MapSet.new(), do: tx.txid
+    s = remove_not_final_or_immature(s, chain, moved, st.chain_state)
     %{st | state: Accept.limit_size(s, chain.now)}
   end
 
-  # Core: filter_final_and_mature in MaybeUpdateMempoolForReorg.
-  defp remove_not_final_or_immature(s, chain) do
-    bad =
-      for {txid, e} <- s.pool.entries,
-          not Exnode.Validation.Block.final_tx?(e.tx, chain.tip.height + 1, chain.tip.mtp) or
-            not Accept.still_valid_at_tip?(s, e, chain),
-          do: txid
+  # Core: filter_final_and_mature in MaybeUpdateMempoolForReorg. Coins are
+  # read, in one call, only for entries whose check depends on them: a
+  # coinbase spend, a relative lock, or a chain input a disconnected tx
+  # created (Core recomputes those entries' lock points, which needs them).
+  defp remove_not_final_or_immature(s, chain, moved, cs) do
+    {bad, check} =
+      Enum.reduce(s.pool.entries, {[], []}, fn {txid, e}, {bad, check} ->
+        cond do
+          not Exnode.Validation.Block.final_tx?(e.tx, chain.tip.height + 1, chain.tip.mtp) ->
+            {[txid | bad], check}
+
+          coins_matter?(s.pool, e, moved) ->
+            {bad, [e | check]}
+
+          true ->
+            {bad, check}
+        end
+      end)
+
+    ops =
+      for e <- check,
+          i <- e.tx.inputs,
+          not Pool.exists?(s.pool, i.prev_hash),
+          uniq: true,
+          do: {i.prev_hash, i.prev_index}
+
+    chain = if ops == [], do: chain, else: with_coins(chain, cs, ops)
+    bad = for e <- check, not Accept.still_valid_at_tip?(s, e, chain), into: bad, do: e.txid
 
     if bad == [],
       do: s,
       else: %{s | pool: Pool.remove(s.pool, Pool.with_descendants(s.pool, bad))}
+  end
+
+  defp coins_matter?(pool, e, moved) do
+    e.spends_coinbase or
+      Enum.any?(e.tx.inputs, fn i ->
+        (e.tx.version >= 2 and (i.sequence &&& @seq_disable) == 0) or
+          (MapSet.member?(moved, i.prev_hash) and not Pool.exists?(pool, i.prev_hash))
+      end)
+  end
+
+  # `chain` with `ops` read ahead in one chain-state call.
+  defp with_coins(chain, cs, ops) do
+    {_tip, prefetched} = ChainState.mempool_view(cs, ops)
+    lazy = chain.coins
+
+    %{
+      chain
+      | coins: fn ops ->
+          {known, missing} = Enum.split_with(ops, &Map.has_key?(prefetched, &1))
+          more = if missing == [], do: %{}, else: lazy.(missing)
+          Map.merge(Map.take(prefetched, known), more)
+        end
+    }
   end
 
   # A listener may be a registered name that is restarting in another

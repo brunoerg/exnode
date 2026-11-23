@@ -39,6 +39,11 @@ defmodule Exnode.Archive do
   # before the files are deleted: readers carry a copy of `wpruned` from
   # their commit, and a read racing a prune used to open a deleted file and
   # crash.
+  # `committed_live` (atomics) is the committed tip's height, raised after a
+  # commit's KV write and lowered before a disconnect touches the chain
+  # tables. Readers get it as `visible`: the chain tables are shared and
+  # also hold the uncommitted batch's blocks (above that height), which a
+  # reader must not see (their records and spend rows are not in the KV).
   # `epoch` counts changes to the committed archive (each commit and each
   # disconnect): answers computed against the committed state (prefetch)
   # are valid only while it is unchanged.
@@ -56,6 +61,8 @@ defmodule Exnode.Archive do
     prune_keep: nil,
     wpruned: -1,
     wpruned_live: nil,
+    committed_live: nil,
+    visible: nil,
     wseg_max: %{},
     committed: nil,
     committed_next: nil,
@@ -132,10 +139,12 @@ defmodule Exnode.Archive do
       batch: empty_batch(),
       prune_keep: Keyword.get(opts, :prune_keep),
       wpruned_live: :atomics.new(1, signed: true),
+      committed_live: :atomics.new(1, signed: true),
       segwit_height: Keyword.get(opts, :segwit_height, 0)
     }
 
     :atomics.put(a.wpruned_live, 1, -1)
+    :atomics.put(a.committed_live, 1, -1)
 
     case meta do
       nil ->
@@ -166,6 +175,7 @@ defmodule Exnode.Archive do
     walk(a, tip_id, rec)
     sum_chain_tx(a, rec.height)
     tip = %{id: tip_id, height: rec.height, hash: rec.hash}
+    :atomics.put(a.committed_live, 1, tip.height)
     %{a | tip: tip, committed: tip}
   end
 
@@ -220,22 +230,35 @@ defmodule Exnode.Archive do
     end
   end
 
-  def on_chain?(%__MODULE__{onchain: t}, id), do: :ets.member(t, id)
+  def on_chain?(%__MODULE__{onchain: t, visible: nil}, id), do: :ets.member(t, id)
 
-  def id_at(%__MODULE__{chain: t}, height) do
+  def on_chain?(%__MODULE__{onchain: t, visible: v}, id) do
+    case :ets.lookup(t, id) do
+      [{_, h}] -> visible?(v, h)
+      [] -> false
+    end
+  end
+
+  def id_at(%__MODULE__{chain: t, visible: v}, height) do
     case :ets.lookup(t, height) do
-      [{_, id, _}] -> id
+      [{_, id, _}] -> if visible?(v, height), do: id
       [] -> nil
     end
   end
+
+  # The row is read before the committed height: a row above it when read
+  # can only fall at or below it later by being committed (a disconnect
+  # commits the batch first), so an uncommitted block is never returned.
+  defp visible?(nil, _height), do: true
+  defp visible?(v, height), do: height <= :atomics.get(v, 1)
 
   @doc """
   Transactions in the selected chain from genesis to `height`, inclusive
   (Core `CBlockIndex::m_chain_tx_count`); nil above the tip.
   """
-  def chain_tx_count(%__MODULE__{chain: t}, height) do
+  def chain_tx_count(%__MODULE__{chain: t, visible: v}, height) do
     case :ets.lookup(t, height) do
-      [{_, _, n}] -> n
+      [{_, _, n}] -> if visible?(v, height), do: n
       [] -> nil
     end
   end
@@ -285,6 +308,7 @@ defmodule Exnode.Archive do
       genesis_hash: a.genesis_hash,
       wpruned: a.wpruned,
       wpruned_live: a.wpruned_live,
+      visible: a.committed_live,
       batch: empty_batch(),
       tip: a.committed || a.tip,
       next: a.committed_next || a.next,
@@ -375,7 +399,7 @@ defmodule Exnode.Archive do
 
     for {txid, vout} = op <- outpoints,
         {base, n} = Map.get(located, txid, {nil, 0}),
-        vout < n,
+        vout >= 0 and vout < n,
         into: %{},
         do: {op, base + vout}
   end
@@ -793,7 +817,7 @@ defmodule Exnode.Archive do
   def resolve(%__MODULE__{} = a, txid, vout) do
     with {:ok, entry} <- newest_on_chain_entry(a, txid),
          {block_id, pos, base_out, nout, _base_in} = entry,
-         true <- vout < nout || :missing,
+         true <- (vout >= 0 and vout < nout) || :missing,
          out_id = base_out + vout,
          false <- spent_on_chain?(a, out_id) do
       {value, spk} = read_output(a, out_id)
@@ -913,6 +937,7 @@ defmodule Exnode.Archive do
   omitted, sent}}` (unique outpoints; `sent` went to committed resolution).
   """
   def prefetch_answers(%__MODULE__{} = a, outpoints, hint) do
+    a = live_chain(a)
     ops = Enum.uniq(outpoints)
     sent = if hint, do: Enum.reject(ops, &Overlay.answerable?(hint, &1)), else: ops
     n = length(ops)
@@ -930,6 +955,7 @@ defmodule Exnode.Archive do
   `history_rows` and `history_extra` (rows read only for the history).
   """
   def prefetch_block(%__MODULE__{} = a, outpoints, hint, txids) do
+    a = live_chain(a)
     ops = Enum.uniq(outpoints)
     sent = if hint, do: Enum.reject(ops, &Overlay.answerable?(hint, &1)), else: ops
     n = length(ops)
@@ -948,6 +974,11 @@ defmodule Exnode.Archive do
        history_extra: length(all) - length(lookup)
      }, %{epoch: a.epoch, rows: Map.take(rows, txids)}}
   end
+
+  # The prefetch answers stand in for the chain-state process's own
+  # committed lookups, which see the whole chain table (the batch's blocks
+  # included), so they read it unbounded too.
+  defp live_chain(a), do: %{a | visible: nil}
 
   @doc """
   Carries `prefetch_block/4` results computed at `epoch` over the one
@@ -1146,7 +1177,7 @@ defmodule Exnode.Archive do
     candidates =
       for {t, v} = op <- outpoints,
           {block_id, pos, base_out, nout, _} <- List.wrap(entries[t]),
-          v < nout,
+          v >= 0 and v < nout,
           into: %{},
           do: {op, {base_out + v, block_id, pos}}
 
@@ -1440,6 +1471,7 @@ defmodule Exnode.Archive do
     # Key-ordered `spends` and `txindex` runs: an IBD commit's millions of
     # rows insert into the memtable several times faster (Store.PackedSort).
     :ok = KV.write(a.kv, ops, sync: true, stats: true, sort_packed: true)
+    :atomics.put(a.committed_live, 1, a.tip.height)
     t2 = System.monotonic_time(:microsecond)
     count(:commit_blocks, a.batch.n)
     count(:commit_materialize_us, tm - t1)
@@ -1517,6 +1549,7 @@ defmodule Exnode.Archive do
     lost = Map.get_lazy(rec, :overwritten, fn -> legacy_overwritten(a, rec) end)
     a = %{a | overwritten: MapSet.union(a.overwritten, MapSet.new(lost))}
     prev = block_record!(a, rec.prev_id)
+    :atomics.put(a.committed_live, 1, prev.height)
 
     a =
       update_chain(%{a | overlay: Overlay.clear(a.overlay)}, %{
@@ -1984,6 +2017,20 @@ defmodule Exnode.Archive do
   def witness_pruned(%__MODULE__{wpruned: w, wpruned_live: nil}), do: w
   def witness_pruned(%__MODULE__{wpruned: w, wpruned_live: ref}), do: max(w, :atomics.get(ref, 1))
 
+  @doc """
+  Whether block `hash` is archived with what connecting it needs (Core
+  BLOCK_HAVE_DATA): on the active chain (already connected), or off it with
+  its witness data kept. A block a reorg disconnected below the pruning
+  horizon has lost its witnesses: it cannot be validated again from the
+  archive and must be downloaded again before it is reconnected.
+  """
+  def have_block_data?(%__MODULE__{} = a, hash) do
+    case block_id(a, hash) do
+      nil -> false
+      id -> on_chain?(a, id) or witness_pruned(a) < 0 or not witness_pruned?(a, id)
+    end
+  end
+
   @doc "Whether block `id`'s witness data is pruned (now)."
   def witness_pruned?(%__MODULE__{} = a, id), do: rec_pruned?(a, block_record!(a, id))
 
@@ -2136,10 +2183,14 @@ defmodule Exnode.Archive do
     {f.(b), rest}
   end
 
+  # Only truncation means "read more": a corrupt length (non-canonical or
+  # above MAX_SIZE) raises at once instead of growing the read to the
+  # segment's end.
   defp guard(f) do
     f.()
   catch
-    {:codec_error, _} -> :more
+    {:codec_error, :truncated} -> :more
+    {:codec_error, reason} -> raise "corrupt archive record (#{reason})"
   end
 
   @doc false

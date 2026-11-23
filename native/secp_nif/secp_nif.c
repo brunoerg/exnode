@@ -28,10 +28,14 @@ static int load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     if (ctx == NULL) return 1;
     /* Side-channel blinding, as Core's ECC_Start (key.cpp). */
     unsigned char seed[32];
-    if (getrandom(seed, sizeof(seed), 0) != (ssize_t)sizeof(seed)) return 1;
-    int ok = secp256k1_context_randomize(ctx, seed);
-    memset(seed, 0, sizeof(seed));
-    return ok ? 0 : 1;
+    int ok = getrandom(seed, sizeof(seed), 0) == (ssize_t)sizeof(seed) && secp256k1_context_randomize(ctx, seed);
+    /* A plain memset of a dead local may be optimised away. */
+    explicit_bzero(seed, sizeof(seed));
+    if (ok) return 0;
+    /* A failed load never reaches unload. */
+    secp256k1_context_destroy(ctx);
+    ctx = NULL;
+    return 1;
 }
 
 static void unload(ErlNifEnv *env, void *priv) {

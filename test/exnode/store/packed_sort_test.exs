@@ -64,6 +64,27 @@ defmodule Exnode.Store.PackedSortTest do
     assert PackedSort.sort(<<>>, 4, :var) == <<>>
   end
 
+  test "edge cases: empty, one record, empty values, bad lengths" do
+    assert PackedSort.sort(<<>>, 2, 3) == <<>>
+    assert PackedSort.sort(<<9, 9, "abc">>, 2, 3) == <<9, 9, "abc">>
+    assert PackedSort.sort(<<9, 9, 0::32>>, 2, :var) == <<9, 9, 0::32>>
+
+    # Empty values between non-empty ones: every record keeps its whole length.
+    bin = <<3, 0::32, 1, 2::32, "xy", 2, 0::32, 1, 0::32>>
+    assert PackedSort.sort(bin, 1, :var) == <<1, 2::32, "xy", 1, 0::32, 2, 0::32, 3, 0::32>>
+
+    # A length prefix past the end of the binary, up to the 32-bit maximum.
+    for len <- [3, 0xFFFF_FFFF] do
+      assert_raise ArgumentError, fn ->
+        PackedSort.sort(<<1, 0::32, 2, len::32, "ab">>, 1, :var)
+      end
+    end
+
+    # A record size past the binary (the value size near the 32-bit maximum).
+    assert_raise ArgumentError, fn -> PackedSort.sort(<<1, 2, 3, 4>>, 1, 0xFFFF_FFFF) end
+    assert_raise ArgumentError, fn -> PackedSort.sort(<<1, 2, 3, 4>>, 1025, 1) end
+  end
+
   @tag :tmp_dir
   test "KV.write with sort_packed: the same store as without", %{tmp_dir: dir} do
     spends = fn seed ->

@@ -21,7 +21,9 @@ defmodule Exnode.Chain.Headers.Writer do
   written everything before the store closes.
 
   Durability is unchanged: writes were `sync: false` before and still are.
-  A header lost on power failure is downloaded again.
+  A header lost on power failure is downloaded again. The chain state's
+  commit waits for this queue (`Headers.flush/1`) before its synced write,
+  which then makes every header written so far durable too.
   """
   use GenServer
 

@@ -137,6 +137,42 @@ defmodule Exnode.Archive.SegmentsTest do
     assert for({p, i} <- read_all(root, later), do: p == payload(i)) |> Enum.all?()
   end
 
+  # Locations keep the segment number in 16 bits (<<seg::16, off::48>>).
+  test "rolling past segment 0xFFFF raises instead of wrapping", %{tmp_dir: root} do
+    {s, _} = write(Segments.open(root, :outputs, max: 10), 0, 1)
+    s = %{s | seg: 0xFFFF}
+
+    assert_raise RuntimeError, ~r/no segment number left after 65535/, fn ->
+      Segments.append_block(s, [rec(0)])
+    end
+
+    refute File.exists?(Path.join([root, "outputs", "65536.seg"]))
+  end
+
+  test "a corrupt record length raises at once instead of reading to the segment's end", %{
+    tmp_dir: root
+  } do
+    # A non-canonical CompactSize (0xFD then a value below 253) before 4 MiB of filler.
+    bad = <<1::little-signed-64, 0xFD, 5, 0>>
+
+    {s, [loc, _]} =
+      Segments.append_block(Segments.open(root, :outputs), [bad, :binary.copy(<<7>>, 4_194_304)])
+
+    :ok = Segments.sync(s)
+
+    assert Exnode.Archive.decode_output(binary_part(bad, 0, 9)) == :more
+    _ = Segments.take_stats()
+    r = Segments.open_reader(root, :outputs)
+
+    assert_raise RuntimeError, ~r/corrupt archive record \(non_canonical_compact_size\)/, fn ->
+      Segments.read_nth(r, loc, 0, &Exnode.Archive.decode_output/1)
+    end
+
+    assert Segments.take_stats().preads == 1
+    Segments.close_reader(r)
+    Segments.close(s)
+  end
+
   describe "through Archive.open" do
     alias Exnode.Store.KV
     alias Exnode.Test.BlockBuilder, as: BB

@@ -205,16 +205,37 @@ defmodule Exnode.Store.KV do
     ArgumentError -> :ok
   end
 
-  @spec get(t(), atom(), binary()) :: {:ok, binary()} | :not_found | {:error, term()}
-  def get(%__MODULE__{db: db, cfs: cfs}, cf, key),
-    do: :rocksdb.get(db, Map.fetch!(cfs, cf), key, [])
+  defmodule Error do
+    @moduledoc """
+    RocksDB could not read (an I/O error, corruption, a missing file): a
+    fault of the host's storage, never an answer about the key.
+    """
+    defexception [:op, :cf, :reason]
+    @impl true
+    def message(%{op: op, cf: cf, reason: r}), do: "store #{op} on #{cf} failed: #{inspect(r)}"
+  end
 
-  @doc "Batched lookup. Results are in key order: `{:ok, value} | :not_found | {:error, _}`."
-  @spec multi_get(t(), atom(), [binary()]) :: [{:ok, binary()} | :not_found | {:error, term()}]
+  @doc "Point lookup. A read error raises `Exnode.Store.KV.Error` (no caller can answer for it)."
+  @spec get(t(), atom(), binary()) :: {:ok, binary()} | :not_found
+  def get(%__MODULE__{db: db, cfs: cfs}, cf, key) do
+    case :rocksdb.get(db, Map.fetch!(cfs, cf), key, []) do
+      {:error, reason} -> raise Error, op: :get, cf: cf, reason: reason
+      found -> found
+    end
+  end
+
+  @doc "Batched lookup. Results are in key order: `{:ok, value} | :not_found`; a read error raises like `get/3`."
+  @spec multi_get(t(), atom(), [binary()]) :: [{:ok, binary()} | :not_found]
   def multi_get(_kv, _cf, []), do: []
 
-  def multi_get(%__MODULE__{db: db, cfs: cfs}, cf, keys),
-    do: :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, [])
+  def multi_get(%__MODULE__{db: db, cfs: cfs}, cf, keys) do
+    found = :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, [])
+
+    case Enum.find(found, &match?({:error, _}, &1)) do
+      {:error, reason} -> raise Error, op: :multi_get, cf: cf, reason: reason
+      nil -> found
+    end
+  end
 
   @doc """
   Applies `ops` atomically as one write batch, in order. `{:put_packed, cf,

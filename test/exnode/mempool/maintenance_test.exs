@@ -329,4 +329,103 @@ defmodule Exnode.Mempool.MaintenanceTest do
     refute Mempool.has?(mp, p.txid)
     assert Mempool.has?(mp, c.txid)
   end
+
+  # Regression: the chain state sent a reorg's disconnect events to the
+  # mempool at the end of the turn that disconnected, before the replacement
+  # blocks connected (their scripts were still running). The mempool then
+  # re-added and re-verified txs the new chain confirms again, and trimmed
+  # the pool before they left it. Core keeps the disconnectpool until the
+  # new chain has more work than the old tip (ActivateBestChainStep).
+  test "a reorg reaches the mempool with its connects, so reconfirmed txs are not re-added",
+       %{cs: cs, coins: coins, start_mp: start_mp, last: last} do
+    mp = start_mp.([])
+
+    cb = fn h, value ->
+      fn extra, wit -> BB.coinbase_with(h, 0, outputs: [{value, @spk} | extra], witness: wit) end
+    end
+
+    p = spend(Enum.at(coins, 0), 1_000)
+    b121 = BB.build_segwit(last.header, cb.(121, 50 * 100_000_000 + 1_000), [p])
+    {:ok, :connected} = State.submit_block(cs, b121)
+    :ok = Mempool.sync_to(mp, b121.header.hash)
+
+    # The fork confirms p again; its first block has a script to verify.
+    f121 = BB.build_segwit(last.header, cb.(121, 49 * 100_000_000 + 1_000), [p])
+    f122 = BB.build_segwit(f121.header, cb.(122, 49 * 100_000_000), [])
+    :erlang.trace(mp, true, [:receive])
+    for b <- [f121, f122], do: {:ok, _} = State.submit_block(cs, b)
+    assert State.tip(cs).hash == f122.header.hash
+    :ok = Mempool.sync_to(mp, f122.header.hash)
+    :erlang.trace(mp, false, [:receive])
+
+    updates = collect_updates(mp)
+    assert updates != []
+
+    for events <- updates do
+      kinds = Enum.map(events, &elem(&1, 0))
+      # Every disconnect arrives with the connects that follow it.
+      if :disconnected in kinds, do: assert(List.last(kinds) == :connected, inspect(kinds))
+    end
+
+    refute Mempool.has?(mp, p.txid)
+  end
+
+  # Regression: after a reorg, the final/mature check read every mempool
+  # entry's chain coins with one chain-state call per entry (only the
+  # disconnected txs' coins were prefetched). Core's filter_final_and_mature
+  # reads coins only for entries spending a coinbase or with relative locks
+  # whose inputs moved.
+  test "after a reorg the final/mature check does not query the chain state per entry",
+       %{cs: cs, coins: coins, start_mp: start_mp, last: last} do
+    mp = start_mp.([])
+
+    cb = fn h, value ->
+      fn extra, wit -> BB.coinbase_with(h, 0, outputs: [{value, @spk} | extra], witness: wit) end
+    end
+
+    n = 30
+    p = spend(Enum.at(coins, 0), 1_000, n)
+    b121 = BB.build_segwit(last.header, cb.(121, 50 * 100_000_000 + 1_000), [p])
+    b122 = BB.build_segwit(b121.header, cb.(122, 50 * 100_000_000), [])
+
+    for b <- [b121, b122], do: {:ok, :connected} = State.submit_block(cs, b)
+    :ok = Mempool.sync_to(mp, b122.header.hash)
+
+    for {o, v} <- Enum.with_index(p.outputs),
+        do: {:ok, _} = Mempool.accept(mp, spend({p.txid, v, o.value}, 500))
+
+    assert Mempool.size(mp) == n
+
+    f122 = BB.build_segwit(b121.header, cb.(122, 49 * 100_000_000), [])
+    f123 = BB.build_segwit(f122.header, cb.(123, 49 * 100_000_000), [])
+    :erlang.trace(cs, true, [:receive])
+    for b <- [f122, f123], do: {:ok, _} = State.submit_block(cs, b)
+    :ok = Mempool.sync_to(mp, f123.header.hash)
+    :erlang.trace(cs, false, [:receive])
+
+    assert Mempool.size(mp) == n
+    views = count_views(cs, mp)
+    assert views < 5, "#{views} mempool_view calls"
+  end
+
+  defp collect_updates(mp) do
+    receive do
+      {:trace, ^mp, :receive, {:mempool_update, _, events}} -> [events | collect_updates(mp)]
+      {:trace, ^mp, :receive, _} -> collect_updates(mp)
+    after
+      200 -> []
+    end
+  end
+
+  defp count_views(cs, mp) do
+    receive do
+      {:trace, ^cs, :receive, {:"$gen_call", {^mp, _}, {:mempool_view, _}}} ->
+        1 + count_views(cs, mp)
+
+      {:trace, ^cs, :receive, _} ->
+        count_views(cs, mp)
+    after
+      200 -> 0
+    end
+  end
 end

@@ -214,7 +214,7 @@ defmodule Exnode.REST.EsploraTest do
           {Mempool, :get_tx, 2},
           {Mempool, :get_txs, 2},
           {Mempool, :pool, 1},
-          {Mempool, :script_txs, 2},
+          {Mempool, :script_txs, 3},
           {Archive, :outputs, 2},
           {Scripthash, :history, 2},
           {Scripthash, :totals, 2}
@@ -225,7 +225,7 @@ defmodule Exnode.REST.EsploraTest do
     # The mempool txs touching the script come from its script index, with
     # the outputs they spend: no archive read for them, no copy of the pool.
     # The confirmed stats are the index's totals: no history scan.
-    assert counts == %{{Mempool, :script_txs, 2} => 1, {Scripthash, :totals, 2} => 1}
+    assert counts == %{{Mempool, :script_txs, 3} => 1, {Scripthash, :totals, 2} => 1}
     stats = Jason.decode!(body)["mempool_stats"]
     # m1, m2 and m3 fund spk; m1 spends a confirmed spk output, m2 spends m1:0
     # (a mempool prevout).

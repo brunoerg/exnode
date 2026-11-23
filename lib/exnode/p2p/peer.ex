@@ -15,7 +15,8 @@ defmodule Exnode.P2P.Peer do
   deserialize.
 
   `node` (passed at start) is a map:
-    params, headers, addrman, sync, connman (optional), nonce, services,
+    params, headers, addrman, sync, connman (optional), local_nonces
+    (optional Registry of outbound handshake nonces), services,
     user_agent, serve_headers (default false), active_tip_fn (optional),
     clock (optional `Exnode.Clock`, the node's; nil: the system clock),
     tick_ms (optional, default 1 s; nil: no timer, tests tick explicitly)
@@ -44,6 +45,7 @@ defmodule Exnode.P2P.Peer do
   @headers_response_time_s 120
   @headers_download_timeout_base_s 15 * 60
   @headers_download_timeout_per_header_ms 1
+  @chain_sync_timeout_s 20 * 60
   @tick_ms 1_000
   # A send blocked this long (peer not reading) fails and closes the socket,
   # so the writer cannot hang; Core's send-side TIMEOUT_INTERVAL.
@@ -121,6 +123,9 @@ defmodule Exnode.P2P.Peer do
       # The peer's last feefilter, resent to TxRelay after it restarts.
       feefilter: nil,
       sent_version: false,
+      # Core nLocalHostNonce: our version nonce, fresh per connection, so
+      # connections cannot be linked to each other by it.
+      local_nonce: rand64(),
       wtxid_relay: false,
       addrv2: false,
       prefers_headers: false,
@@ -135,6 +140,9 @@ defmodule Exnode.P2P.Peer do
       headers_sync: nil,
       last_getheaders_at: nil,
       best_known: nil,
+      # Core ChainSyncTimeoutState (m_timeout, m_work_header,
+      # m_sent_getheaders, m_protect); timeout nil is Core's 0s.
+      chain_sync: %{timeout: nil, work_header: nil, sent_getheaders: false, protect: false},
       getaddr_answered: false,
       # Core m_addr_token_bucket.
       addr_rate: Exnode.P2P.AddrRate.new(Exnode.Clock.mono(node[:clock])),
@@ -569,14 +577,27 @@ defmodule Exnode.P2P.Peer do
       services: st.node.services,
       time: now(st),
       addr_recv: addr_recv,
-      nonce: st.node.nonce,
+      nonce: st.local_nonce,
       user_agent: st.node.user_agent,
       start_height: best.height,
       # Block-relay-only connections announce fRelay = false.
       relay: st.conn_type != :block_relay
     }
 
+    # Core CheckIncomingNonce: only outbound connections not yet fully
+    # connected count; the entry goes at verack or when this process exits.
+    if not st.inbound and st.node[:local_nonces],
+      do: Registry.register(st.node.local_nonces, st.local_nonce, nil)
+
     push(%{st | sent_version: true}, {:version, v})
+  end
+
+  # Core FastRandomContext: unpredictable to peers, never 0.
+  defp rand64, do: elem(:rand.uniform_s(0xFFFFFFFFFFFFFFFF, :crypto.rand_seed_s()), 0)
+
+  defp connected_to_self?(st, nonce) do
+    st.inbound and st.node[:local_nonces] != nil and
+      Registry.lookup(st.node.local_nonces, nonce) != []
   end
 
   defp handshake_done?(st), do: st.version != nil and st.verack_received
@@ -614,7 +635,7 @@ defmodule Exnode.P2P.Peer do
       v.version < Message.min_peer_proto_version() ->
         {:stop, {:shutdown, {:obsolete_version, v.version}}, st}
 
-      st.inbound and v.nonce == st.node.nonce ->
+      connected_to_self?(st, v.nonce) ->
         {:stop, {:shutdown, :connected_to_self}, st}
 
       # Core: a feeler only checks that the address is online; AddrMan::Good
@@ -660,6 +681,8 @@ defmodule Exnode.P2P.Peer do
   defp handle_msg(:verack, st) do
     common = common_version(st)
     st = %{st | verack_received: true}
+    # Core fSuccessfullyConnected: no longer a self-connection candidate.
+    if st.node[:local_nonces], do: Registry.unregister(st.node.local_nonces, st.local_nonce)
     st = if common >= @sendheaders_version, do: push(st, :sendheaders), else: st
 
     st =
@@ -917,7 +940,7 @@ defmodule Exnode.P2P.Peer do
 
   defp maybe_ping(st, t) do
     if handshake_done?(st) and st.ping_nonce == nil and t >= st.next_ping_at do
-      nonce = :rand.uniform(0xFFFFFFFFFFFFFFFF)
+      nonce = rand64()
 
       push(
         %{st | ping_nonce: nonce, ping_sent_at: t, next_ping_at: t + @ping_interval_s},
@@ -1063,7 +1086,7 @@ defmodule Exnode.P2P.Peer do
   defp accept_headers(st, headers, count, have_headers_sync) do
     case Headers.process_headers(st.node.headers, headers, min_pow_checked: true, now: now(st)) do
       {:ok, last} ->
-        st = %{st | best_known: better(st.best_known, last)}
+        st = maybe_protect(%{st | best_known: better(st.best_known, last)})
 
         st =
           if count == Message.max_headers_results() and not have_headers_sync,
@@ -1130,19 +1153,90 @@ defmodule Exnode.P2P.Peer do
   end
 
   # Core: GetAntiDoSWorkThreshold, on the active tip (genesis until blocks connect).
-  defp anti_dos_work_threshold(st) do
-    tip =
-      if cs = st.node[:chain_state] do
-        t =
-          if v = is_atom(cs) && ChainState.view(cs),
-            do: ChainState.view_tip(v),
-            else: ChainState.tip(cs)
+  defp anti_dos_work_threshold(st),
+    do: HeaderIndex.anti_dos_work_threshold(active_tip_header(st), st.p)
 
-        HeaderIndex.lookup(Headers.index(st.node.headers), t.hash)
-      end
+  # The active tip's header entry; nil without a chain state.
+  defp active_tip_header(st) do
+    if cs = st.node[:chain_state] do
+      t =
+        if v = is_atom(cs) && ChainState.view(cs),
+          do: ChainState.view_tip(v),
+          else: ChainState.tip(cs)
 
-    HeaderIndex.anti_dos_work_threshold(tip, st.p)
+      HeaderIndex.lookup(Headers.index(st.node.headers), t.hash)
+    end
   end
+
+  # The active tip, genesis without a chain state.
+  defp chain_sync_tip(st, idx),
+    do: active_tip_header(st) || HeaderIndex.ancestor(idx, HeaderIndex.best(idx), 0)
+
+  # Core: UpdatePeerStateForReceivedHeaders. Up to
+  # MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT (4) outbound full-relay
+  # peers with a chain at least as good as our tip are exempt from
+  # ConsiderEviction; block-relay peers never are.
+  defp maybe_protect(
+         %{conn_type: :outbound_full_relay, chain_sync: %{protect: false}, best_known: b} = st
+       )
+       when b != nil do
+    tip = chain_sync_tip(st, Headers.index(st.node.headers))
+
+    if b.chain_work >= tip.chain_work and SyncState.try_protect(st.node.sync, self()),
+      do: put_in(st.chain_sync.protect, true),
+      else: st
+  end
+
+  defp maybe_protect(st), do: st
+
+  # Core: ConsiderEviction (CHAIN_SYNC_TIMEOUT, HEADERS_RESPONSE_TIME). An
+  # unprotected outbound full-relay or block-relay peer that started sync
+  # and whose best known block has less work than our tip has 20 min to
+  # reach the work of the tip at the time; then it gets one getheaders and
+  # 2 min to answer, else it is disconnected. Without this, a peer that only
+  # answers pings holds an outbound slot forever.
+  defp consider_eviction(
+         {:noreply, %{chain_sync: %{protect: false}, sync_started: true, conn_type: ct} = st},
+         t
+       )
+       when ct in [:outbound_full_relay, :block_relay] do
+    idx = Headers.index(st.node.headers)
+    tip = chain_sync_tip(st, idx)
+    cs = st.chain_sync
+    best = st.best_known
+
+    cond do
+      best != nil and best.chain_work >= tip.chain_work ->
+        {:noreply,
+         %{st | chain_sync: %{cs | timeout: nil, work_header: nil, sent_getheaders: false}}}
+
+      cs.timeout == nil or
+          (cs.work_header != nil and best != nil and
+             best.chain_work >= cs.work_header.chain_work) ->
+        cs = %{cs | timeout: t + @chain_sync_timeout_s, work_header: tip, sent_getheaders: false}
+        {:noreply, %{st | chain_sync: cs}}
+
+      t > cs.timeout and cs.sent_getheaders ->
+        Logger.info(
+          "outbound peer has old chain, best known block = " <>
+            if(best, do: Base.encode16(best.hash, case: :lower), else: "<none>")
+        )
+
+        {:stop, {:shutdown, :chain_sync_timeout}, st}
+
+      t > cs.timeout ->
+        # Core: GetLocator(m_work_header->pprev), through the getheaders throttle.
+        start = HeaderIndex.prev(idx, cs.work_header) || cs.work_header
+        st = maybe_send_getheaders(st, HeaderIndex.locator(idx, start))
+        cs = %{cs | sent_getheaders: true, timeout: t + @headers_response_time_s}
+        {:noreply, %{st | chain_sync: cs}}
+
+      true ->
+        {:noreply, st}
+    end
+  end
+
+  defp consider_eviction(result, _t), do: result
 
   defp continuous?([_]), do: true
   defp continuous?([a, b | rest]), do: b.prev_hash == a.hash and continuous?([b | rest])
@@ -1425,6 +1519,7 @@ defmodule Exnode.P2P.Peer do
           e.height > tip.height + 2 ->
             {:ok, maybe_request_blocks(st)}
 
+          # Full block, but only while this peer can take it in flight.
           map_size(st.partials) >= @max_partials ->
             {:ok, request_full_block(st, hash)}
 
@@ -1537,17 +1632,22 @@ defmodule Exnode.P2P.Peer do
     end
   end
 
+  # Core falls back to getdata only when this peer is first in flight for
+  # the block; otherwise it gives up on this peer and waits for the others.
+  # A getdata without the request would be untracked here, beyond the
+  # peer's MAX_BLOCKS_IN_TRANSIT_PER_PEER and the byte budget.
   defp request_full_block(st, hash) do
-    mark_in_flight(st, hash)
-    push(st, {:getdata, [%{type: :block, witness: true, hash: hash}]})
+    if mark_in_flight(st, hash),
+      do: push(st, {:getdata, [%{type: :block, witness: true, hash: hash}]}),
+      else: st
   end
 
   # Core BlockRequested for a compact block's reconstruction or its full
   # fallback: in flight from this peer, so parallel download does not fetch
-  # it too. A no-op if another peer holds it.
+  # it too. False if another peer holds it or this peer has
+  # MAX_BLOCKS_IN_TRANSIT_PER_PEER in flight; true without block download.
   defp mark_in_flight(st, hash) do
-    if bd = st.node[:block_download], do: BlockDownload.mark(bd, self(), hash)
-    :ok
+    if bd = st.node[:block_download], do: BlockDownload.mark(bd, self(), hash), else: true
   end
 
   # --- getheaders serving ----------------------------------------------------
@@ -1799,25 +1899,31 @@ defmodule Exnode.P2P.Peer do
           {:ok, h, raw} when tip_h - h >= @max_blocktxn_depth ->
             {:ok, push(st, {:block, raw})}
 
+          # Only the txs' extents are needed, not the decoded block: a 34-byte
+          # request is below the DecodeBudget, and every peer decoding a
+          # recent 4 MB block at once (tens of MB of heap each) is an OOM.
           {:ok, _h, raw} ->
-            {:ok, b} = Block.decode_exact(raw)
+            {:ok, ranges} = Block.tx_ranges(raw)
 
             # Indexes strictly increase (decode_getblocktxn): the last is the largest.
-            if List.last(indexes) >= length(b.txs) do
+            if List.last(indexes) >= tuple_size(ranges) do
               misbehaving(st, "getblocktxn with out-of-bounds tx indices")
             else
-              txs = select_txs(b.txs, indexes)
-              {:ok, push(st, {:blocktxn, CompactBlock.encode_blocktxn(hash, txs)})}
+              txs = select_txs(raw, ranges, indexes)
+              {:ok, push(st, {:blocktxn, CompactBlock.encode_blocktxn_raw(hash, txs)})}
             end
         end
     end
   end
 
   @doc false
-  # The txs at `indexes` (all in range): one tuple, O(1) per index.
-  def select_txs(txs, indexes) do
-    t = List.to_tuple(txs)
-    Enum.map(indexes, &elem(t, &1))
+  # The serialized txs at `indexes` (all in range), sliced from the block:
+  # O(1) per index, no copy.
+  def select_txs(raw, ranges, indexes) do
+    Enum.map(indexes, fn i ->
+      {offset, len} = elem(ranges, i)
+      binary_part(raw, offset, len)
+    end)
   end
 
   # Core SendMessages block announcements: cmpctblock to peers that asked for
@@ -2178,6 +2284,7 @@ defmodule Exnode.P2P.Peer do
         |> maybe_request_blocks()
         |> maybe_announce_blocks()
         |> check_headers_sync_timeout(t)
+        |> consider_eviction(t)
     end
   end
 

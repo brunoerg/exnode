@@ -40,7 +40,15 @@ defmodule Exnode.Address do
   end
 
   @doc "Core `DecodeDestination` + `GetScriptForDestination`: `{:ok, scriptPubKey}` or `{:error, reason}`."
+  # No address is longer than a bech32 string (90); the input may be any
+  # bytes (an HTTP path).
   def to_script(addr, network) do
+    if byte_size(addr) <= 90 and String.valid?(addr),
+      do: decode_destination(addr, network),
+      else: {:error, :invalid}
+  end
+
+  defp decode_destination(addr, network) do
     pre = prefixes(network)
 
     case decode_segwit(pre.hrp, addr) do
@@ -81,8 +89,18 @@ defmodule Exnode.Address do
   defp b58_digits(0, acc), do: acc
   defp b58_digits(n, acc), do: b58_digits(div(n, 58), [Enum.at(@b58, rem(n, 58)) | acc])
 
-  def base58check_decode(str) do
-    chars = String.to_charlist(str)
+  @doc """
+  Core `DecodeBase58Check(str, ret, max_ret_len)`: the payload, at most
+  `max_len` bytes. Longer input is rejected before decoding, which is
+  quadratic in its length.
+  """
+  def base58check_decode(str, max_len \\ 21)
+
+  def base58check_decode(str, max_len) when byte_size(str) > div((max_len + 4) * 138, 100) + 1,
+    do: {:error, :invalid}
+
+  def base58check_decode(str, max_len) do
+    chars = :binary.bin_to_list(str)
 
     with true <- Enum.all?(chars, &(&1 in @b58)) || :error do
       leading = Enum.take_while(chars, &(&1 == ?1)) |> length()
@@ -91,7 +109,7 @@ defmodule Exnode.Address do
 
       case bin do
         <<payload::binary-size(byte_size(bin) - 4), ck::binary-size(4)>>
-        when byte_size(bin) >= 4 ->
+        when byte_size(bin) >= 4 and byte_size(bin) <= max_len + 4 ->
           if binary_part(Exnode.Crypto.Hash.hash256(payload), 0, 4) == ck,
             do: {:ok, payload},
             else: {:error, :checksum}

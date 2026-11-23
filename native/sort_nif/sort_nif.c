@@ -20,7 +20,7 @@
 
 typedef struct {
     const unsigned char *p; /* record start (its key) */
-    uint32_t len;           /* whole record */
+    size_t len;             /* whole record; ks + 4 + a 32-bit length can pass 4 GiB */
 } rec_t;
 
 
@@ -56,17 +56,17 @@ static ERL_NIF_TERM sort_packed(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     /* Count and bounds-check the records. */
     size_t n = 0, off = 0;
     while (off < in.size) {
-        size_t len;
+        uint64_t len; /* 64-bit so ks + vs cannot wrap where size_t is 32 bits */
         if (vs > 0) {
-            len = (size_t)ks + vs;
+            len = (uint64_t)ks + vs;
         } else {
             if (in.size - off < (size_t)ks + 4) return enif_make_badarg(env);
             const unsigned char *l = in.data + off + ks;
             uint32_t vl = ((uint32_t)l[0] << 24) | ((uint32_t)l[1] << 16) | ((uint32_t)l[2] << 8) | l[3];
-            len = (size_t)ks + 4 + vl;
+            len = (uint64_t)ks + 4 + vl;
         }
-        if (in.size - off < len) return enif_make_badarg(env);
-        off += len;
+        if ((uint64_t)(in.size - off) < len) return enif_make_badarg(env);
+        off += (size_t)len;
         n++;
     }
 
@@ -74,7 +74,7 @@ static ERL_NIF_TERM sort_packed(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     unsigned char *out = enif_make_new_binary(env, in.size, &out_term);
     if (out == NULL) return enif_raise_exception(env, enif_make_atom(env, "enomem"));
     if (n < 2) {
-        memcpy(out, in.data, in.size);
+        if (in.size > 0) memcpy(out, in.data, in.size); /* an empty binary may have no data */
         return out_term;
     }
 
@@ -92,7 +92,7 @@ static ERL_NIF_TERM sort_packed(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
             (((uint32_t)in.data[off + ks] << 24) | ((uint32_t)in.data[off + ks + 1] << 16) |
              ((uint32_t)in.data[off + ks + 2] << 8) | in.data[off + ks + 3]);
         recs[i].p = in.data + off;
-        recs[i].len = (uint32_t)len;
+        recs[i].len = len;
         off += len;
     }
 

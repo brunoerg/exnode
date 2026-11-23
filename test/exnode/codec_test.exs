@@ -64,6 +64,71 @@ defmodule Exnode.CodecTest do
     end
   end
 
+  describe "Block.tx_ranges" do
+    defp block_of(tx_raws),
+      do: IO.iodata_to_binary([<<0::640>>, CompactSize.encode(length(tx_raws)), tx_raws])
+
+    test "agrees with decode on every Core tx vector, one block of them all" do
+      raws =
+        for f <- ["tx_valid.json", "tx_invalid.json"],
+            [[_ | _], hex, _] <- Jason.decode!(File.read!(Path.join(@fixtures, f))),
+            raw = Base.decode16!(hex, case: :mixed),
+            do: raw
+
+      bin = block_of(raws)
+      {:ok, b} = Block.decode_exact(bin)
+      {:ok, ranges} = Block.tx_ranges(bin)
+      assert Tuple.to_list(ranges) |> Enum.map(fn {o, l} -> binary_part(bin, o, l) end) == raws
+      assert Enum.map(b.txs, & &1.raw) == raws
+    end
+
+    test "agrees with decode on the regtest fixture chain" do
+      path = Path.expand("../fixtures/regtest/chain150.bin", __DIR__)
+
+      for raw <- Exnode.Test.BlockBuilder.read_chain(path) do
+        {:ok, b} = Block.decode_exact(raw)
+        {:ok, ranges} = Block.tx_ranges(raw)
+
+        assert for({o, l} <- Tuple.to_list(ranges), do: binary_part(raw, o, l)) ==
+                 Enum.map(b.txs, & &1.raw)
+      end
+    end
+
+    test "fails where decode fails" do
+      inp = [<<0::256>>, <<0::32>>, <<0>>, <<0xFFFFFFFF::32>>]
+      ok = <<1::little-32, 0, 0, 0::little-32>>
+
+      for bad <- [
+            # superfluous witness record
+            IO.iodata_to_binary([<<2::little-32, 0, 1, 1>>, inp, <<0>>, <<0>>, <<0::32>>]),
+            # unknown optional data
+            IO.iodata_to_binary([<<2::little-32, 0, 2, 0, 0>>, <<0::32>>]),
+            # truncated
+            <<1, 0, 0>>,
+            # non-canonical CompactSize input count
+            <<1::little-32, 253, 1, 0>>
+          ] do
+        bin = block_of([bad])
+        assert {:error, r} = Block.decode_exact(bin)
+        assert Block.tx_ranges(bin) == {:error, r}
+      end
+
+      assert {:error, :trailing_data} = Block.tx_ranges(block_of([ok]) <> <<0>>)
+      assert {:error, :truncated} = Block.tx_ranges(<<0::320>>)
+      # A count larger than the txs present.
+      assert {:error, :truncated} = Block.tx_ranges(<<0::640, 2>> <> ok)
+    end
+
+    property "agrees with decode on generated txs" do
+      check all(txs <- StreamData.list_of(Exnode.Test.Generators.tx(), max_length: 5)) do
+        raws = for tx <- txs, do: IO.iodata_to_binary(Tx.encode(tx))
+        bin = block_of(raws)
+        {:ok, ranges} = Block.tx_ranges(bin)
+        assert for({o, l} <- Tuple.to_list(ranges), do: binary_part(bin, o, l)) == raws
+      end
+    end
+  end
+
   describe "CompactSize" do
     test "non-canonical encodings are rejected" do
       assert catch_throw(CompactSize.decode(<<253, 252, 0>>)) ==

@@ -7,7 +7,8 @@ defmodule Exnode.P2P.RefillTest do
   * the received→checked gap: a block being checked is never selected again;
     a failed check makes it selectable; garbage from a non-owner changes
     nothing; disconnects release every reservation and byte;
-  * cursors follow the peer's best chain and reset on a fork;
+  * cursors follow the peer's best chain and reset on a fork, and below a
+    block that is disconnected or fails;
   * the byte budget gates requests, never data, and always lets the
     earliest missing block through;
   * wakeups are coalesced and go only to peers that found nothing;
@@ -348,6 +349,28 @@ defmodule Exnode.P2P.RefillTest do
     b20 = Enum.at(entries, 20)
     :ok = GenServer.call(t.chain, {:unhold, b20.hash})
     send(t.bd, {:block_invalid, b20.hash, {:mutated, "bad-txnmrklroot"}})
+    assert 20 in heights(entries, BlockDownload.request(t.bd, a, best.hash))
+  end
+
+  # Regression: a block a reorg disconnects below the witness-pruning
+  # horizon is no longer held. Peers whose cursor had passed it never
+  # selected it again, and the old branch could not be reconnected.
+  test "a held block disconnected and no longer held is selected again by a peer whose cursor passed it" do
+    {idx, entries} = chain(100)
+    t = start(entries, idx)
+    a = self()
+    best = List.last(entries)
+    hold(t, Enum.map(Enum.slice(entries, 1..50), & &1.hash))
+    assert heights(entries, BlockDownload.request(t.bd, a, best.hash)) == Enum.to_list(51..66)
+
+    for h <- Map.keys(BlockDownload.in_flight(t.bd)) do
+      BlockDownload.received(t.bd, a, h, 1)
+      BlockDownload.checked(t.bd, a, h, false)
+    end
+
+    b20 = Enum.at(entries, 20)
+    :ok = GenServer.call(t.chain, {:unhold, b20.hash})
+    send(t.bd, {:block_disconnected, b20.hash})
     assert 20 in heights(entries, BlockDownload.request(t.bd, a, best.hash))
   end
 end

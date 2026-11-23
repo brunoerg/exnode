@@ -22,18 +22,20 @@ defmodule Exnode.REST.Esplora do
   (`Archive.read_tx/2`), never by rebuilding its block; prevouts are point
   reads, batched per response (`Archive.outputs/2`), with the mempool looked
   up once per tx (or once per `/txs` page). No request copies the mempool:
-  each asks it for what it needs (`Mempool.script_txs/2` from the mempool's
-  script index for the address endpoints, `Mempool.spenders/2` for
-  outspends, `Mempool.fee_rates/1` for `/mempool`). Confirmed spenders come
+  each asks it for what it needs (`Mempool.script_txs/3` from the mempool's
+  script index for the address endpoints, at most `:mempool_txs_limit` txs,
+  `Mempool.spenders/2` for outspends, `Mempool.backlog/1`, cached, for
+  `/mempool`). Confirmed spenders come
   from the archive's spend records (`Archive.spenders/2`: one seek per
   output, one tx read per spender; no address history, and no scripthash
   index needed). An address's confirmed
   stats are the index's per-script totals (`Scripthash.totals/2`), not a
   history scan; `/utxo` streams the history in the request's process,
   holding only the outputs unspent so far and answering 400 past 500 of
-  them (electrs' `--utxos-limit`; `:utxos_limit` in the context), and
-  `/txs` pages read only their rows (a reverse seek from the last seen
-  tx).
+  them (electrs' `--utxos-limit`; `:utxos_limit` in the context) or past
+  `:utxos_scan_limit` history rows, and `/txs` pages read only their rows
+  (a reverse seek from the last seen tx). The block endpoints rebuild the
+  block from the archive, at most two at a time (`:block_budget`).
   """
   use Plug.Router, copy_opts_to_assign: :opts
 
@@ -44,6 +46,7 @@ defmodule Exnode.REST.Esplora do
   alias Exnode.Crypto.Hash
   alias Exnode.Index.Scripthash
   alias Exnode.Mempool.Policy
+  alias Exnode.P2P.DecodeBudget
 
   # Each connection process is an archive reader the fd budget counts.
   plug(:limit_reads)
@@ -97,8 +100,8 @@ defmodule Exnode.REST.Esplora do
   end
 
   get "/block/:hash/txids" do
-    with_block(conn, conn.assigns.opts, hash, fn _e, b ->
-      json(conn, Enum.map(b.txs, &Hash.to_hex(&1.txid)))
+    with_block(conn, conn.assigns.opts, hash, &block_txids/2, fn _e, txids ->
+      json(conn, Enum.map(txids, &Hash.to_hex/1))
     end)
   end
 
@@ -151,18 +154,28 @@ defmodule Exnode.REST.Esplora do
   get "/tx/:txid/merkle-proof" do
     with_tx(conn, conn.assigns.opts, txid, fn
       {:block, _tx, _header, e, pos} ->
-        a = reader(conn.assigns.opts)
-        {:ok, b} = Archive.read_block_txs(a, Archive.block_id(a, e.hash))
-        json(conn, %{block_height: e.height, merkle: merkle_branch(b, pos), pos: pos})
+        with_block(conn, conn.assigns.opts, Hash.to_hex(e.hash), &block_txids/2, fn _e, txids ->
+          json(conn, %{block_height: e.height, merkle: merkle_branch(txids, pos), pos: pos})
+        end)
 
       _ ->
         err(conn, 400, "Transaction not confirmed")
     end)
   end
 
-  post "/tx" do
-    {:ok, body, conn} = Plug.Conn.read_body(conn)
+  # The hex of a standard-size tx (Core MAX_STANDARD_TX_WEIGHT; a larger
+  # one is not accepted anyway), with room for surrounding whitespace.
+  @max_tx_body 2 * 400_000 + 1_024
 
+  post "/tx" do
+    case Plug.Conn.read_body(conn, length: @max_tx_body) do
+      {:ok, body, conn} -> submit_tx(conn, body)
+      {:more, _, conn} -> err(conn, 413, "Request body too large")
+      {:error, _} -> err(conn, 400, "Invalid transaction hex")
+    end
+  end
+
+  defp submit_tx(conn, body) do
     with {:ok, raw} <- Base.decode16(String.trim(body), case: :mixed),
          {:ok, tx} <- Tx.decode_exact(raw) do
       case Mempool.accept(conn.assigns.opts.ctx.mempool, tx, unbroadcast: true) do
@@ -250,30 +263,18 @@ defmodule Exnode.REST.Esplora do
           400,
           "Too many unspent transaction outputs (>#{utxos_limit(opts)}). Contact support to raise limits."
         )
+
+      {:error, :too_many_rows} ->
+        too_popular(conn)
     end
   end
 
+  # electrs' TooPopular error.
+  defp too_popular(conn), do: err(conn, 400, "Too many history entries")
+
   # --- mempool / fees ----------------------------------------------------------------
 
-  get "/mempool" do
-    {pairs, total_vsize} = Mempool.fee_rates(conn.assigns.opts.ctx.mempool)
-
-    hist =
-      pairs
-      |> Enum.map(fn {fee, vsize} -> {fee / vsize, vsize} end)
-      |> Enum.sort(:desc)
-      |> Enum.chunk_by(fn {r, _} -> round(r * 10) end)
-      |> Enum.map(fn group ->
-        [elem(hd(group), 0), Enum.reduce(group, 0, &(&2 + elem(&1, 1)))]
-      end)
-
-    json(conn, %{
-      count: length(pairs),
-      vsize: total_vsize,
-      total_fee: Enum.reduce(pairs, 0, &(&2 + elem(&1, 0))),
-      fee_histogram: hist
-    })
-  end
+  get("/mempool", do: json(conn, Mempool.backlog(conn.assigns.opts.ctx.mempool)))
 
   get("/fee-estimates", do: json(conn, %{}))
 
@@ -313,15 +314,35 @@ defmodule Exnode.REST.Esplora do
     end
   end
 
-  defp with_block(conn, opts, h, f) do
+  # A block's reconstruction holds several times its 4 MB in the request's
+  # process: the REST server runs at most a few at once (`:block_budget` in
+  # the context, a `DecodeBudget` each one takes a whole block from).
+  @max_block_bytes 4_000_000
+  def block_budget_bytes, do: 2 * @max_block_bytes
+
+  defp with_block(conn, opts, h, read \\ &Archive.read_block_txs/2, f) do
     with_header(conn, opts, h, fn e ->
       a = reader(opts)
 
-      case (id = Archive.block_id(a, e.hash)) && Archive.read_block_txs(a, id) do
+      load = fn ->
+        case (id = Archive.block_id(a, e.hash)) && read.(a, id) do
+          {:ok, b} -> {:ok, b}
+          _ -> :error
+        end
+      end
+
+      case DecodeBudget.with_budget(ctx(opts)[:block_budget], @max_block_bytes, load) do
         {:ok, b} -> f.(e, b)
+        :unavailable -> err(conn, 503, "Service unavailable")
         _ -> err(conn, 404, "Block not found")
       end
     end)
+  end
+
+  # The txids from the base records only (no witness read, no block decode).
+  defp block_txids(a, id) do
+    with {:ok, facts} <- Archive.read_index_facts(a, id),
+         do: {:ok, for({txid, _, _} <- facts.txs, do: txid)}
   end
 
   defp active?(opts, e) do
@@ -613,9 +634,8 @@ defmodule Exnode.REST.Esplora do
   end
 
   # Core-style merkle branch for tx `pos` (hex, display order).
-  defp merkle_branch(b, pos) do
-    level = Enum.map(b.txs, & &1.txid)
-    branch(level, pos, []) |> Enum.map(&Hash.to_hex/1)
+  defp merkle_branch(txids, pos) do
+    branch(txids, pos, []) |> Enum.map(&Hash.to_hex/1)
   end
 
   defp branch([_], _pos, acc), do: Enum.reverse(acc)
@@ -649,17 +669,28 @@ defmodule Exnode.REST.Esplora do
     end
   end
 
-  defp require_index(conn, opts, f),
-    do:
-      if(ctx(opts)[:scripthash_index],
-        do: f.(),
-        else: err(conn, 400, "Address indexing is disabled")
-      )
+  defp require_index(conn, opts, f) do
+    if ctx(opts)[:scripthash_index],
+      do: f.(),
+      else: err(conn, 400, "Address indexing is disabled")
+  catch
+    {__MODULE__, :too_popular} -> too_popular(conn)
+  end
 
   # electrs' default `--utxos-limit`: `/utxo` answers at most this many
   # confirmed outputs.
   @utxos_limit 500
   defp utxos_limit(opts), do: ctx(opts)[:utxos_limit] || @utxos_limit
+
+  # `/utxo` scans at most this many history rows: a script that keeps
+  # few outputs unspent can have millions, each request a scan of them.
+  @utxos_scan_limit 250_000
+  defp utxos_scan_limit(opts), do: ctx(opts)[:utxos_scan_limit] || @utxos_scan_limit
+
+  # An address endpoint copies at most this many of the script's mempool
+  # txs out of the (single) mempool process; past it, a 400.
+  @mempool_txs_limit 1_000
+  defp mempool_txs_limit(opts), do: ctx(opts)[:mempool_txs_limit] || @mempool_txs_limit
 
   # height => the active chain's header entry, for the heights of `rows`
   # whose indexed block is that one. Between a disconnect and the index's
@@ -679,11 +710,15 @@ defmodule Exnode.REST.Esplora do
 
   # The mempool txs touching the script, oldest first, from the mempool's
   # script index (only those txs are copied out; the outputs they spend
-  # come with them, so nothing is read from the archive).
+  # come with them, so nothing is read from the archive). Past the limit,
+  # thrown to `require_index/3`, which answers 400.
   defp mempool_rows(opts, {sh, _spk}) do
-    case Mempool.script_txs(ctx(opts).mempool, sh) do
+    case Mempool.script_txs(ctx(opts).mempool, sh, mempool_txs_limit(opts)) do
       {:error, :not_indexed} ->
         raise "the mempool keeps no script index (start it with index_scripts: true)"
+
+      {:error, :too_many} ->
+        throw({__MODULE__, :too_popular})
 
       txs ->
         for t <- txs do
@@ -807,7 +842,13 @@ defmodule Exnode.REST.Esplora do
   # the index's rows are streamed, holding only the outputs unspent so far
   # (`Scripthash.utxos/3`), never the whole history.
   defp utxos(opts, {sh, _} = script) do
-    with {:ok, rows} <- Scripthash.utxos(ctx(opts).scripthash_index, sh, utxos_limit(opts)) do
+    with {:ok, rows} <-
+           Scripthash.utxos(
+             ctx(opts).scripthash_index,
+             sh,
+             utxos_limit(opts),
+             utxos_scan_limit(opts)
+           ) do
       {:ok, utxos(opts, script, rows)}
     end
   end

@@ -96,6 +96,33 @@ defmodule Exnode.P2P.PeerAddrTest do
     assert AddrMan.size(n.addrman, :torv3) == 0
   end
 
+  # Regression: an addrv2 IPv6 address carrying an IPv4 one (::ffff:a.b.c.d)
+  # was stored as IPv6. It escaped the local/private checks (so ::ffff:127.0.0.1
+  # or ::ffff:10.0.0.1 could be dialled), sat in a single IPv6 netgroup apart
+  # from its IPv4 /16, and counted as an IPv6 address. Core reads it as
+  # invalid, as it does TORv2 and internal addresses embedded in IPv6.
+  test "addrv2 IPv6 with an embedded IPv4, TORv2 or internal prefix is not stored", %{n: n} do
+    now = System.os_time(:second)
+    {pid, sock} = FakePeer.connect_from(n, node: %{addrman: n.addrman})
+    handshaked(pid)
+    assert [{"getaddr", _}] = FakePeer.recv(sock, ["getaddr"], 1)
+
+    embedded =
+      for a <- [
+            <<0::80, 0xFF, 0xFF, 127, 0, 0, 1>>,
+            <<0::80, 0xFF, 0xFF, 10, 0, 0, 1>>,
+            <<0::80, 0xFF, 0xFF, 8, 8, 8, 8>>,
+            <<0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43, 1::80>>,
+            <<0xFD, 0x6B, 0x88, 0xC0, 0x87, 0x24, 1::80>>
+          ],
+          do: %{time: now - 3600, services: 9, net: :ipv6, addr: a, port: 18444}
+
+    :ok = FakePeer.send_msgs(sock, {:addrv2, embedded ++ ipv4s(1, now)})
+    barrier(sock)
+    wait_until(fn -> AddrMan.size(n.addrman, :ipv4) == 1 end)
+    assert AddrMan.size(n.addrman, :ipv6) == 0
+  end
+
   # The address book's entry for `a` (time, services, ...), or nil.
   defp entry(addrman, a) do
     t = :sys.get_state(addrman).t

@@ -5,8 +5,9 @@ defmodule Exnode.P2P.PeerProtocolTest do
 
   * version: a full-relay outbound peer without NETWORK | WITNESS, a
     version below MIN_PEER_PROTO_VERSION, and an inbound connection to
-    ourselves (our nonce) are disconnected; a second version or verack is
-    ignored, as is anything before version;
+    ourselves (the nonce of one of our outbound connections still in the
+    handshake) are disconnected; every connection sends its own nonce; a
+    second version or verack is ignored, as is anything before version;
   * wtxidrelay or sendaddrv2 after verack disconnects;
   * after the handshake, oversized headers (by the count alone), oversized
     complete inv / getdata / addr / addrv2 and a non-continuous headers
@@ -17,7 +18,11 @@ defmodule Exnode.P2P.PeerProtocolTest do
   * timeouts on a mock clock, run by explicit ticks: no handshake within
     60 s, no pong within 20 min, and the headers-sync deadline: a peer
     that leaves our best header old past it is disconnected once another
-    preferred peer could sync instead.
+    preferred peer could sync instead;
+  * chain-sync eviction (Core ConsiderEviction): an outbound peer whose
+    best known block stays below our tip's work is probed with getheaders
+    after 20 min and disconnected 2 min later; up to 4 outbound full-relay
+    peers with our tip's work are protected.
   """
   use Exnode.NodeCase
 
@@ -120,22 +125,61 @@ defmodule Exnode.P2P.PeerProtocolTest do
       assert_stopped(ref, {:obsolete_version, old})
     end
 
-    test "an inbound connection carrying our own nonce is a connection to ourselves",
-         %{n: n, port: port} do
-      before = for {_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p
-      sock = FakePeer.dial(port, handshake: false)
-
-      new_peers = fn ->
-        for({_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p) -- before
+    # Regression: the node sent one static version nonce on every connection,
+    # linking them (block-relay-only ones too) to each other and to the node,
+    # and the self-connection check compared against that one value. Core
+    # sends a per-connection nLocalHostNonce and CheckIncomingNonce matches
+    # an inbound version against outbound connections still in the handshake.
+    test "every connection sends its own version nonce", %{n: n, port: port} do
+      nonce_of = fn sock ->
+        [{"version", pl}] = FakePeer.recv(sock, "version", 1)
+        {:ok, {:version, v}} = Message.decode("version", pl)
+        v.nonce
       end
 
-      wait_until(fn -> length(new_peers.()) == 1 end)
-      [pid] = new_peers.()
+      inbound =
+        for _ <- 1..2 do
+          sock = FakePeer.dial(port, handshake: false)
+          :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version()})
+          nonce_of.(sock)
+        end
 
-      ref = Process.monitor(pid)
-      nonce = :sys.get_state(pid).node.nonce
-      :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version(nonce: nonce)})
+      {_pid, sock, _clock, _ref} = connect(n, handshake: false)
+      nonces = [nonce_of.(sock) | inbound]
+      assert length(Enum.uniq(nonces)) == 3
+    end
+
+    test "an inbound version carrying the nonce of our outbound handshake is a connection to ourselves",
+         %{n: n, port: port} do
+      {_pid, out_sock, _clock, _ref} = connect(n, handshake: false)
+      [{"version", pl}] = FakePeer.recv(out_sock, "version", 1)
+      {:ok, {:version, %{nonce: nonce}}} = Message.decode("version", pl)
+
+      self_conn = fn ->
+        before = for {_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p
+        sock = FakePeer.dial(port, handshake: false)
+
+        new_peers = fn ->
+          for({_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p) -- before
+        end
+
+        wait_until(fn -> length(new_peers.()) == 1 end)
+        [pid] = new_peers.()
+        ref = Process.monitor(pid)
+        :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version(nonce: nonce)})
+        {pid, ref}
+      end
+
+      {_, ref} = self_conn.()
       assert_stopped(ref, :connected_to_self)
+
+      # Core fSuccessfullyConnected: once the outbound handshake completes
+      # its nonce no longer counts.
+      :ok = FakePeer.send_msgs(out_sock, [{:version, FakePeer.version()}, :verack])
+      wait_until(fn -> Registry.lookup(n.local_nonces, nonce) == [] end)
+      {pid, ref} = self_conn.()
+      wait_until(fn -> :sys.get_state(pid).version != nil end)
+      refute_received {:DOWN, ^ref, _, _, _}
     end
 
     test "a second version is ignored", %{n: n} do
@@ -260,6 +304,14 @@ defmodule Exnode.P2P.PeerProtocolTest do
     end
   end
 
+  # The peer announces our active tip (genesis): its best known block then
+  # has our tip's work.
+  defp announce_tip(n, pid, sock) do
+    tip = Exnode.Chain.State.view_tip(Exnode.Chain.State.view(n.chain_state))
+    :ok = FakePeer.send_msgs(sock, {:inv, [%{type: :block, hash: tip.hash}]})
+    wait_until(fn -> :sys.get_state(pid).best_known != nil end)
+  end
+
   describe "timeouts" do
     test "no handshake within 60 s", %{n: n} do
       {pid, _sock, clock, ref} = connect(n, handshake: false)
@@ -291,6 +343,8 @@ defmodule Exnode.P2P.PeerProtocolTest do
       bd = %{block_download: n.block_download}
       {pid, sock, clock, ref} = connect(n, node: bd)
       handshaked(pid)
+      # The peer has our tip, so chain-sync eviction leaves it alone.
+      announce_tip(n, pid, sock)
       # The first pass starts headers sync (regtest genesis is years old,
       # deadline = now + 15 min + 1 ms per expected header) and registers
       # the peer as preferred with BlockDownload.
@@ -332,6 +386,85 @@ defmodule Exnode.P2P.PeerProtocolTest do
       :ok = Clock.tick(pid)
       assert Process.alive?(pid)
       assert :sys.get_state(pid).headers_sync_timeout == nil
+    end
+  end
+
+  describe "chain-sync eviction" do
+    # Regression: outbound peers were never checked for chain work. A peer
+    # that completed the handshake and answered pings, but never announced
+    # a block with our tip's work, held its outbound slot forever.
+    for ct <- [:outbound_full_relay, :block_relay] do
+      test "a #{ct} peer that never reaches our tip's work is disconnected", %{n: n} do
+        {pid, sock, clock, ref} = connect(n, conn_type: unquote(ct))
+        handshaked(pid)
+        # The first pass starts sync and sets the 20 min chain-sync deadline.
+        :ok = Clock.tick(pid)
+        deadline = Clock.now(clock) + 20 * 60
+
+        responsive_until(pid, sock, clock, deadline)
+        Clock.advance(clock, deadline - Clock.now(clock))
+        :ok = Clock.tick(pid)
+        msgs = until_pong(sock, System.unique_integer([:positive]))
+        refute Enum.any?(msgs, &match?({:getheaders, _}, &1))
+
+        # Past it: one getheaders probe and 2 more minutes.
+        Clock.advance(clock, 1)
+        :ok = Clock.tick(pid)
+        msgs = until_pong(sock, System.unique_integer([:positive]))
+        assert Enum.any?(msgs, &match?({:getheaders, _}, &1))
+
+        Clock.advance(clock, 120)
+        :ok = Clock.tick(pid)
+        assert Process.alive?(pid)
+        Clock.advance(clock, 1)
+        :ok = Clock.tick(pid)
+        assert_stopped(ref, :chain_sync_timeout)
+      end
+    end
+
+    test "a peer that answers the probe with our tip's work is kept", %{n: n} do
+      {pid, sock, clock, _ref} = connect(n, conn_type: :block_relay)
+      handshaked(pid)
+      :ok = Clock.tick(pid)
+      deadline = :sys.get_state(pid).chain_sync.timeout
+      responsive_until(pid, sock, clock, deadline)
+      Clock.advance(clock, deadline - Clock.now(clock) + 1)
+      :ok = Clock.tick(pid)
+      assert :sys.get_state(pid).chain_sync.sent_getheaders
+
+      announce_tip(n, pid, sock)
+      Clock.advance(clock, 121)
+      :ok = Clock.tick(pid)
+      until_pong(sock, System.unique_integer([:positive]))
+      assert Process.alive?(pid)
+      assert :sys.get_state(pid).chain_sync.timeout == nil
+    end
+
+    test "a manual peer is not checked", %{n: n} do
+      {pid, sock, clock, _ref} = connect(n, conn_type: :manual)
+      handshaked(pid)
+      :ok = Clock.tick(pid)
+      assert :sys.get_state(pid).sync_started
+      assert :sys.get_state(pid).chain_sync.timeout == nil
+      responsive_until(pid, sock, clock, Clock.now(clock) + 30 * 60)
+      assert :sys.get_state(pid).chain_sync.timeout == nil
+    end
+
+    test "at most 4 outbound full-relay peers with our tip's work are protected", %{n: n} do
+      {tip, ""} = Exnode.Codec.Header.decode(Exnode.Chain.Headers.best_header(n.headers).raw)
+      h = BB.next_header(tip)
+
+      peers =
+        for ct <- [:block_relay | List.duplicate(:outbound_full_relay, 5)] do
+          {pid, sock, _clock, _ref} = connect(n, conn_type: ct)
+          handshaked(pid)
+          :ok = FakePeer.send_msgs(sock, {:headers, [h]})
+          wait_until(fn -> :sys.get_state(pid).best_known != nil end)
+          {ct, pid}
+        end
+
+      protected = for {ct, pid} <- peers, :sys.get_state(pid).chain_sync.protect, do: ct
+      assert protected == List.duplicate(:outbound_full_relay, 4)
     end
   end
 end

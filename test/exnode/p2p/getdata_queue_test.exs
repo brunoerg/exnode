@@ -166,10 +166,11 @@ defmodule Exnode.P2P.GetdataQueueTest do
   end
 
   test "select_txs: 16k indexes into a 16k-tx block in linear time" do
-    txs = Enum.to_list(1..16_384)
+    raw = IO.iodata_to_binary(for i <- 0..16_383, do: <<i::32>>)
+    ranges = List.to_tuple(for i <- 0..16_383, do: {i * 4, 4})
     idx = Enum.shuffle(0..16_383)
-    {us, got} = :timer.tc(fn -> Peer.select_txs(txs, idx) end)
-    assert got == Enum.map(idx, &(&1 + 1))
+    {us, got} = :timer.tc(fn -> Peer.select_txs(raw, ranges, idx) end)
+    assert got == Enum.map(idx, &<<&1::32>>)
     assert us < 2_000_000
   end
 end

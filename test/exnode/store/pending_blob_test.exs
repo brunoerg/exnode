@@ -51,7 +51,7 @@ defmodule Exnode.Store.PendingBlobTest do
     files = blob_files(dir)
     assert files != []
     Enum.each(files, &File.rm!/1)
-    assert {:error, _} = KV.get(kv, :pending, first)
+    assert_raise KV.Error, fn -> KV.get(kv, :pending, first) end
 
     assert KV.fold_keys(kv, :pending, <<>>, [], &[&1 | &2]) |> Enum.reverse() ==
              keys ++ [<<9::256>>]

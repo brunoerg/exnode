@@ -24,6 +24,7 @@ defmodule Exnode.P2P.NetAddr do
 
   @ipv4_in_ipv6 <<0::80, 0xFF, 0xFF>>
   @internal_in_ipv6 <<0xFD, 0x6B, 0x88, 0xC0, 0x87, 0x24>>
+  @torv2_in_ipv6 <<0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43>>
 
   @doc """
   Core `CNetAddr::SetInternal(name)`: a placeholder address standing for a
@@ -88,10 +89,23 @@ defmodule Exnode.P2P.NetAddr do
 
   def valid?(%{net: net, addr: a} = x)
       when net in [:ipv4, :ipv6, :torv3, :i2p, :cjdns] and is_binary(a) do
-    size_ok?(net, a) and not (rfc3849?(x) or rfc9637?(x))
+    size_ok?(net, a) and not (rfc3849?(x) or rfc9637?(x) or embedded_in_ipv6?(x))
   end
 
   def valid?(_), do: false
+
+  # Core never holds these prefixes as IPv6: SetLegacyIPv6 maps IPv4-mapped
+  # to IPv4 and internal to NET_INTERNAL; UnserializeV2Stream (BIP155) reads
+  # IPv4-mapped and TORv2 as invalid. Here one comes from a peer's addrv2
+  # (decoded as is, so it still uses a rate-limit token, as Core's does) or a
+  # peers.dat written before this check.
+  defp embedded_in_ipv6?(%{net: :ipv6, addr: <<0::80, 0xFF, 0xFF, _::binary-size(4)>>}),
+    do: true
+
+  defp embedded_in_ipv6?(%{net: :ipv6, addr: <<p::binary-size(6), _::binary-size(10)>>}),
+    do: p in [@torv2_in_ipv6, @internal_in_ipv6]
+
+  defp embedded_in_ipv6?(_), do: false
 
   defp size_ok?(:ipv4, a), do: byte_size(a) == 4
   defp size_ok?(:ipv6, a), do: byte_size(a) == 16

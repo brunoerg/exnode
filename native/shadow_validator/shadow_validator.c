@@ -23,7 +23,8 @@
  * Fatal kernel errors write to stderr and exit(2). exnode treats that as a
  * shadow failure and halts.
  *
- * Shutdown: on EOF, or when exnode has closed the pipe while a response is
+ * Shutdown: on EOF, on a bad or cut-short request frame (exit 3) or event
+ * overflow (exit 4), or when exnode has closed the pipe while a response is
  * being written (EPIPE; SIGPIPE is ignored so it cannot kill the process),
  * the chainstate manager is destroyed, which flushes Core's coins cache and
  * block index (btck_chainstate_manager_destroy -> ForceFlushStateToDisk).
@@ -85,11 +86,11 @@ static void send_frame(const uint8_t *buf, size_t n) {
 
 static void send_error(const char *reason) {
     size_t n = strlen(reason);
-    uint8_t *buf = malloc(n + 1);
-    buf[0] = 1;
-    memcpy(buf + 1, reason, n);
-    send_frame(buf, n + 1);
-    free(buf);
+    uint8_t hdr[5];
+    put32(hdr, (uint32_t)(n + 1));
+    hdr[4] = 1;
+    write_full(hdr, sizeof hdr);
+    write_full(reason, n);
 }
 
 /* block_checked runs synchronously inside process_block (validation.cpp:
@@ -151,7 +152,8 @@ int main(int argc, char **argv) {
     if (!parse_chain(argv[1], &chain_type)) { fprintf(stderr, "unknown chain %s\n", argv[1]); return 64; }
     const char *datadir = argv[2];
     char blocksdir[4096];
-    snprintf(blocksdir, sizeof blocksdir, "%s/blocks", datadir);
+    int bn = snprintf(blocksdir, sizeof blocksdir, "%s/blocks", datadir);
+    if (bn < 0 || (size_t)bn >= sizeof blocksdir) { fprintf(stderr, "datadir path too long\n"); return 64; }
 
     signal(SIGPIPE, SIG_IGN);
     btck_logging_disable();
@@ -183,15 +185,17 @@ int main(int argc, char **argv) {
     btck_chainstate_manager_options_destroy(mopts);
     if (!cm) { fprintf(stderr, "chainstate manager create failed\n"); return 1; }
 
+    /* Every exit from the loop goes through the flush below, errors included. */
+    int status = 0;
     for (;;) {
         uint8_t hdr[4];
         int r = read_full(hdr, 4);
         if (r == 0) break; /* EOF: exnode closed the port */
-        if (r < 0) return 3;
+        if (r < 0) { status = 3; break; }
         uint32_t len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) | ((uint32_t)hdr[2] << 8) | hdr[3];
-        if (len == 0 || len > MAX_FRAME) { fprintf(stderr, "bad frame length %u\n", len); return 3; }
+        if (len == 0 || len > MAX_FRAME) { fprintf(stderr, "bad frame length %u\n", len); status = 3; break; }
         uint8_t *buf = malloc(len);
-        if (!buf || read_full(buf, len) != 1) return 3;
+        if (!buf || read_full(buf, len) != 1) { free(buf); status = 3; break; }
 
         if (buf[0] == 1) {
             btck_Block *block = btck_block_create(buf + 1, len - 1);
@@ -201,10 +205,11 @@ int main(int argc, char **argv) {
             int new_block = 0;
             int rc = btck_chainstate_manager_process_block(cm, block, &new_block);
             btck_block_destroy(block);
-            if (g_event_overflow) { fprintf(stderr, "event overflow\n"); return 4; }
+            if (g_event_overflow) { fprintf(stderr, "event overflow\n"); free(buf); status = 4; break; }
 
             size_t out_len = 1 + 1 + 1 + 4 + g_nevents * 37 + 36;
             uint8_t *out = malloc(out_len), *p = out;
+            if (!out) { fprintf(stderr, "out of memory\n"); free(buf); status = 3; break; }
             *p++ = 0;
             *p++ = (uint8_t)(rc != 0);
             *p++ = (uint8_t)new_block;
@@ -231,5 +236,5 @@ int main(int argc, char **argv) {
 
     btck_chainstate_manager_destroy(cm);
     btck_context_destroy(ctx);
-    return 0;
+    return status;
 }

@@ -506,6 +506,52 @@ defmodule Exnode.DoS.OrphanageTest do
     assert MapSet.member?(:sys.get_state(r).rejects.set, child.wtxid)
   end
 
+  # Regression: a 1p1c package whose parent failed its scripts left the
+  # parent out of `rejects` (only the child's failure and the parent's
+  # success were handled; Core ProcessPackageResult runs ProcessInvalidTx
+  # for each tx). The parent stayed reconsiderable and the child stayed in
+  # the orphanage, so resending the same parent re-ran the package (and
+  # its script checks) synchronously in the mempool every time.
+  test "a failed 1p1c package: a parent that failed its scripts is rejected, not resubmitted" do
+    parent = tx(hashes(1, 26), 1)
+    child = tx([parent.txid], 2)
+
+    accept = fn
+      %{txid: t} when t == parent.txid ->
+        {:error, %{result: :reconsiderable, reason: "min relay fee not met"}}
+
+      _ ->
+        {:error, %{result: :missing_inputs}}
+    end
+
+    # Core AcceptMultipleTransactions stops at the first failing script
+    # check: only the parent has a result.
+    package = fn _ ->
+      %{
+        state: {:tx, "transaction failed", nil},
+        txs: %{
+          parent.wtxid =>
+            {:invalid, %{result: :not_standard, reason: "mempool-script-verify-flag-failed"}}
+        }
+      }
+    end
+
+    r = scripted(accept, package)
+    p = peer(r)
+    :ok = TxRelay.received_tx(r, p, child)
+    :ok = TxRelay.received_tx(r, p, parent)
+    assert_received {:accept, w} when w == child.wtxid
+    assert_received {:accept, w} when w == parent.wtxid
+    assert_received {:package, _}
+
+    assert MapSet.member?(:sys.get_state(r).rejects.set, parent.wtxid)
+
+    :ok = TxRelay.received_tx(r, p, parent)
+    _ = :sys.get_state(r)
+    refute_received {:package, _}
+    refute_received {:accept, _}
+  end
+
   # Regression: an accept that finds its tx already added by
   # another submitter (RPC submitpackage during the script check) answers
   # txn-already-in-mempool; TxRelay put the in-mempool tx in `rejects`.

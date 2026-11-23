@@ -285,17 +285,18 @@ defmodule Exnode.Chain.State do
   end
 
   @doc """
-  Subset of `hashes` whose block data is held in memory, archived, or
-  quarantined (its body stays in `pending`; fetching it again cannot help
-  until the quarantine is cleared) (no call).
+  Subset of `hashes` whose block data is held in memory, archived (see
+  `Archive.have_block_data?/2`), or quarantined (its body stays in
+  `pending`; fetching it again cannot help until the quarantine is cleared)
+  (no call).
   """
   def view_have_many(view, hashes) do
-    kv = :ets.lookup_element(view, :kv, 2)
+    reader = view_reader(view)
 
     MapSet.new(
       Enum.filter(hashes, fn h ->
         :ets.member(view, {:held, h}) or :ets.member(view, {:quarantined, h}) or
-          Exnode.Store.KV.get(kv, :blockhash, h) != :not_found
+          Archive.have_block_data?(reader, h)
       end)
     )
   end
@@ -313,8 +314,13 @@ defmodule Exnode.Chain.State do
   overlay, without committing. Waits with no timeout, as Core's mempool
   holds `cs_main` (the mempool must not restart because a block is slow).
   """
-  def mempool_view(server, outpoints),
-    do: GenServer.call(server, {:mempool_view, outpoints}, :infinity)
+  def mempool_view(server, outpoints) do
+    # An outpoint no transaction can have (vout not a uint32) is missing,
+    # never sent: the overlay NIF raises on it, inside this server.
+    {ok, bad} = Enum.split_with(outpoints, fn {_, v} -> is_integer(v) and v in 0..0xFFFFFFFF end)
+    {tip, found} = GenServer.call(server, {:mempool_view, ok}, :infinity)
+    {tip, Enum.reduce(bad, found, &Map.put(&2, &1, :missing))}
+  end
 
   @doc """
   Clears quarantine marks (`:all` or one block hash) once the cause is
@@ -453,8 +459,9 @@ defmodule Exnode.Chain.State do
       # activation is idle (newest first), and their blocks kept at hand.
       waiters: [],
       current_blocks: %{},
-      # Blocks fail_block reported to the shadow while waiters were pending.
-      rejected_seen: MapSet.new(),
+      # Blocks fail_block reported to the shadow while waiters were pending:
+      # hash => that block's own failure.
+      rejected_seen: %{},
       pstats: %{},
       # Non-script ConnectBlock: :reference (Connect.connect_block
       # inline), :engine (Prepare.populate + check inline) or :worker (the
@@ -479,7 +486,10 @@ defmodule Exnode.Chain.State do
       last_failure: nil,
       # The mempool process (name or pid) and the block events for it, newest first.
       mempool: Keyword.get(opts, :mempool),
-      mempool_events: []
+      mempool_events: [],
+      # The old tip's chain work while a reorg's events are held back from
+      # the mempool, else nil.
+      reorg_work: nil
     }
 
     # The shared script executor (the node's, by name), or a private one.
@@ -612,6 +622,11 @@ defmodule Exnode.Chain.State do
 
   defp commit(st) do
     hashes = Enum.map(st.uncommitted, &elem(&1, 0))
+    # Core writes the block index before the chainstate: the headers'
+    # queued (unsynced) writes reach the same KV first, so the synced batch
+    # below makes them durable too and a committed block never lacks its
+    # header at restart.
+    :ok = Headers.flush(st.headers)
     a = Archive.flush(st.a, for(h <- hashes, do: {:delete, :pending, h})) |> note_durable()
     for h <- hashes, do: :ets.delete(st.view, {:held, h})
 
@@ -659,6 +674,20 @@ defmodule Exnode.Chain.State do
     %{st | blocks: MapSet.delete(st.blocks, hash), sources: Map.delete(st.sources, hash)}
   end
 
+  # Core InvalidChainFound marks every descendant BLOCK_FAILED_CHILD, which
+  # keeps it out of setBlockIndexCandidates for good: a held body under a
+  # failed header can never connect, so it is dropped with the failed block.
+  defp unhold_failed(st) do
+    idx = Headers.index(st.headers)
+
+    Enum.reduce(st.blocks, st, fn h, st ->
+      case HeaderIndex.lookup(idx, h) do
+        %{status: :failed} -> %{unhold(st, h) | checked: MapSet.delete(st.checked, h)}
+        _ -> st
+      end
+    end)
+  end
+
   # Startup: pending blocks from the previous run are held again (no
   # re-download). Entries already archived are dropped. Keys only: the
   # blocks live in blob files and are not read here.
@@ -667,18 +696,25 @@ defmodule Exnode.Chain.State do
 
     # Quarantined blocks stay in `pending` (for reconsider_poisoned) but are not held.
     hashes = Enum.reject(hashes, &MapSet.member?(st.poisoned, &1))
-    {archived, held} = Enum.split_with(hashes, &(Archive.block_id(st.a, &1) != nil))
+    idx = Headers.index(st.headers)
 
-    if archived != [],
+    # Under a failed header (Core: not a candidate) a body can never connect.
+    # Without a header (its unsynced write lost in a crash) it could not
+    # link either, and holding it would stop it being downloaded again.
+    {dropped, held} =
+      Enum.split_with(
+        hashes,
+        &(Archive.block_id(st.a, &1) != nil or
+            match?(e when e == nil or e.status == :failed, HeaderIndex.lookup(idx, &1)))
+      )
+
+    if dropped != [],
       do:
         :ok =
-          Exnode.Store.KV.write(st.kv, for(h <- archived, do: {:delete, :pending, h}),
-            sync: false
-          )
+          Exnode.Store.KV.write(st.kv, for(h <- dropped, do: {:delete, :pending, h}), sync: false)
 
     for h <- held, do: :ets.insert(st.view, {{:held, h}})
     st = %{st | blocks: MapSet.new(held)}
-    idx = Headers.index(st.headers)
     # Like Core LoadBlockIndex: availability ties across restarts are not
     # arrival-ordered (active blocks get 0, other loaded blocks get 1).
     held
@@ -1053,8 +1089,23 @@ defmodule Exnode.Chain.State do
     # commit, orphaning committed rows whose pending copies are gone, or
     # restoring a disconnected block's rows without its spends. The restart
     # recovers from the disk and `pending` instead.
+    # A segment roll in the crashed callback (fsynced, not committed) closed
+    # a file this struct still holds: its commit then fails the segment
+    # sync before writing anything, so the failure is logged and the
+    # shutdown goes on.
     if durable_current?(st.a) do
-      commit(st)
+      try do
+        commit(st)
+      catch
+        # Also when Headers is gone (a rest_for_one restart): its writes
+        # cannot be flushed first, and the restart reconnects the batch
+        # from `pending`.
+        kind, reason ->
+          Logger.warning(
+            "chain state stopped without committing (the restart resumes from the disk): " <>
+              Exception.format_banner(kind, reason, __STACKTRACE__)
+          )
+      end
     else
       Logger.warning(
         "chain state stopped with an archive state older than its last commit; " <>
@@ -1112,7 +1163,17 @@ defmodule Exnode.Chain.State do
 
   # Sends the block events of this activation to the mempool (Core: ConnectTip
   # calls removeForBlock; ActivateBestChainStep calls MaybeUpdateMempoolForReorg).
+  #
+  # A reorg's events are held until the new chain has more work than the old
+  # tip, or its plan ends: Core keeps the disconnectpool across those
+  # ConnectTip calls, so txs the new blocks confirm again are never re-added
+  # (and never trimmed against).
   defp flush_mempool(%{mempool_events: []} = st), do: st
+
+  defp flush_mempool(%{reorg_work: w, plan: plan} = st) when w != nil and plan != nil do
+    tip = HeaderIndex.lookup(Headers.index(st.headers), Archive.tip(st.a).hash)
+    if tip.chain_work > w, do: flush_mempool(%{st | reorg_work: nil}), else: st
+  end
 
   defp flush_mempool(st) do
     case st.mempool && GenServer.whereis(st.mempool) do
@@ -1123,7 +1184,7 @@ defmodule Exnode.Chain.State do
         :ok
     end
 
-    %{st | mempool_events: []}
+    %{st | mempool_events: [], reorg_work: nil}
   end
 
   defp mempool_event(%{mempool: nil} = st, _ev), do: st
@@ -1264,17 +1325,15 @@ defmodule Exnode.Chain.State do
 
   defp fail_submitted(st, hash, reason) do
     Headers.invalidate(st.headers, hash, Archive.tip(st.a).hash)
-    {{:error, reason}, st}
+    {{:error, reason}, unhold_failed(st)}
   end
 
-  defp have?(st, hash), do: MapSet.member?(st.blocks, hash) or Archive.block_id(st.a, hash) != nil
-
-  defp failed?(st, hash) do
-    case HeaderIndex.lookup(Headers.index(st.headers), hash) do
-      %{status: :failed} -> true
-      _ -> false
-    end
-  end
+  # An archived block off the active chain whose witness data is pruned is
+  # not had: reconnecting it needs the full block again (Core clears
+  # BLOCK_HAVE_DATA when pruning). Counting it had let a failed deep reorg
+  # pick the old branch, crash reading it and quarantine an honest block.
+  defp have?(st, hash),
+    do: MapSet.member?(st.blocks, hash) or Archive.have_block_data?(st.a, hash)
 
   # --- activation --------------------------------------------------------------
   #
@@ -1437,6 +1496,12 @@ defmodule Exnode.Chain.State do
 
       {target, st} ->
         fork = HeaderIndex.last_common_ancestor(idx, tip_entry, target)
+
+        st =
+          if fork.height < tip_entry.height and st.mempool,
+            do: %{st | reorg_work: max(st.reorg_work || 0, tip_entry.chain_work)},
+            else: st
+
         st = disconnect_to(st, fork)
         path = path(idx, fork, target)
         # The prefetch stage runs only on paths of new blocks (see Chain.Prefetch).
@@ -1820,7 +1885,8 @@ defmodule Exnode.Chain.State do
     [entry | rest] = st.plan.todo
     idx = Headers.index(st.headers)
 
-    # An exception while loading the block is contained like one in validation.
+    # An exception while loading the block is contained like one in validation
+    # (a host fault among them is re-raised at retirement, retire/2).
     loaded =
       try do
         take_prefetched(st, entry)
@@ -2577,6 +2643,7 @@ defmodule Exnode.Chain.State do
         {:failed, %{quarantine_block(st, item.entry, item.block, crash) | retarget: true}}
 
       {:crash, _, _} = crash ->
+        raise_host_fault(crash)
         st = cancel_plan(st)
         {:failed, %{quarantine_block(st, item.entry, item.block, crash) | retarget: true}}
     end
@@ -2647,12 +2714,12 @@ defmodule Exnode.Chain.State do
           reply = submit_outcome(st, hash)
 
           # A rejection fail_block already put in a shadow round (possibly
-          # flushed by an earlier turn) is not added again; a quarantine or
-          # an inherited failure is, as the synchronous path did.
+          # flushed by an earlier turn) is not added again; a quarantine is,
+          # as the synchronous path did.
           st =
             case reply do
               {:error, r} ->
-                if MapSet.member?(st.rejected_seen, hash),
+                if Map.has_key?(st.rejected_seen, hash),
                   do: st,
                   else: %{st | round_rejected: [{hash, raw, r} | st.round_rejected]}
 
@@ -2668,16 +2735,19 @@ defmodule Exnode.Chain.State do
           st
       end)
 
-    %{st | current_blocks: %{}, rejected_seen: MapSet.new()} |> flush_round()
+    %{st | current_blocks: %{}, rejected_seen: %{}} |> flush_round()
   end
 
+  # Only a block that itself failed ConnectBlock gets an error, its own (Core
+  # BlockChecked for that block). One failed only through an ancestor was
+  # accepted (Core ProcessNewBlock returns true, nobody is punished for it).
   defp submit_outcome(st, hash) do
     cond do
       MapSet.member?(st.poisoned, hash) ->
         {:error, {:crash, "validation crashed; block quarantined"}}
 
-      failed?(st, hash) ->
-        {:error, st.last_failure || {:consensus, "invalid"}}
+      Map.has_key?(st.rejected_seen, hash) ->
+        {:error, Map.fetch!(st.rejected_seen, hash)}
 
       Archive.on_chain?(st.a, Archive.block_id(st.a, hash) || -1) ->
         {:ok, :connected}
@@ -2797,7 +2867,14 @@ defmodule Exnode.Chain.State do
       old = Archive.tip(st.a).hash
       {a, _id} = Archive.disconnect_tip(st.a)
       note_durable(a)
-      :ets.insert(st.view, {:tip, Archive.tip(a)})
+      # The disconnect lowered the committed tip: readers must not keep the
+      # old height while the new branch is connected above it.
+      :ets.insert(st.view, [
+        {:tip, Archive.tip(a)},
+        {:committed, Archive.committed_tip(a).height},
+        {:reader, Archive.reader(a)}
+      ])
+
       notify(st, {:block_disconnected, old})
       disconnect_to(%{st | a: a, disconnected: MapSet.put(st.disconnected, old)}, fork)
     else
@@ -2806,8 +2883,8 @@ defmodule Exnode.Chain.State do
   end
 
   # Archive.connect is contained too. An exception or exit
-  # becomes {:crash, error, stacktrace}, unless it comes from the storage layer
-  # itself (segment files, KV): a disk error is not the block's fault, so it
+  # becomes {:crash, error, stacktrace}, unless it is a fault of the host
+  # (host_fault?/3: the storage layer, memory): not the block's fault, so it
   # stays fatal and is not quarantined (as Core AbortNode on a write failure).
   defp archive_connect(st, %{entry: entry, block: block, res: res} = item) do
     t1 = System.monotonic_time(:microsecond)
@@ -2830,19 +2907,42 @@ defmodule Exnode.Chain.State do
     {:ok, a, System.monotonic_time(:microsecond) - t1}
   catch
     kind, reason ->
-      if storage_failure?(__STACKTRACE__) or out_of_memory?(kind, reason),
+      if host_fault?(kind, reason, __STACKTRACE__),
         do: :erlang.raise(kind, reason, __STACKTRACE__)
 
       {:crash, {kind, reason}, __STACKTRACE__}
   end
 
-  # Native memory exhausted (the overlay's tables, Archive.Overlay): a fault
-  # of this host, not of the block, so fatal like a storage failure, never a
-  # quarantine. The restart discards the half-applied tables.
-  defp out_of_memory?(:error, :enomem), do: true
+  # A crash contained while preparing or checking the block (loading it,
+  # its checks, its scripts): a host fault is re-raised, fatal, before it
+  # can quarantine the block.
+  defp raise_host_fault({:crash, error, stack}) do
+    {kind, reason} =
+      case error do
+        {kind, reason} when kind in [:error, :exit, :throw] -> {kind, reason}
+        exception -> {:error, exception}
+      end
+
+    if host_fault?(kind, reason, stack), do: :erlang.raise(kind, reason, stack)
+    :ok
+  end
+
+  # A fault of this host, not of the block: fatal (Core: AbortNode,
+  # FatalError), never a quarantine. The restart resumes from the last
+  # commit (and discards the overlay's half-applied tables).
+  defp host_fault?(kind, reason, stack),
+    do: storage_failure?(stack) or out_of_memory?(kind, reason)
+
+  # Native memory exhausted: the overlay's tables (Archive.Overlay), the
+  # kernel's script check (Exnode.Kernel: its allocations, its precomputed
+  # tx data). A rescued raise arrives wrapped in ErlangError.
+  @out_of_memory [:enomem, :kernel_alloc, :kernel_txdata]
+  defp out_of_memory?(:error, %ErlangError{original: r}), do: r in @out_of_memory
+  defp out_of_memory?(:error, r), do: r in @out_of_memory
   defp out_of_memory?(_kind, _reason), do: false
 
-  # The innermost exnode frame is the storage layer.
+  # The innermost exnode frame is the storage layer (it raises its read
+  # errors itself, Exnode.Store.KV.Error, rather than returning them).
   defp storage_failure?(stack) do
     case Enum.find(stack, fn {m, _, _, _} ->
            String.starts_with?(Atom.to_string(m), "Elixir.Exnode.")
@@ -2937,7 +3037,7 @@ defmodule Exnode.Chain.State do
     # may be punished (MaybePunishNodeForBlock).
     {source, sources} = Map.pop(st.sources, entry.hash)
     if is_pid(source), do: send(source, {:block_checked, entry.hash, {:error, r}})
-    st = unhold(%{st | sources: sources}, entry.hash)
+    st = unhold(%{st | sources: sources}, entry.hash) |> unhold_failed()
 
     %{
       st
@@ -2948,7 +3048,7 @@ defmodule Exnode.Chain.State do
         rejected_seen:
           if(st.waiters == [],
             do: st.rejected_seen,
-            else: MapSet.put(st.rejected_seen, entry.hash)
+            else: Map.put(st.rejected_seen, entry.hash, r)
           )
     }
   end
