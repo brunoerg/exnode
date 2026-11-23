@@ -24,7 +24,10 @@ defmodule Exnode.Mempool do
     consensus or policy verdict, so neither is punished.
 
   `test_accept/2`, `submit_package/2` and the reorg re-adds stay
-  synchronous (RPC-facing, authenticated, or chain-driven).
+  synchronous, as all of Core's acceptance does under `cs_main`. Packages
+  also come from peers (TxRelay's 1p1c): TxRelay submits one only for a
+  parent that failed alone on its fee, and caches a parent or child that
+  fails in the package, so each such evaluation costs the peer a new tx.
 
   The chain state provides the view (tip, unspent coins, script flags) and
   sends `{:mempool_update, tip_hash, events}` after each activation, with

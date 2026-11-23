@@ -1330,26 +1330,27 @@ defmodule Exnode.P2P.TxRelay do
           # failed: a parent accepted on its own is in the mempool (and only
           # TxRelay would announce it: the mempool's notification names us
           # as origin), and a child that failed for a reason of its own
-          # leaves the orphanage. The child
-          # goes first, so the parent's orphan reconsideration skips it.
+          # leaves the orphanage. A parent that failed (its scripts, say)
+          # goes in `rejects`, so resending it is not evaluated again. The
+          # child goes first, so the parent's orphan reconsideration skips it.
           st = %{st | reconsiderable: f_insert(st.reconsiderable, package_hash([parent, child]))}
 
-          st =
-            case res.txs[child.wtxid] do
-              {:valid, _} ->
-                accepted(orphans_drop(st, [child.wtxid]), child, peer)
-
-              {:invalid, %{result: r} = e} when r != :missing_inputs ->
-                rejected(st, child, e, peer, false)
-
-              _ ->
-                st
-            end
-
-          if match?({:valid, _}, res.txs[parent.wtxid]), do: accepted(st, parent, peer), else: st
+          st
+          |> package_tx_result(child, res.txs[child.wtxid], peer)
+          |> package_tx_result(parent, res.txs[parent.wtxid], peer)
         end
     end
   end
+
+  # Core ProcessPackageResult, for one tx: ProcessValidTx or
+  # ProcessInvalidTx(first_time_failure = false).
+  defp package_tx_result(st, tx, {:valid, _}, peer),
+    do: accepted(orphans_drop(st, [tx.wtxid]), tx, peer)
+
+  defp package_tx_result(st, tx, {:invalid, %{result: r} = e}, peer) when r != :missing_inputs,
+    do: rejected(st, tx, e, peer, false)
+
+  defp package_tx_result(st, _tx, _result, _peer), do: st
 
   # Core GetPackageHash: SHA256 of the sorted wtxids.
   defp package_hash(txs), do: :crypto.hash(:sha256, txs |> Enum.map(& &1.wtxid) |> Enum.sort())

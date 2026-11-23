@@ -276,12 +276,7 @@ defmodule Exnode.Mempool.Package do
          {:ok, all_conflicts} <-
            if(conflicts != MapSet.new(),
              do: package_rbf(state, txs, wss, conflicts, total_fee, total_vsize),
-             else: {:ok, MapSet.new()}
-           ),
-         :ok <-
-           if(Pool.stage(state.pool, Enum.map(wss, & &1.entry), all_conflicts).oversized,
-             do: {:pkg_error, {:policy, "too-large-cluster", ""}},
-             else: :ok
+             else: cluster_limits(state.pool, wss)
            ),
          :ok <- unspent_dust(txs, state),
          :ok <- scripts(wss, chain) do
@@ -315,6 +310,14 @@ defmodule Exnode.Mempool.Package do
       {:pkg_error, pkg_state} -> {%{state: pkg_state, txs: %{}}, state}
       {:pkg_error, pkg_state, txs_res} -> {%{state: pkg_state, txs: txs_res}, state}
     end
+  end
+
+  # Core: CheckMemPoolPolicyLimits with no conflicts (package_rbf/6 has
+  # checked the staging it built).
+  defp cluster_limits(pool, wss) do
+    if Pool.stage(pool, Enum.map(wss, & &1.entry), MapSet.new()).oversized,
+      do: {:pkg_error, {:policy, "too-large-cluster", ""}},
+      else: {:ok, MapSet.new()}
   end
 
   defp package_fee_rate(state, args, vsize, fee, chain, child) do
