@@ -375,7 +375,7 @@ defmodule Exnode.Archive do
 
     for {txid, vout} = op <- outpoints,
         {base, n} = Map.get(located, txid, {nil, 0}),
-        vout < n,
+        vout >= 0 and vout < n,
         into: %{},
         do: {op, base + vout}
   end
@@ -793,7 +793,7 @@ defmodule Exnode.Archive do
   def resolve(%__MODULE__{} = a, txid, vout) do
     with {:ok, entry} <- newest_on_chain_entry(a, txid),
          {block_id, pos, base_out, nout, _base_in} = entry,
-         true <- vout < nout || :missing,
+         true <- (vout >= 0 and vout < nout) || :missing,
          out_id = base_out + vout,
          false <- spent_on_chain?(a, out_id) do
       {value, spk} = read_output(a, out_id)
@@ -1146,7 +1146,7 @@ defmodule Exnode.Archive do
     candidates =
       for {t, v} = op <- outpoints,
           {block_id, pos, base_out, nout, _} <- List.wrap(entries[t]),
-          v < nout,
+          v >= 0 and v < nout,
           into: %{},
           do: {op, {base_out + v, block_id, pos}}
 

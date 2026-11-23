@@ -314,8 +314,13 @@ defmodule Exnode.Chain.State do
   overlay, without committing. Waits with no timeout, as Core's mempool
   holds `cs_main` (the mempool must not restart because a block is slow).
   """
-  def mempool_view(server, outpoints),
-    do: GenServer.call(server, {:mempool_view, outpoints}, :infinity)
+  def mempool_view(server, outpoints) do
+    # An outpoint no transaction can have (vout not a uint32) is missing,
+    # never sent: the overlay NIF raises on it, inside this server.
+    {ok, bad} = Enum.split_with(outpoints, fn {_, v} -> is_integer(v) and v in 0..0xFFFFFFFF end)
+    {tip, found} = GenServer.call(server, {:mempool_view, ok}, :infinity)
+    {tip, Enum.reduce(bad, found, &Map.put(&2, &1, :missing))}
+  end
 
   @doc """
   Clears quarantine marks (`:all` or one block hash) once the cause is

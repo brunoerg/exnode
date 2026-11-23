@@ -423,11 +423,16 @@ defmodule Exnode.RPC.Methods do
       fee ++ if(include_hex, do: [{"hex", hex(tx.raw)}], else: [])
   end
 
-  # Core: gettxout(txid, n, include_mempool = true)
+  # Core: gettxout(txid, n, include_mempool = true). `n` is read with
+  # getInt<uint32_t> after RPCHelpMan's type check.
   def gettxout(params, ctx) do
-    with {:ok, txid} <- parse_hash(arg(params, 0), "txid") do
-      n = arg(params, 1)
-      include_mempool = arg(params, 2, true)
+    n = arg(params, 1)
+    include_mempool = arg(params, 2, true)
+
+    with :ok <- check_type(n, "number", &is_number/1),
+         :ok <- check_type(include_mempool, "bool", &is_boolean/1),
+         {:ok, txid} <- parse_hash(arg(params, 0), "txid"),
+         :ok <- check_uint32(n) do
       op = {txid, n}
 
       mem_out = include_mempool && mempool_output(ctx, txid, n)
@@ -438,24 +443,22 @@ defmodule Exnode.RPC.Methods do
             nil
 
           mem_out ->
-            {:mempool, mem_out}
+            {mem_out, tip(ctx), 0}
 
+          # Confirmations against the tip the coin was read at (Core: the
+          # coins view's best block), which may be past the committed one.
           true ->
             case ChainState.mempool_view(ctx.chain_state, [op]) do
-              {_tip, %{^op => {:ok, c}}} -> {:chain, c}
+              {t, %{^op => {:ok, c}}} -> {c, t, t.height - c.height + 1}
               _ -> nil
             end
         end
-
-      t = tip(ctx)
 
       case coin do
         nil ->
           {:ok, nil}
 
-        {kind, c} ->
-          conf = if kind == :mempool, do: 0, else: t.height - c.height + 1
-
+        {c, t, conf} ->
           {:ok,
            obj([
              {"bestblock", hash_hex(t.hash)},
@@ -468,9 +471,20 @@ defmodule Exnode.RPC.Methods do
     end
   end
 
+  defp check_type(v, expected, ok?) do
+    if ok?.(v),
+      do: :ok,
+      else:
+        {:error, @rpc_type_error,
+         "JSON value of type #{json_type(v)} is not of expected type #{expected}"}
+  end
+
+  defp check_uint32(n) when is_integer(n) and n in 0..0xFFFFFFFF, do: :ok
+  defp check_uint32(_), do: {:error, @rpc_misc_error, "JSON integer out of range"}
+
   defp mempool_output(ctx, txid, n) do
     case Mempool.get_tx(ctx.mempool, txid) do
-      %Tx{outputs: outs} when n < length(outs) ->
+      %Tx{outputs: outs} when n >= 0 and n < length(outs) ->
         o = Enum.at(outs, n)
         %{value: o.value, script_pubkey: o.script_pubkey, coinbase: false}
 
