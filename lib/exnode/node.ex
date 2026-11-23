@@ -111,6 +111,7 @@ defmodule Exnode.Node do
       addrman: Module.concat(prefix, AddrMan),
       sync: Module.concat(prefix, SyncState),
       peer_sup: Module.concat(prefix, PeerSup),
+      local_nonces: Module.concat(prefix, LocalNonces),
       chain_state: Module.concat(prefix, ChainState),
       script_exec: Module.concat(prefix, ScriptExec),
       block_download: Module.concat(prefix, BlockDownload),
@@ -281,7 +282,9 @@ defmodule Exnode.Node do
       mempool: n.mempool,
       high_bandwidth: n.high_bandwidth,
       decode_budget: n.decode_budget,
-      nonce: :rand.uniform(0xFFFFFFFFFFFFFFFF),
+      # Each peer sends its own version nonce; outbound ones still in the
+      # handshake are registered here for the inbound self-connection check.
+      local_nonces: n.local_nonces,
       # NODE_WITNESS, plus NODE_NETWORK (all blocks served), or
       # NODE_NETWORK_LIMITED with witness pruning.
       # BIP324 (Core -v2transport, default on): NODE_P2P_V2.
@@ -471,6 +474,7 @@ defmodule Exnode.Node do
                bytes:
                  Keyword.get(opts, :decode_budget_bytes, Exnode.P2P.DecodeBudget.default_bytes())},
               group(n.conns_sup, :one_for_all, [
+                {Registry, keys: :unique, name: n.local_nonces},
                 {DynamicSupervisor, name: n.peer_sup, strategy: :one_for_one},
                 {Connman, connman_opts}
               ])

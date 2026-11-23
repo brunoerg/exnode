@@ -83,7 +83,8 @@ defmodule Exnode.P2P.HeadersSync do
       params: p,
       commitment_period: period,
       redownload_buffer_size: buffer,
-      commit_offset: :rand.uniform(period) - 1,
+      # Unpredictable to the peer (Core FastRandomContext).
+      commit_offset: elem(:rand.uniform_s(period, :crypto.rand_seed_s()), 0) - 1,
       key: :crypto.strong_rand_bytes(32),
       chain_start: chain_start,
       chain_start_locator: chain_start_locator,

@@ -5,8 +5,9 @@ defmodule Exnode.P2P.PeerProtocolTest do
 
   * version: a full-relay outbound peer without NETWORK | WITNESS, a
     version below MIN_PEER_PROTO_VERSION, and an inbound connection to
-    ourselves (our nonce) are disconnected; a second version or verack is
-    ignored, as is anything before version;
+    ourselves (the nonce of one of our outbound connections still in the
+    handshake) are disconnected; every connection sends its own nonce; a
+    second version or verack is ignored, as is anything before version;
   * wtxidrelay or sendaddrv2 after verack disconnects;
   * after the handshake, oversized headers (by the count alone), oversized
     complete inv / getdata / addr / addrv2 and a non-continuous headers
@@ -124,22 +125,61 @@ defmodule Exnode.P2P.PeerProtocolTest do
       assert_stopped(ref, {:obsolete_version, old})
     end
 
-    test "an inbound connection carrying our own nonce is a connection to ourselves",
-         %{n: n, port: port} do
-      before = for {_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p
-      sock = FakePeer.dial(port, handshake: false)
-
-      new_peers = fn ->
-        for({_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p) -- before
+    # Regression: the node sent one static version nonce on every connection,
+    # linking them (block-relay-only ones too) to each other and to the node,
+    # and the self-connection check compared against that one value. Core
+    # sends a per-connection nLocalHostNonce and CheckIncomingNonce matches
+    # an inbound version against outbound connections still in the handshake.
+    test "every connection sends its own version nonce", %{n: n, port: port} do
+      nonce_of = fn sock ->
+        [{"version", pl}] = FakePeer.recv(sock, "version", 1)
+        {:ok, {:version, v}} = Message.decode("version", pl)
+        v.nonce
       end
 
-      wait_until(fn -> length(new_peers.()) == 1 end)
-      [pid] = new_peers.()
+      inbound =
+        for _ <- 1..2 do
+          sock = FakePeer.dial(port, handshake: false)
+          :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version()})
+          nonce_of.(sock)
+        end
 
-      ref = Process.monitor(pid)
-      nonce = :sys.get_state(pid).node.nonce
-      :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version(nonce: nonce)})
+      {_pid, sock, _clock, _ref} = connect(n, handshake: false)
+      nonces = [nonce_of.(sock) | inbound]
+      assert length(Enum.uniq(nonces)) == 3
+    end
+
+    test "an inbound version carrying the nonce of our outbound handshake is a connection to ourselves",
+         %{n: n, port: port} do
+      {_pid, out_sock, _clock, _ref} = connect(n, handshake: false)
+      [{"version", pl}] = FakePeer.recv(out_sock, "version", 1)
+      {:ok, {:version, %{nonce: nonce}}} = Message.decode("version", pl)
+
+      self_conn = fn ->
+        before = for {_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p
+        sock = FakePeer.dial(port, handshake: false)
+
+        new_peers = fn ->
+          for({_, p, _, _} <- DynamicSupervisor.which_children(n.peer_sup), do: p) -- before
+        end
+
+        wait_until(fn -> length(new_peers.()) == 1 end)
+        [pid] = new_peers.()
+        ref = Process.monitor(pid)
+        :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version(nonce: nonce)})
+        {pid, ref}
+      end
+
+      {_, ref} = self_conn.()
       assert_stopped(ref, :connected_to_self)
+
+      # Core fSuccessfullyConnected: once the outbound handshake completes
+      # its nonce no longer counts.
+      :ok = FakePeer.send_msgs(out_sock, [{:version, FakePeer.version()}, :verack])
+      wait_until(fn -> Registry.lookup(n.local_nonces, nonce) == [] end)
+      {pid, ref} = self_conn.()
+      wait_until(fn -> :sys.get_state(pid).version != nil end)
+      refute_received {:DOWN, ^ref, _, _, _}
     end
 
     test "a second version is ignored", %{n: n} do

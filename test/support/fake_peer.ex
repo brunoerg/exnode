@@ -42,8 +42,8 @@ defmodule Exnode.Test.FakePeer do
 
   Options:
   * `:node`: fields merged into the peer's node map. The defaults are
-    params, headers, sync and chain_state from `n`, no address book, nonce
-    1, services 9, user agent "/t/". Anything else (tx_relay, mempool,
+    params, headers, sync, chain_state and local_nonces from `n`, no
+    address book, services 9, user agent "/t/". Anything else (tx_relay, mempool,
     a clock...) is added here.
   * `:params`: chain params (default regtest).
   * `:conn_type`: the peer's connection type (default
@@ -72,7 +72,7 @@ defmodule Exnode.Test.FakePeer do
           chain_state: n.chain_state,
           block_serving: n[:block_serving],
           decode_budget: n[:decode_budget],
-          nonce: 1,
+          local_nonces: n[:local_nonces],
           services: 9,
           user_agent: "/t/"
         },

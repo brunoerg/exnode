@@ -15,7 +15,8 @@ defmodule Exnode.P2P.Peer do
   deserialize.
 
   `node` (passed at start) is a map:
-    params, headers, addrman, sync, connman (optional), nonce, services,
+    params, headers, addrman, sync, connman (optional), local_nonces
+    (optional Registry of outbound handshake nonces), services,
     user_agent, serve_headers (default false), active_tip_fn (optional),
     clock (optional `Exnode.Clock`, the node's; nil: the system clock),
     tick_ms (optional, default 1 s; nil: no timer, tests tick explicitly)
@@ -122,6 +123,9 @@ defmodule Exnode.P2P.Peer do
       # The peer's last feefilter, resent to TxRelay after it restarts.
       feefilter: nil,
       sent_version: false,
+      # Core nLocalHostNonce: our version nonce, fresh per connection, so
+      # connections cannot be linked to each other by it.
+      local_nonce: rand64(),
       wtxid_relay: false,
       addrv2: false,
       prefers_headers: false,
@@ -573,14 +577,27 @@ defmodule Exnode.P2P.Peer do
       services: st.node.services,
       time: now(st),
       addr_recv: addr_recv,
-      nonce: st.node.nonce,
+      nonce: st.local_nonce,
       user_agent: st.node.user_agent,
       start_height: best.height,
       # Block-relay-only connections announce fRelay = false.
       relay: st.conn_type != :block_relay
     }
 
+    # Core CheckIncomingNonce: only outbound connections not yet fully
+    # connected count; the entry goes at verack or when this process exits.
+    if not st.inbound and st.node[:local_nonces],
+      do: Registry.register(st.node.local_nonces, st.local_nonce, nil)
+
     push(%{st | sent_version: true}, {:version, v})
+  end
+
+  # Core FastRandomContext: unpredictable to peers, never 0.
+  defp rand64, do: elem(:rand.uniform_s(0xFFFFFFFFFFFFFFFF, :crypto.rand_seed_s()), 0)
+
+  defp connected_to_self?(st, nonce) do
+    st.inbound and st.node[:local_nonces] != nil and
+      Registry.lookup(st.node.local_nonces, nonce) != []
   end
 
   defp handshake_done?(st), do: st.version != nil and st.verack_received
@@ -618,7 +635,7 @@ defmodule Exnode.P2P.Peer do
       v.version < Message.min_peer_proto_version() ->
         {:stop, {:shutdown, {:obsolete_version, v.version}}, st}
 
-      st.inbound and v.nonce == st.node.nonce ->
+      connected_to_self?(st, v.nonce) ->
         {:stop, {:shutdown, :connected_to_self}, st}
 
       # Core: a feeler only checks that the address is online; AddrMan::Good
@@ -664,6 +681,8 @@ defmodule Exnode.P2P.Peer do
   defp handle_msg(:verack, st) do
     common = common_version(st)
     st = %{st | verack_received: true}
+    # Core fSuccessfullyConnected: no longer a self-connection candidate.
+    if st.node[:local_nonces], do: Registry.unregister(st.node.local_nonces, st.local_nonce)
     st = if common >= @sendheaders_version, do: push(st, :sendheaders), else: st
 
     st =
@@ -921,7 +940,7 @@ defmodule Exnode.P2P.Peer do
 
   defp maybe_ping(st, t) do
     if handshake_done?(st) and st.ping_nonce == nil and t >= st.next_ping_at do
-      nonce = :rand.uniform(0xFFFFFFFFFFFFFFFF)
+      nonce = rand64()
 
       push(
         %{st | ping_nonce: nonce, ping_sent_at: t, next_ping_at: t + @ping_interval_s},
