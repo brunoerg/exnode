@@ -7,6 +7,7 @@ defmodule Exnode.MempoolTest do
   headers on a regtest chain built here, coinbases to P2WSH(OP_TRUE).
   """
   use ExUnit.Case, async: true
+  import Exnode.Test.Wait
 
   alias Exnode.ChainParams
   alias Exnode.Chain.{Headers, State}
@@ -82,14 +83,6 @@ defmodule Exnode.MempoolTest do
   defp pending(mp) do
     st = :sys.get_state(mp)
     map_size(st.jobs) + :queue.len(st.deferred)
-  end
-
-  defp wait_until(f, n \\ 400) do
-    cond do
-      f.() -> :ok
-      n == 0 -> flunk("condition not reached")
-      true -> Process.sleep(10) && wait_until(f, n - 1)
-    end
   end
 
   # A chain state that records every call and has no chain.
