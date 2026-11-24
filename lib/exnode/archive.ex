@@ -6,8 +6,9 @@ defmodule Exnode.Archive do
 
   Layout, key points:
   * block ids, output ids and input ids are monotonic in archive order
-  * `spends`: `<<output_id::64, block_id::32>> => <<input_id::64>>`, so
-    rollback deletes exactly a block's undo list
+  * `spends`: `<<output_id::64>> => <<block_id::32, input_id::64>>`, so
+    spent checks are one batched `multi_get` and rollback deletes a block's
+    undo list
   * an output is unspent on the selected chain iff its block is on chain,
     it is not unspendable / overwritten (BIP30), and no spend record with an
     on-chain block exists
@@ -545,9 +546,9 @@ defmodule Exnode.Archive do
     sent = if hint, do: Enum.reject(ops, &Overlay.answerable?(hint, &1)), else: ops
     n = length(ops)
     s = length(sent)
-    txids = Enum.uniq(txids)
-    lookup = sent |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
-    all = Enum.uniq(lookup ++ txids)
+    txids = txids |> Enum.sort() |> Enum.dedup()
+    lookup = sent |> Enum.map(&elem(&1, 0)) |> Enum.sort() |> Enum.dedup()
+    all = (lookup ++ txids) |> Enum.sort() |> Enum.dedup()
     rows = Map.new(Enum.zip(all, KV.multi_get(a.kv, :txindex, all)))
 
     {resolve_committed(a, sent, rows),
@@ -694,7 +695,7 @@ defmodule Exnode.Archive do
 
   defp resolve_committed(a, outpoints, rows) do
     count(:committed_ops, length(outpoints))
-    txids = outpoints |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
+    txids = outpoints |> Enum.map(&elem(&1, 0)) |> Enum.sort() |> Enum.dedup()
 
     read =
       if rows,
@@ -761,27 +762,24 @@ defmodule Exnode.Archive do
     end
   end
 
-  @doc "Output ids (of `ids`) that have a spend record in an on-chain block. Uses a single iterator."
+  @doc "Output ids (of `ids`) that have a spend record in an on-chain block. Uses a single `multi_get`."
   def spent_many(_a, []), do: MapSet.new()
 
   def spent_many(a, ids) do
-    KV.with_iterator(a.kv, :spends, fn it ->
-      ids
-      |> Enum.sort()
-      |> Enum.uniq()
-      |> Enum.reduce(MapSet.intersection(a.overwritten, MapSet.new(ids)), fn id, acc ->
-        if spent_scan(a, it, KV.iter_move(it, :spends, {:seek, <<id::64>>}), id),
-          do: MapSet.put(acc, id),
-          else: acc
-      end)
+    u = ids |> Enum.sort() |> Enum.dedup()
+    keys = for id <- u, do: <<id::64>>
+    base = MapSet.intersection(a.overwritten, MapSet.new(u))
+
+    u
+    |> Enum.zip(KV.multi_get(a.kv, :spends, keys))
+    |> Enum.reduce(base, fn
+      {id, {:ok, <<b::32, _::64>>}}, acc ->
+        if on_chain?(a, b), do: MapSet.put(acc, id), else: acc
+
+      {_, :not_found}, acc ->
+        acc
     end)
   end
-
-  defp spent_scan(a, it, {:ok, <<id::64, b::32>>, _}, id) do
-    on_chain?(a, b) or spent_scan(a, it, KV.iter_move(it, :spends, :next), id)
-  end
-
-  defp spent_scan(_a, _it, _, _id), do: false
 
   # Reads outputs grouped by their sparse-index base: one pread run per group,
   # the groups in physical order ({segment, offset} ascending) for locality.
@@ -848,9 +846,10 @@ defmodule Exnode.Archive do
   @doc "True if a spend record of `out_id` belongs to a block on the selected chain."
   def spent_on_chain?(a, out_id) do
     MapSet.member?(a.overwritten, out_id) or
-      KV.fold_prefix(a.kv, :spends, <<out_id::64>>, false, fn {<<_::64, b::32>>, _}, acc ->
-        acc or on_chain?(a, b)
-      end)
+      case KV.get(a.kv, :spends, <<out_id::64>>) do
+        {:ok, <<b::32, _::64>>} -> on_chain?(a, b)
+        :not_found -> false
+      end
   end
 
   @doc "Reads output `id`: `{value, script_pubkey}`."
@@ -1071,7 +1070,7 @@ defmodule Exnode.Archive do
     a = flush(a)
     %{id: id} = a.tip
     rec = block_record!(a, id)
-    ops = for out_id <- rec.undo, do: {:delete, :spends, <<out_id::64, id::32>>}
+    ops = for out_id <- Enum.uniq(rec.undo), do: {:delete, :spends, <<out_id::64>>}
     # Core AddCoin overwrites without undoing the old coin; DisconnectBlock
     # removes the new occurrence but NEVER restores the overwritten one.
     lost = Map.get_lazy(rec, :overwritten, fn -> legacy_overwritten(a, rec) end)
@@ -1408,14 +1407,14 @@ defmodule Exnode.Archive do
   # count every input (the coinbase's too). One walk over the inputs; a
   # `spent` list longer or shorter than the non-coinbase inputs raises.
   defp spend_count([]), do: 0
-  defp spend_count([{:put_packed, :spends, 12, 8, bin}]), do: div(byte_size(bin), 20)
+  defp spend_count([{:put_packed, :spends, 8, 12, bin}]), do: div(byte_size(bin), 20)
 
   # The block's spend records as one packed put (KV.write/3): in input order,
-  # key <<out::64, block::32>>, value <<input::64>>.
+  # key <<out::64>>, value <<block::32, input::64>>.
   defp spend_ops(block_id, base_in, %Block{txs: [cb | txs]}, spent) do
     case spend_txs(txs, base_in + length(cb.inputs), spent, block_id, <<>>) do
       {<<>>, []} -> []
-      {bin, []} -> [{:put_packed, :spends, 12, 8, bin}]
+      {bin, []} -> [{:put_packed, :spends, 8, 12, bin}]
       {_, _} -> raise ArgumentError, "more spent output ids than non-coinbase inputs"
     end
   end

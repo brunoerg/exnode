@@ -11,7 +11,7 @@ defmodule Exnode.Store.KV do
   commits its index entries, spends and status in one batch.
   """
 
-  defstruct [:db, :cfs, :path]
+  defstruct [:db, :cfs, :cf_ids, :path]
 
   @type t :: %__MODULE__{}
   @type op ::
@@ -65,6 +65,9 @@ defmodule Exnode.Store.KV do
       {:ok, cache} =
         :rocksdb.new_cache(:lru, Keyword.get(opts, :block_cache_bytes, 256 * 1024 * 1024))
 
+      bg_jobs =
+        Keyword.get(opts, :max_background_jobs, max(4, min(System.schedulers_online(), 8)))
+
       # Table files RocksDB keeps open (its default, -1, keeps every SST open:
       # 920 descriptors on a mainnet store at 593k, past a 1,024 soft limit).
       # Bounded like Core's LevelDB max_open_files; the node sizes it from the
@@ -72,7 +75,10 @@ defmodule Exnode.Store.KV do
       db_opts = [
         create_if_missing: create?,
         create_missing_column_families: create?,
-        max_background_jobs: 4,
+        max_background_jobs: bg_jobs,
+        max_subcompactions: Keyword.get(opts, :max_subcompactions, 2),
+        compaction_readahead_size: 2 * 1024 * 1024,
+        enable_pipelined_write: true,
         bytes_per_sync: 1024 * 1024,
         max_open_files: Keyword.get(opts, :max_open_files, @default_max_open_files)
       ]
@@ -86,7 +92,13 @@ defmodule Exnode.Store.KV do
 
       case open_db(String.to_charlist(path), db_opts, cf_descs, deadline) do
         {:ok, db, [_default | handles]} ->
-          {:ok, %__MODULE__{db: db, cfs: Map.new(Enum.zip(names, handles)), path: path}}
+          {:ok,
+           %__MODULE__{
+             db: db,
+             cfs: Map.new(Enum.zip(names, handles)),
+             cf_ids: discover_cf_ids(names, handles),
+             path: path
+           }}
 
         {:error, _} = err ->
           err
@@ -112,31 +124,74 @@ defmodule Exnode.Store.KV do
 
   defp held_in_vm?(msg), do: :string.find(msg, ~c"lock hold by current process") != :nomatch
 
-  # Point lookups dominate (txindex: mostly misses, e.g. BIP30 checks and new
-  # txids; blockhash; locs), so every family gets a bloom filter and a shared
-  # block cache. `spends` keys are <<output_id::64, block_id::32>> and are
-  # always read by seeking to an output id, so its filter is on the 8-byte
-  # prefix. Settings only affect new SST files, so existing stores open as is.
+  # Probes each handle's internal 32-bit RocksDB column-family ID in memory
+  # (zero DB writes) so `write/3` can frame `WriteBatch` binaries directly.
+  defp discover_cf_ids(names, handles) do
+    {:ok, batch} = :rocksdb.batch()
+
+    try do
+      names
+      |> Enum.with_index()
+      |> Enum.zip(handles)
+      |> Enum.each(fn {{_name, idx}, handle} ->
+        :ok = :rocksdb.batch_put(batch, handle, <<idx::32>>, <<>>)
+      end)
+
+      ids_by_idx =
+        Map.new(:rocksdb.batch_tolist(batch), fn
+          {:put, cf_id, <<idx::32>>, <<>>} -> {idx, cf_id}
+          {:put, <<idx::32>>, <<>>} -> {idx, 0}
+        end)
+
+      names
+      |> Enum.with_index()
+      |> Map.new(fn {name, idx} -> {name, Map.fetch!(ids_by_idx, idx)} end)
+    after
+      :rocksdb.release_batch(batch)
+    end
+  end
+
+  # Point and batched lookups dominate (`txindex` and `spends`: mostly misses;
+  # `blockhash`, `headers`, `poisoned`), so those families get whole-key bloom
+  # filters and interpolation-capable index search in the shared block cache.
+  # Dense/hit-only families (`blocks`, `locs`, `pending`) omit bloom filters to
+  # keep filter memory for `txindex` and `spends`. Settings only affect new SST
+  # files, so existing stores open as is.
   defp cf_options(cf, cache) do
-    table = [
-      block_cache: cache,
-      bloom_filter_policy: 10,
-      cache_index_and_filter_blocks: true,
-      format_version: 5
-    ]
+    bloom =
+      if cf in [:blocks, :locs, :pending],
+        do: [],
+        else: [bloom_filter_policy: 10]
+
+    table =
+      bloom ++
+        [
+          block_cache: cache,
+          cache_index_and_filter_blocks: true,
+          index_block_search_type: :auto,
+          format_version: 5
+        ]
+
+    {wb_size, max_wb} =
+      cond do
+        cf in [:txindex, :spends, :pending, :scripthash] -> {64 * 1024 * 1024, 4}
+        cf in [:meta, :poisoned] -> {4 * 1024 * 1024, 2}
+        true -> {16 * 1024 * 1024, 2}
+      end
 
     # LZ4 when the RocksDB build has it (liblz4-dev present at build time).
     # Compression is recorded per SST block, so stores written uncompressed
     # stay readable and are compressed as they compact.
     base = [
       block_based_table_options: table,
-      write_buffer_size: 64 * 1024 * 1024,
+      write_buffer_size: wb_size,
+      max_write_buffer_number: max_wb,
+      memtable_batch_lookup_optimization: true,
       level_compaction_dynamic_level_bytes: true,
       compression: compression()
     ]
 
     case cf do
-      :spends -> [prefix_extractor: {:fixed_prefix_transform, 8}] ++ base
       :pending -> pending_blob_options() ++ base
       # Per-script totals are updated by merges (`{:merge, ...}` ops of
       # `:erlang.term_to_binary({:int_add, n})` onto an integer term).
@@ -235,7 +290,7 @@ defmodule Exnode.Store.KV do
   def multi_get(_kv, _cf, []), do: []
 
   def multi_get(%__MODULE__{db: db, cfs: cfs}, cf, keys) do
-    found = :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, [])
+    found = :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, async_io: true)
 
     case Enum.find(found, &match?({:error, _}, &1)) do
       {:error, reason} -> raise Error, op: :multi_get, cf: cf, reason: reason
@@ -262,60 +317,47 @@ defmodule Exnode.Store.KV do
   (`batch_put`/`batch_delete` calls) is timed apart from `write_batch`.
   """
   @spec write(t(), [op()], keyword()) :: :ok | {:error, term()}
-  def write(%__MODULE__{db: db, cfs: cfs}, ops, opts \\ []) do
+  def write(%__MODULE__{db: db, cf_ids: cf_ids}, ops, opts \\ []) do
     stats = Keyword.get(opts, :stats, false)
     t0 = if stats, do: System.monotonic_time(:microsecond)
-    ops = if Keyword.get(opts, :sort_packed, false), do: sort_packed(ops), else: ops
-    {:ok, batch} = :rocksdb.batch()
 
-    try do
-      {n, bytes} =
-        Enum.reduce(ops, {0, 0}, fn
-          {:put, cf, k, v}, {n, b} ->
-            :ok = :rocksdb.batch_put(batch, Map.fetch!(cfs, cf), k, v)
-            {n + 1, b + byte_size(k) + byte_size(v)}
+    {wb, n, bytes} =
+      encode_write_batch(ops, cf_ids, Keyword.get(opts, :sort_packed, false))
 
-          {:delete, cf, k}, {n, b} ->
-            :ok = :rocksdb.batch_delete(batch, Map.fetch!(cfs, cf), k)
-            {n + 1, b + byte_size(k)}
+    t1 = if stats, do: System.monotonic_time(:microsecond)
+    result = :rocksdb.write_binary_update(db, wb, sync: Keyword.get(opts, :sync, true))
 
-          {:merge, cf, k, v}, {n, b} ->
-            :ok = :rocksdb.batch_merge(batch, Map.fetch!(cfs, cf), k, v)
-            {n + 1, b + byte_size(k) + byte_size(v)}
+    if stats do
+      t2 = System.monotonic_time(:microsecond)
+      bump(:kv_writes, 1)
+      bump(:kv_ops, n)
+      bump(:kv_bytes, bytes)
+      bump(:kv_build_us, t1 - t0)
+      bump(:kv_write_us, t2 - t1)
 
-          {:put_packed, cf, ks, vs, bin}, {n, b} ->
-            put_packed(batch, Map.fetch!(cfs, cf), ks, vs, bin, n, b)
-        end)
-
-      t1 = if stats, do: System.monotonic_time(:microsecond)
-      result = :rocksdb.write_batch(db, batch, sync: Keyword.get(opts, :sync, true))
-
-      if stats do
-        t2 = System.monotonic_time(:microsecond)
-        bump(:kv_writes, 1)
-        bump(:kv_ops, n)
-        bump(:kv_bytes, bytes)
-        bump(:kv_build_us, t1 - t0)
-        bump(:kv_write_us, t2 - t1)
-
-        if t2 - t1 > (Process.get({__MODULE__, :stat, :kv_write_max_us}) || 0),
-          do: Process.put({__MODULE__, :stat, :kv_write_max_us}, t2 - t1)
-      end
-
-      result
-    after
-      :rocksdb.release_batch(batch)
+      if t2 - t1 > (Process.get({__MODULE__, :stat, :kv_write_max_us}) || 0),
+        do: Process.put({__MODULE__, :stat, :kv_write_max_us}, t2 - t1)
     end
+
+    result
   end
 
-  # `sort_packed: true`: in each column family written only by
-  # `put_packed` ops of one record shape, the runs are joined in order and
-  # sorted by key (`Exnode.Store.PackedSort`, stable), so the memtable
-  # takes them in key order. The store written is the same: within such a
-  # family the last put of a key still wins, and families are independent,
-  # so moving the run within the batch changes nothing. A family with any
-  # other op, or runs of two shapes, is left as given.
-  defp sort_packed(ops) do
+  # Encodes `ops` directly into RocksDB's `WriteBatch` wire format
+  # (`<<seq::little-64, count::little-32, records::binary>>`).
+  #
+  # With `sort_packed?: true`, in each column family written only by
+  # `put_packed` ops of one record shape, the runs are sorted stably by key
+  # and framed into `WriteBatch` records in one native pass
+  # (`Exnode.Store.PackedSort.encode_write_batch/5`), so the memtable takes
+  # them in key order without intermediate binary concatenation or per-record
+  # NIF calls. A family with any other op, or runs of two shapes, is encoded
+  # in the exact order given.
+  defp encode_write_batch(ops, cf_ids, false) do
+    {chunks, n, bytes} = encode_ops_seq(ops, cf_ids, [], 0, 0)
+    {IO.iodata_to_binary([<<0::little-64, n::little-32>> | Enum.reverse(chunks)]), n, bytes}
+  end
+
+  defp encode_write_batch(ops, cf_ids, true) do
     shapes =
       Enum.reduce(ops, %{}, fn
         {:put_packed, cf, ks, vs, _}, acc ->
@@ -328,39 +370,75 @@ defmodule Exnode.Store.KV do
     sortable = for {cf, {_, _}} <- shapes, into: MapSet.new(), do: cf
 
     if MapSet.size(sortable) == 0 do
-      ops
+      encode_write_batch(ops, cf_ids, false)
     else
       {runs, rest} =
         Enum.split_with(ops, &(elem(&1, 0) == :put_packed and elem(&1, 1) in sortable))
 
-      sorted =
+      {chunks, n, bytes} =
         runs
         |> Enum.group_by(&elem(&1, 1), &elem(&1, 4))
         |> Enum.sort()
-        |> Enum.map(fn {cf, bins} ->
+        |> Enum.reduce({[], 0, 0}, fn {cf, bins}, {acc, n, b} ->
           {ks, vs} = Map.fetch!(shapes, cf)
+          cf_id = Map.fetch!(cf_ids, cf)
 
-          {:put_packed, cf, ks, vs,
-           Exnode.Store.PackedSort.sort(IO.iodata_to_binary(bins), ks, vs)}
+          {:ok, chunk, cnt, kv_b} =
+            Exnode.Store.PackedSort.encode_write_batch(cf_id, ks, vs, bins, true)
+
+          {[chunk | acc], n + cnt, b + kv_b}
         end)
 
-      sorted ++ rest
+      {chunks, n, bytes} = encode_ops_seq(rest, cf_ids, chunks, n, bytes)
+      {IO.iodata_to_binary([<<0::little-64, n::little-32>> | Enum.reverse(chunks)]), n, bytes}
     end
   end
 
-  defp put_packed(_batch, _cf, _ks, _vs, <<>>, n, b), do: {n, b}
+  defp encode_ops_seq([], _cf_ids, chunks, n, bytes), do: {chunks, n, bytes}
 
-  defp put_packed(batch, cf, ks, :var, bin, n, b) do
-    <<k::binary-size(ks), len::32, v::binary-size(len), rest::binary>> = bin
-    :ok = :rocksdb.batch_put(batch, cf, k, v)
-    put_packed(batch, cf, ks, :var, rest, n + 1, b + ks + len)
+  defp encode_ops_seq([{:put, cf, k, v} | rest], cf_ids, chunks, n, bytes)
+       when is_binary(k) and is_binary(v) do
+    chunk = encode_wb_kv(Map.fetch!(cf_ids, cf), 0x01, 0x05, k, v)
+    encode_ops_seq(rest, cf_ids, [chunk | chunks], n + 1, bytes + byte_size(k) + byte_size(v))
   end
 
-  defp put_packed(batch, cf, ks, vs, bin, n, b) do
-    <<k::binary-size(ks), v::binary-size(vs), rest::binary>> = bin
-    :ok = :rocksdb.batch_put(batch, cf, k, v)
-    put_packed(batch, cf, ks, vs, rest, n + 1, b + ks + vs)
+  defp encode_ops_seq([{:delete, cf, k} | rest], cf_ids, chunks, n, bytes)
+       when is_binary(k) do
+    chunk = encode_wb_k(Map.fetch!(cf_ids, cf), 0x00, 0x04, k)
+    encode_ops_seq(rest, cf_ids, [chunk | chunks], n + 1, bytes + byte_size(k))
   end
+
+  defp encode_ops_seq([{:merge, cf, k, v} | rest], cf_ids, chunks, n, bytes)
+       when is_binary(k) and is_binary(v) do
+    chunk = encode_wb_kv(Map.fetch!(cf_ids, cf), 0x02, 0x06, k, v)
+    encode_ops_seq(rest, cf_ids, [chunk | chunks], n + 1, bytes + byte_size(k) + byte_size(v))
+  end
+
+  defp encode_ops_seq([{:put_packed, cf, ks, vs, bin} | rest], cf_ids, chunks, n, bytes) do
+    cf_id = Map.fetch!(cf_ids, cf)
+
+    {:ok, chunk, cnt, kv_b} =
+      Exnode.Store.PackedSort.encode_write_batch(cf_id, ks, vs, bin, false)
+
+    encode_ops_seq(rest, cf_ids, [chunk | chunks], n + cnt, bytes + kv_b)
+  end
+
+  defp encode_wb_kv(0, tag0, _tag_cf, k, v),
+    do: [tag0, varint32(byte_size(k)), k, varint32(byte_size(v)), v]
+
+  defp encode_wb_kv(cf_id, _tag0, tag_cf, k, v),
+    do: [tag_cf, varint32(cf_id), varint32(byte_size(k)), k, varint32(byte_size(v)), v]
+
+  defp encode_wb_k(0, tag0, _tag_cf, k),
+    do: [tag0, varint32(byte_size(k)), k]
+
+  defp encode_wb_k(cf_id, _tag0, tag_cf, k),
+    do: [tag_cf, varint32(cf_id), varint32(byte_size(k)), k]
+
+  defp varint32(v) when v < 128, do: <<v>>
+
+  defp varint32(v),
+    do: <<Bitwise.bor(Bitwise.band(v, 0x7F), 0x80), varint32(Bitwise.bsr(v, 7))::binary>>
 
   @doc """
   Takes (and resets) this process's counters of `write(..., stats: true)`:
@@ -398,6 +476,29 @@ defmodule Exnode.Store.KV do
   @doc "Runs `fun.(it)` with a total-order iterator over `cf`, always closing `it`."
   def with_iterator(%__MODULE__{} = kv, cf, fun) do
     it = iterator(kv, cf)
+
+    try do
+      fun.(it)
+    after
+      :rocksdb.iterator_close(it)
+    end
+  end
+
+  @doc """
+  An iterator over `cf` bounded to the sought key's prefix (`prefix_same_as_start:
+  true`), allowing RocksDB to consult prefix bloom filters when `cf` configures
+  a `prefix_extractor`.
+  """
+  def prefix_iterator(%__MODULE__{db: db, cfs: cfs}, cf) do
+    case :rocksdb.iterator(db, Map.fetch!(cfs, cf), prefix_same_as_start: true) do
+      {:ok, it} -> it
+      {:error, reason} -> raise Error, op: :iterator, cf: cf, reason: reason
+    end
+  end
+
+  @doc "Runs `fun.(it)` with a prefix-bounded iterator over `cf`, always closing `it`."
+  def with_prefix_iterator(%__MODULE__{} = kv, cf, fun) do
+    it = prefix_iterator(kv, cf)
 
     try do
       fun.(it)

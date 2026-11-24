@@ -25,6 +25,7 @@ defmodule Exnode.CLI do
     datadir_cold: :string,
     prune_witness: :boolean,
     dbcache: :integer,
+    kv_cache_mib: :integer,
     commit_at_tip: :boolean,
     prefetch: :integer,
     batch_blocks: :integer,
@@ -79,6 +80,7 @@ defmodule Exnode.CLI do
         datadir_cold: opts[:datadir_cold] && Path.expand(opts[:datadir_cold]),
         prune_witness: Keyword.get(opts, :prune_witness, false),
         cache_bytes: Keyword.get(opts, :dbcache, 450) * 1024 * 1024,
+        kv_cache_bytes: Keyword.get(opts, :kv_cache_mib, 256) * 1024 * 1024,
         # Test only: --no-commit-at-tip keeps blocks batched at the tip (crash tests).
         commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
         # Commit batch limits: a batch is committed (segment sync + one synced

@@ -155,26 +155,19 @@ defmodule Exnode.Archive.Query do
   defp spend_records(_a, []), do: %{}
 
   defp spend_records(a, ids) do
-    KV.with_iterator(a.kv, :spends, fn it ->
-      ids
-      |> Enum.sort()
-      |> Enum.uniq()
-      |> Enum.reduce(%{}, fn id, acc ->
-        case spend_record(a, it, KV.iter_move(it, :spends, {:seek, <<id::64>>}), id) do
-          nil -> acc
-          r -> Map.put(acc, id, r)
-        end
-      end)
+    u = ids |> Enum.sort() |> Enum.dedup()
+    keys = for id <- u, do: <<id::64>>
+
+    u
+    |> Enum.zip(KV.multi_get(a.kv, :spends, keys))
+    |> Enum.reduce(%{}, fn
+      {id, {:ok, <<b::32, input::64>>}}, acc ->
+        if Archive.on_chain?(a, b), do: Map.put(acc, id, {b, input}), else: acc
+
+      {_, :not_found}, acc ->
+        acc
     end)
   end
-
-  defp spend_record(a, it, {:ok, <<id::64, b::32>>, <<input::64>>}, id) do
-    if Archive.on_chain?(a, b),
-      do: {b, input},
-      else: spend_record(a, it, KV.iter_move(it, :spends, :next), id)
-  end
-
-  defp spend_record(_a, _it, _, _id), do: nil
 
   # {tx position, input index} of the block's `k`th input (counting every
   # input, the coinbase's too, as input ids do).
