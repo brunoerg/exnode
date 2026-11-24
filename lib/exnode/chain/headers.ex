@@ -122,13 +122,29 @@ defmodule Exnode.Chain.Headers do
     min_pow = Keyword.get(opts, :min_pow_checked, true)
     before = Index.size(st.idx)
 
-    {reply, idx, new_entries} =
+    existing =
+      if st.writer,
+        do:
+          for(h <- headers, Index.lookup(st.idx, h.hash) != nil, into: MapSet.new(), do: h.hash),
+        else: MapSet.new()
+
+    {reply, idx} =
       case HeaderRules.process_new_block_headers(st.idx, headers, st.params, min_pow, now) do
-        {:ok, last, idx} -> {{:ok, last}, idx, new_since(idx, headers)}
-        {:error, reason, last, idx} -> {{:error, reason, last}, idx, new_since(idx, headers)}
+        {:ok, last, idx} -> {{:ok, last}, idx}
+        {:error, reason, last, idx} -> {{:error, reason, last}, idx}
       end
 
-    if st.writer && Index.size(idx) > before, do: Writer.write(st.writer, ops(new_entries))
+    if st.writer && Index.size(idx) > before do
+      new_entries =
+        for h <- headers,
+            not MapSet.member?(existing, h.hash),
+            e = Index.lookup(idx, h.hash),
+            e != nil,
+            do: e
+
+      if new_entries != [], do: Writer.write(st.writer, ops(new_entries))
+    end
+
     {:reply, reply, %{st | idx: idx}}
   end
 
@@ -150,10 +166,6 @@ defmodule Exnode.Chain.Headers do
   defp clock(%{now: f}) when is_function(f, 0), do: f.()
   defp clock(_), do: System.os_time(:second)
 
-  defp new_since(idx, headers) do
-    headers |> Enum.map(&Index.lookup(idx, &1.hash)) |> Enum.reject(&is_nil/1)
-  end
-
   defp ops(entries), do: for(e <- entries, do: {:put, :headers, e.hash, encode(e)})
 
   defp encode(e), do: <<e.height::32, status_byte(e.status), e.raw::binary>>
@@ -162,21 +174,28 @@ defmodule Exnode.Chain.Headers do
 
   defp load(idx, kv) do
     kv
-    |> KV.fold_prefix(:headers, <<>>, [], fn {_k, <<h::32, s, raw::binary-size(80)>>}, acc ->
-      [{h, s, raw} | acc]
+    |> KV.fold_prefix(:headers, <<>>, [], fn {k, <<h::32, s, raw::binary-size(80)>>}, acc ->
+      [{h, s, k, raw} | acc]
     end)
     |> Enum.sort_by(&elem(&1, 0))
-    |> Enum.reduce(idx, fn {_h, s, raw}, idx ->
-      {hdr, ""} = Header.decode(raw)
-
-      if Index.lookup(idx, hdr.hash) do
+    |> Enum.reduce(idx, fn {h, s, k, raw}, idx ->
+      if Index.lookup(idx, k) do
         idx
       else
+        hdr = Header.decode_with_hash(raw, k)
         prev = Index.lookup(idx, hdr.prev_hash)
+
+        if prev == nil do
+          raise Exnode.StorageError,
+            source: :headers,
+            reason: {:missing_parent, k, hdr.prev_hash},
+            message: "header store corrupt: missing parent for header at height #{h}"
+        end
+
         e = Index.make_entry(hdr, prev)
         # Core LoadBlockIndex (blockstorage.cpp): a child of a failed block
         # is failed; failed entries never become the best header (insert/2).
-        failed = s == 1 or (prev != nil and prev.status == :failed)
+        failed = s == 1 or prev.status == :failed
         Index.insert(idx, %{e | status: if(failed, do: :failed, else: :valid_header)})
       end
     end)

@@ -81,20 +81,11 @@ defmodule Exnode.Archive.Segments do
   def position(%__MODULE__{seg: s, offset: o}), do: {s, o}
 
   @doc """
-  Appends one block's `records` (a list of iodata) whose ids start at
-  `base`, as `append_block/2`, but returns only what the archive keeps:
-  `{segments, first, sparse}`, `first` the first record's location and
-  `sparse` `[{id, {seg, offset}}]` for the ids that are multiples of
-  `every`, in order. One pass over the records; the write is the same.
-  """
-  def append_sparse(%__MODULE__{} = st, records, base, every),
-    do: append_layout(st, layout(records, base, every))
-
-  @doc """
-  The position-independent part of `append_sparse/4`: `{records, rel,
-  total}`, `rel` the `{id, offset in the block}` of the ids that are
-  multiples of `every` (newest first). Pure, so any process may compute it;
-  `records` may be flattened to one binary before `append_layout/2`.
+  Position-independent layout of one block's `records` (a list of iodata)
+  whose ids start at `base`: `{records, rel, total}`, `rel` the
+  `{id, offset in the block}` of the ids that are multiples of `every`
+  (newest first). Pure, so any process may compute it; `records` may be
+  flattened to one binary before `append_layout/2`.
   """
   def layout(records, base, every) do
     {rel, total, _} =
@@ -106,7 +97,11 @@ defmodule Exnode.Archive.Segments do
     {records, rel, total}
   end
 
-  @doc "Writes a `layout/3` result; returns what `append_sparse/4` returns."
+  @doc """
+  Writes a `layout/3` result; returns `{segments, first, sparse}`, where
+  `first` is the first record's `{seg, offset}` and `sparse` is
+  `[{id, {seg, offset}}]` for the ids that are multiples of `every`, in order.
+  """
   def append_layout(%__MODULE__{} = st, {records, rel, total}) do
     st = if st.offset > 0 and st.offset + total > st.max, do: roll(st), else: st
     %{seg: seg, offset: start} = st
@@ -150,7 +145,13 @@ defmodule Exnode.Archive.Segments do
   defp do_roll(st) do
     seg = st.seg + 1
     # Locations store the segment number in 16 bits: one more would wrap.
-    if seg > 0xFFFF, do: raise("archive #{st.kind} has no segment number left after #{st.seg}")
+    if seg > 0xFFFF do
+      raise Exnode.StorageError,
+        source: :segments,
+        reason: {:segment_overflow, st.kind, st.seg},
+        message: "archive #{st.kind} has no segment number left after #{st.seg}"
+    end
+
     :ok = :file.sync(st.fd)
     :ok = :file.close(st.fd)
     {:ok, fd} = :file.open(path(st.dir, seg), [:raw, :binary, :read, :write])
@@ -169,7 +170,11 @@ defmodule Exnode.Archive.Segments do
       :ok
     else
       err ->
-        raise "cannot fsync directory #{dir} (#{inspect(err)}): the archive's durability contract needs it"
+        raise Exnode.StorageError,
+          source: :segments,
+          reason: {:fsync_dir, dir, err},
+          message:
+            "cannot fsync directory #{dir} (#{inspect(err)}): the archive's durability contract needs it"
     end
   end
 
@@ -227,12 +232,20 @@ defmodule Exnode.Archive.Segments do
   defp check_committed!(dir, kind, {seg, offset}) do
     case File.stat(path(dir, seg)) do
       {:error, :enoent} ->
-        raise "archive #{kind} segment #{seg} missing but committed state references it: " <>
-                "the archive is corrupt; resync required"
+        raise Exnode.StorageError,
+          source: :segments,
+          reason: {:missing_segment, kind, seg},
+          message:
+            "archive #{kind} segment #{seg} missing but committed state references it: " <>
+              "the archive is corrupt; resync required"
 
       {:ok, %{size: size}} when size < offset ->
-        raise "archive #{kind} segment #{seg} is shorter than the committed end (#{size} < #{offset}): " <>
-                "the archive is corrupt; resync required"
+        raise Exnode.StorageError,
+          source: :segments,
+          reason: {:short_segment, kind, seg, size, offset},
+          message:
+            "archive #{kind} segment #{seg} is shorter than the committed end (#{size} < #{offset}): " <>
+              "the archive is corrupt; resync required"
 
       {:ok, _} ->
         :ok
@@ -243,7 +256,7 @@ defmodule Exnode.Archive.Segments do
 
   defmodule Reader do
     @moduledoc false
-    defstruct [:dir, fds: %{}]
+    defstruct [:dir]
   end
 
   def open_reader(%__MODULE__{dir: dir}), do: %Reader{dir: dir}
@@ -255,13 +268,13 @@ defmodule Exnode.Archive.Segments do
   segment (see `read_run/6`).
   """
   def read_nth(%Reader{} = r, loc, n, decode, chunk \\ 4096) do
-    {r, [rec]} = read_run(r, loc, n, 1, decode, chunk)
-    {r, rec}
+    [rec] = read_run(r, loc, n, 1, decode, chunk)
+    rec
   end
 
   @doc """
   Skips `skip` records at `{seg, offset}`, then reads `count` consecutive
-  records. Returns `{reader, records}`.
+  records and returns them as a list.
 
   Ids are contiguous across segments, but a segment only rolls at a block
   boundary. A sparse-index group (64 ids) can therefore span two segments.
@@ -269,7 +282,7 @@ defmodule Exnode.Archive.Segments do
   of the next segment.
   """
   def read_run(%Reader{} = r, {seg, offset}, skip, count, decode, chunk \\ 65_536) do
-    {r, fd} = fd(r, seg)
+    fd = fd(r, seg)
     bump(:preads, 1)
     bump(:pread_bytes, chunk)
 
@@ -283,15 +296,18 @@ defmodule Exnode.Archive.Segments do
 
     case take(data, skip, count, decode, []) do
       {:ok, recs} ->
-        {r, recs}
+        recs
 
       {:more, skip_left, count_left, acc, rest} when eof and rest == <<>> ->
         # The segment ended exactly on a record boundary: continue in the next one.
-        {r, more} = read_run(r, {seg + 1, 0}, skip_left, count_left, decode)
-        {r, Enum.reverse(acc) ++ more}
+        more = read_run(r, {seg + 1, 0}, skip_left, count_left, decode)
+        Enum.reverse(acc) ++ more
 
       {:more, _, _, _, _} when eof ->
-        raise "archive segment truncated at #{seg}:#{offset}"
+        raise Exnode.StorageError,
+          source: :segments,
+          reason: {:truncated_segment, seg, offset},
+          message: "archive segment truncated at #{seg}:#{offset}"
 
       {:more, _, _, _, _} ->
         read_run(r, {seg, offset}, skip, count, decode, chunk * 4)
@@ -377,14 +393,14 @@ defmodule Exnode.Archive.Segments do
     case handles do
       %{^p => {fd, _}} ->
         Process.put({__MODULE__, :handles}, %{handles | p => {fd, tick}})
-        {r, fd}
+        fd
 
       _ ->
         handles = shrink(handles, cap() - 1)
         {:ok, fd} = :file.open(p, [:raw, :binary, :read])
         bump(:read_opens, 1)
         Process.put({__MODULE__, :handles}, Map.put(handles, p, {fd, tick}))
-        {r, fd}
+        fd
     end
   end
 
