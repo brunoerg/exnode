@@ -17,7 +17,8 @@ defmodule Exnode.DoS.OrphanFanoutTest do
   fan-out over real sockets, streams fresh orphans, and checks that an
   honest peer's tx and block are not meaningfully delayed.
 
-  Tunables: `FANOUT_ORPHANS` (400), `FANOUT_ANN` (100), `FANOUT_SENDERS` (24).
+  Tunables: `FANOUT_ORPHANS` (400), `FANOUT_ANN` (100), `FANOUT_SENDERS` (24),
+  `FANOUT_WARMUP_KIB` (1024).
   Full scale: `FANOUT_ORPHANS=1000 FANOUT_ANN=200 FANOUT_SENDERS=40`.
   """
   use ExUnit.Case, async: false
@@ -103,22 +104,17 @@ defmodule Exnode.DoS.OrphanFanoutTest do
     _, _ -> 0
   end
 
-  # The fan-out invs have been handled: the announcer count is stable and
-  # TxRelay's mailbox is empty for a few consecutive polls.
-  defp fanout_settled?(node) do
-    Exnode.Test.Wait.until?(
-      fn ->
-        a = fanout_entries(node)
-        Process.sleep(200)
+  # Every announcer's inv has been handled: a peer handles its messages in
+  # order and its inv is a call to TxRelay, so the pong to a ping sent after
+  # the inv comes once TxRelay has added that peer's announcements.
+  defp await_handled(socks) do
+    for {sock, i} <- Enum.with_index(socks), do: FakePeer.send_msgs(sock, {:ping, i + 1})
+    for sock <- socks, do: FakePeer.recv(sock, ["pong"], 1, timeout: 120_000)
+  end
 
-        {:message_queue_len, q} =
-          Process.info(Process.whereis(node.n.tx_relay), :message_queue_len)
-
-        q == 0 and fanout_entries(node) == a
-      end,
-      120_000,
-      100
-    )
+  defp in_bytes do
+    {{:input, b}, _} = :erlang.statistics(:io)
+    b
   end
 
   @tag :bench
@@ -149,7 +145,7 @@ defmodule Exnode.DoS.OrphanFanoutTest do
     {setup_us, _} =
       :timer.tc(fn ->
         for sock <- announcers, do: FakePeer.send_msgs(sock, [{:inv, items}])
-        assert fanout_settled?(node)
+        await_handled(announcers)
       end)
 
     # Capped as Core's latency score, not orphans x announcers.
@@ -194,15 +190,21 @@ defmodule Exnode.DoS.OrphanFanoutTest do
     # entry; now it costs O(evictions).
     stop = :counters.new(1, [])
     sent = :counters.new(1, [])
+    warmup_from = in_bytes()
 
     attack_pids =
       for {sock, k} <- Enum.with_index(senders) do
         spawn(fn -> trigger_loop(sock, k * 1_000_000, stop, sent) end)
       end
 
-    # While the triggers are being processed, the honest peer relays a tx.
-    # Give the attackers' calls a moment to pile up in TxRelay's mailbox.
-    Process.sleep(String.to_integer(System.get_env("FANOUT_WARMUP_MS", "2500")))
+    # While the triggers are being processed, the honest peer relays a tx:
+    # once the node has read FANOUT_WARMUP_KIB of attack traffic (~94 bytes
+    # an orphan), so the attackers' calls are piling up in TxRelay's mailbox.
+    warmup = String.to_integer(System.get_env("FANOUT_WARMUP_KIB", "1024")) * 1024
+
+    assert Exnode.Test.Wait.until?(fn -> in_bytes() - warmup_from >= warmup end, 120_000),
+           "attack traffic did not reach #{div(warmup, 1024)} KiB"
+
     honest_tx2 = Coins.tx([Enum.at(coins, 1)], [{25 * @coin, Coins.p2wsh()}])
     b1 = next_block(b0.header, 113)
 

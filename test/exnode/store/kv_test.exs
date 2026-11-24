@@ -37,13 +37,16 @@ defmodule Exnode.Store.KVTest do
     assert {:error, {:db_open, msg}} = KV.open(dir, lock_wait_ms: 50)
     assert to_string(msg) =~ "lock hold by current process"
 
-    # Released while the second open waits.
-    Task.start(fn ->
-      Process.sleep(100)
-      KV.close(kv)
+    # Released while the second open waits: it found the store held and is
+    # sleeping before its next attempt.
+    opening = Task.async(fn -> KV.open(dir) end)
+
+    Exnode.Test.Wait.wait_until(fn ->
+      Process.info(opening.pid, :current_function) == {:current_function, {Process, :sleep, 1}}
     end)
 
-    assert {:ok, kv2} = KV.open(dir)
+    KV.close(kv)
+    assert {:ok, kv2} = Task.await(opening)
     KV.close(kv2)
     # Closing again is harmless.
     assert KV.close(kv) == :ok

@@ -47,13 +47,21 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
           {:reply, {:error, %{result: :missing_inputs, reason: "missing-inputs"}}, st}
 
         true ->
-          Process.sleep(st.ms)
+          verify(st.ms)
           :counters.add(st.ctr, 1, 1)
 
           {:reply, {:error, %{result: :consensus, reason: "mandatory-script-verify-flag-failed"}},
            st}
       end
     end
+
+    # `{:gate, pid}`: tells pid it is verifying and holds until `:go`.
+    defp verify({:gate, pid}) do
+      send(pid, {:verifying, self()})
+      receive do: (:go -> :ok)
+    end
+
+    defp verify(ms), do: Process.sleep(ms)
   end
 
   defp tx(inputs, tag) do
@@ -110,7 +118,8 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
     relay_parent =
       Task.async(fn -> :timer.tc(fn -> TxRelay.received_tx(r, honest, parent) end) end)
 
-    Process.sleep(20)
+    # The inv must arrive while the children are being reconsidered.
+    await(fn -> :counters.get(ctr, 1) >= 1 end)
     item = %{type: :wtx, hash: :crypto.strong_rand_bytes(32)}
     {inv_us, :ok} = :timer.tc(fn -> TxRelay.inv(r, other, [item]) end)
     {parent_us, :ok} = Task.await(relay_parent, 60_000)
@@ -182,15 +191,18 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
   test "an announcer that disconnects takes its queued reconsideration with it" do
     parent = tx([{:crypto.strong_rand_bytes(32), 0}], 0)
     ctr = :counters.new(1, [])
-    {:ok, mp} = SlowMempool.start_link({parent.wtxid, ctr, 200})
+    {:ok, mp} = SlowMempool.start_link({parent.wtxid, ctr, {:gate, self()}})
     {:ok, r} = TxRelay.start_link(mempool: mp, tick_ms: nil)
     a = peer(r)
     for i <- 1..5, do: :ok = TxRelay.received_tx(r, a, tx([{parent.txid, i}], i))
 
-    # The first child is being verified (200 ms) when the announcer goes.
+    # The first child is being verified when the announcer goes: TxRelay
+    # has the DOWN queued before that verification returns.
     :ok = TxRelay.received_tx(r, peer(r), parent)
-    Process.sleep(50)
+    assert_receive {:verifying, ^mp}, 5_000
     Process.exit(a, :kill)
+    await(fn -> down_queued?(r, a) end)
+    send(mp, :go)
     await(fn -> :sys.get_state(r).orphan_work == %{} end)
 
     st = :sys.get_state(r)
@@ -200,6 +212,11 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
     # EraseForPeer); the orphans themselves went with their only announcer.
     assert :counters.get(ctr, 1) == 1
     assert TxRelay.orphans(r) == []
+  end
+
+  defp down_queued?(r, pid) do
+    {:messages, msgs} = Process.info(r, :messages)
+    Enum.any?(msgs, &match?({:DOWN, _, :process, ^pid, _}, &1))
   end
 
   defp wait_all(r, ctr, deadline) do
