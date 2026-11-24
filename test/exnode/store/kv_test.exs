@@ -135,12 +135,16 @@ defmodule Exnode.Store.KVPackedTest do
 
   property "packed puts are the same writes", %{tmp_dir: dir} do
     check all(ops <- list_of(op_gen(), max_length: 12), max_runs: 50) do
-      {:ok, a} = KV.open(Path.join(dir, "a"))
-      {:ok, b} = KV.open(Path.join(dir, "b"))
+      # Fresh directories per run, not removed after it: KV.close only asks
+      # RocksDB to close, and the DB is torn down (still writing files) when
+      # its last reference goes, so removing the directory right after the
+      # close can fail with it not empty. The tmp_dir goes with the next run.
+      run = System.unique_integer([:positive])
+      {:ok, a} = KV.open(Path.join(dir, "a#{run}"))
+      {:ok, b} = KV.open(Path.join(dir, "b#{run}"))
 
-      # Closed even when an assertion fails: otherwise each shrinking rerun
-      # reopens a still-open directory and reports a RocksDB lock error
-      # instead of the original failure.
+      # Closed even when an assertion fails, so shrinking reruns do not pile
+      # up open stores.
       try do
         KV.take_stats()
         :ok = KV.write(a, Enum.flat_map(ops, &expand/1), stats: true)
@@ -152,8 +156,6 @@ defmodule Exnode.Store.KVPackedTest do
       after
         KV.close(a)
         KV.close(b)
-        File.rm_rf!(Path.join(dir, "a"))
-        File.rm_rf!(Path.join(dir, "b"))
       end
     end
   end
