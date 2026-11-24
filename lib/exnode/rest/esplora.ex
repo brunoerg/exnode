@@ -53,6 +53,32 @@ defmodule Exnode.REST.Esplora do
   plug(:match)
   plug(:dispatch)
 
+  @impl Plug
+  def call(conn, opts) do
+    super(conn, opts)
+  rescue
+    e in Plug.Conn.WrapperError ->
+      case e do
+        %{kind: :exit, reason: reason} -> service_unavailable(conn, reason)
+        _ -> reraise(e, __STACKTRACE__)
+      end
+  catch
+    :exit, reason ->
+      service_unavailable(conn, reason)
+  end
+
+  defp service_unavailable(conn, reason) do
+    require Logger
+
+    Logger.warning(
+      "REST #{conn.method} #{conn.request_path}: component unavailable: #{inspect(reason, limit: 5)}"
+    )
+
+    if conn.state in [:unset, :set],
+      do: err(conn, 503, "Service unavailable"),
+      else: conn
+  end
+
   defp limit_reads(conn, _opts) do
     Exnode.Archive.Segments.limit_read_handles(Exnode.FdBudget.api_read_handles())
     conn
@@ -508,21 +534,19 @@ defmodule Exnode.REST.Esplora do
   defp inner_scripts(base, nil, _i), do: base
 
   defp inner_scripts(base, po, i) do
-    base =
+    redeem =
       if Exnode.Script.p2sh?(po.script_pubkey) do
         case Policy.eval_push_only(i.script_sig) do
-          {:ok, [_ | _] = stack} -> Map.put(base, :inner_redeemscript_asm, asm(List.last(stack)))
-          _ -> base
+          {:ok, [_ | _] = stack} -> List.last(stack)
+          _ -> nil
         end
-      else
-        base
       end
+
+    base = if redeem != nil, do: Map.put(base, :inner_redeemscript_asm, asm(redeem)), else: base
 
     wsh =
       match?(<<0, 32, _::binary-size(32)>>, po.script_pubkey) or
-        (Map.has_key?(base, :inner_redeemscript_asm) and
-           match?({:ok, [_ | _]}, Policy.eval_push_only(i.script_sig)) and
-           match?(<<0, 32, _::binary>>, List.last(elem(Policy.eval_push_only(i.script_sig), 1))))
+        match?(<<0, 32, _::binary>>, redeem)
 
     if wsh and i.witness != [],
       do: Map.put(base, :inner_witnessscript_asm, asm(List.last(i.witness))),

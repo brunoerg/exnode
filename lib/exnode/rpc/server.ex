@@ -34,6 +34,7 @@ defmodule Exnode.RPC.Server do
     "getmempoolentry" => ~w(txid),
     "testmempoolaccept" => ~w(rawtxs maxfeerate),
     "sendrawtransaction" => ~w(hexstring maxfeerate maxburnamount),
+    "submitpackage" => ~w(package maxfeerate maxburnamount),
     "getblockfilter" => ~w(blockhash filtertype)
   }
 
