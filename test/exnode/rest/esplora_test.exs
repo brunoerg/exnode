@@ -289,7 +289,10 @@ defmodule Exnode.REST.EsploraTest do
 
   test "POST /tx flood of bad-signature txs: all rejected, reads keep answering",
        %{tmp_dir: dir} do
+    test = self()
+
     slow = fn raw, spent, flags ->
+      send(test, :verifying)
       Process.sleep(100)
       Exnode.Kernel.verify_tx_all(raw, spent, flags)
     end
@@ -307,8 +310,10 @@ defmodule Exnode.REST.EsploraTest do
         |> Base.encode16(case: :lower)
       end
 
+    flush_verifying()
     flood = for hex <- bad, do: Task.async(fn -> req(Esplora, n.ctx, :post, "/tx", hex) end)
-    Process.sleep(20)
+    # The reads go in while the mempool is verifying the flood.
+    assert_receive :verifying, 5_000
 
     for path <- ["/blocks/tip/hash", "/mempool"] do
       {us, {200, _}} = :timer.tc(fn -> req(Esplora, n.ctx, :get, path) end)
@@ -321,6 +326,15 @@ defmodule Exnode.REST.EsploraTest do
     end
 
     assert Mempool.size(n.mp) == 0
+  end
+
+  # Any verification before the flood (setup) does not count.
+  defp flush_verifying do
+    receive do
+      :verifying -> flush_verifying()
+    after
+      0 -> :ok
+    end
   end
 
   # Regression: /utxo took each row's block from the active

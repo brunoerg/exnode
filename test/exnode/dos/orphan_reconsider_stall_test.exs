@@ -16,6 +16,7 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
   drained a step at a time, between the calls TxRelay serves.
   """
   use ExUnit.Case, async: false
+  import Exnode.Test.Wait
   @moduletag :dos
 
   alias Exnode.Codec.Tx
@@ -47,13 +48,21 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
           {:reply, {:error, %{result: :missing_inputs, reason: "missing-inputs"}}, st}
 
         true ->
-          Process.sleep(st.ms)
+          verify(st.ms)
           :counters.add(st.ctr, 1, 1)
 
           {:reply, {:error, %{result: :consensus, reason: "mandatory-script-verify-flag-failed"}},
            st}
       end
     end
+
+    # `{:gate, pid}`: tells pid it is verifying and holds until `:go`.
+    defp verify({:gate, pid}) do
+      send(pid, {:verifying, self()})
+      receive do: (:go -> :ok)
+    end
+
+    defp verify(ms), do: Process.sleep(ms)
   end
 
   defp tx(inputs, tag) do
@@ -110,7 +119,8 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
     relay_parent =
       Task.async(fn -> :timer.tc(fn -> TxRelay.received_tx(r, honest, parent) end) end)
 
-    Process.sleep(20)
+    # The inv must arrive while the children are being reconsidered.
+    wait_until(fn -> :counters.get(ctr, 1) >= 1 end)
     item = %{type: :wtx, hash: :crypto.strong_rand_bytes(32)}
     {inv_us, :ok} = :timer.tc(fn -> TxRelay.inv(r, other, [item]) end)
     {parent_us, :ok} = Task.await(relay_parent, 60_000)
@@ -126,8 +136,11 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
     assert parent_us < 1_000_000
 
     # The work still gets done: every child reconsidered, and gone.
-    deadline = System.monotonic_time(:millisecond) + 30_000
-    wait_all(r, ctr, deadline)
+    done? = fn -> :counters.get(ctr, 1) >= @children and TxRelay.orphans(r) == [] end
+
+    assert Exnode.Test.Wait.until?(done?, 30_000),
+           "children not all reconsidered: #{:counters.get(ctr, 1)} of #{@children}"
+
     assert :counters.get(ctr, 1) == @children
     assert TxRelay.orphans(r) == []
   end
@@ -154,14 +167,6 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
     end
   end
 
-  defp await(f, deadline \\ System.monotonic_time(:millisecond) + 5_000) do
-    cond do
-      f.() -> :ok
-      System.monotonic_time(:millisecond) > deadline -> flunk("condition not reached")
-      true -> Process.sleep(10) && await(f, deadline)
-    end
-  end
-
   test "a chain of orphans resolves step by step once its root arrives" do
     root = tx([{:crypto.strong_rand_bytes(32), 0}], 0)
     child = tx([{root.txid, 0}], 1)
@@ -175,23 +180,26 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
     assert Enum.sort(TxRelay.orphans(r)) == Enum.sort([child.wtxid, grandchild.wtxid])
 
     :ok = TxRelay.received_tx(r, peer(r), root)
-    await(fn -> TxRelay.orphans(r) == [] end)
+    wait_until(fn -> TxRelay.orphans(r) == [] end)
     assert MapSet.member?(:sys.get_state(mp).have, grandchild.txid)
   end
 
   test "an announcer that disconnects takes its queued reconsideration with it" do
     parent = tx([{:crypto.strong_rand_bytes(32), 0}], 0)
     ctr = :counters.new(1, [])
-    {:ok, mp} = SlowMempool.start_link({parent.wtxid, ctr, 200})
+    {:ok, mp} = SlowMempool.start_link({parent.wtxid, ctr, {:gate, self()}})
     {:ok, r} = TxRelay.start_link(mempool: mp, tick_ms: nil)
     a = peer(r)
     for i <- 1..5, do: :ok = TxRelay.received_tx(r, a, tx([{parent.txid, i}], i))
 
-    # The first child is being verified (200 ms) when the announcer goes.
+    # The first child is being verified when the announcer goes: TxRelay
+    # has the DOWN queued before that verification returns.
     :ok = TxRelay.received_tx(r, peer(r), parent)
-    Process.sleep(50)
+    assert_receive {:verifying, ^mp}, 5_000
     Process.exit(a, :kill)
-    await(fn -> :sys.get_state(r).orphan_work == %{} end)
+    wait_until(fn -> down_queued?(r, a) end)
+    send(mp, :go)
+    wait_until(fn -> :sys.get_state(r).orphan_work == %{} end)
 
     st = :sys.get_state(r)
     assert MapSet.size(st.orphan_work_set) == 0
@@ -202,17 +210,8 @@ defmodule Exnode.DoS.OrphanReconsiderStallTest do
     assert TxRelay.orphans(r) == []
   end
 
-  defp wait_all(r, ctr, deadline) do
-    cond do
-      :counters.get(ctr, 1) >= @children and TxRelay.orphans(r) == [] ->
-        :ok
-
-      System.monotonic_time(:millisecond) > deadline ->
-        flunk("children not all reconsidered: #{:counters.get(ctr, 1)} of #{@children}")
-
-      true ->
-        Process.sleep(20)
-        wait_all(r, ctr, deadline)
-    end
+  defp down_queued?(r, pid) do
+    {:messages, msgs} = Process.info(r, :messages)
+    Enum.any?(msgs, &match?({:DOWN, _, :process, ^pid, _}, &1))
   end
 end

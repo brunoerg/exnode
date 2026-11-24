@@ -210,15 +210,14 @@ defmodule Exnode.Properties.OrphanagePropertyTest do
       peers ->
         peer = at(peers, p)
         Process.exit(peer, :kill)
-        wait_unregistered(ctx.r, peer)
-        %{ctx | peers: List.delete(peers, peer), gone: [peer | ctx.gone]}
-    end
-  end
+        # Polled at 1 ms: this runs on every disconnect of every property run.
+        Exnode.Test.Wait.wait_until(
+          fn -> not Map.has_key?(:sys.get_state(ctx.r).peers, peer) end,
+          5_000,
+          1
+        )
 
-  defp wait_unregistered(r, peer) do
-    if Map.has_key?(:sys.get_state(r).peers, peer) do
-      Process.sleep(1)
-      wait_unregistered(r, peer)
+        %{ctx | peers: List.delete(peers, peer), gone: [peer | ctx.gone]}
     end
   end
 

@@ -27,7 +27,7 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
   @moduletag :dos
 
   alias Exnode.Codec.{Block, CompactSize, Tx}
-  alias Exnode.P2P.{DecodeBudget, Frame}
+  alias Exnode.P2P.{DecodeBudget, Frame, FrameBuffer}
 
   @magic Exnode.ChainParams.get(:regtest).magic
   @max_payload 4_000_000
@@ -134,7 +134,7 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
 
       assert_receive :holding
       waiter = Task.async(fn -> DecodeBudget.with_budget(b, 700_000, fn -> :ran end) end)
-      Process.sleep(50)
+      wait_until(fn -> DecodeBudget.info(b).waiting == 1 end)
       assert %{available: 300_000, holders: 1, waiting: 1} = DecodeBudget.info(b)
       assert Task.yield(waiter, 0) == nil
 
@@ -174,14 +174,11 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
 
       assert_receive :holding
       waiter = spawn(fn -> DecodeBudget.with_budget(b, 100_000, fn -> :ok end) end)
-      Process.sleep(50)
-      assert %{waiting: 1} = DecodeBudget.info(b)
+      wait_until(fn -> DecodeBudget.info(b).waiting == 1 end)
       Process.exit(waiter, :kill)
-      Process.sleep(50)
-      assert %{waiting: 0} = DecodeBudget.info(b)
+      wait_until(fn -> DecodeBudget.info(b).waiting == 0 end)
       send(holder, :go)
-      Process.sleep(50)
-      assert %{available: 1_000_000, holders: 0} = DecodeBudget.info(b)
+      wait_until(fn -> match?(%{available: 1_000_000, holders: 0}, DecodeBudget.info(b)) end)
     end
 
     test "with no server running the caller is told, and fun does not run" do
@@ -233,8 +230,11 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
   # unknown). Returns the peak sum.
   defp release_and_measure(peers, head, last) do
     for %{sock: s} <- peers, do: :ok = :gen_tcp.send(s, head)
-    # Let every peer buffer its partial frame.
-    Process.sleep(500)
+    # Every peer holds its partial frame.
+    for %{pid: p} <- peers do
+      wait_until(fn -> FrameBuffer.size(:sys.get_state(p).buf) == byte_size(head) end, 30_000)
+    end
+
     test = self()
     pids = for %{pid: p} <- peers, do: p
     sampler = spawn(fn -> sample(pids, 0, test) end)

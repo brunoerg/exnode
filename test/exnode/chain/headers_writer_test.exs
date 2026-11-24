@@ -23,6 +23,20 @@ defmodule Exnode.Chain.HeadersWriterTest do
 
   defp writer(hs), do: :sys.get_state(hs).writer
 
+  # Resumes the suspended writer once a call matching `call?` is queued
+  # behind the writes it holds (resumes anyway after 5 s, so a failing test
+  # does not hang).
+  defp resume_once_called(w, call?) do
+    spawn(fn ->
+      Exnode.Test.Wait.until?(fn ->
+        {:messages, msgs} = Process.info(w, :messages)
+        Enum.any?(msgs, call?)
+      end)
+
+      :sys.resume(w)
+    end)
+  end
+
   defp persisted(kv), do: KV.fold_keys(kv, :headers, <<>>, MapSet.new(), &MapSet.put(&2, &1))
 
   defp within(ms, fun) do
@@ -67,7 +81,7 @@ defmodule Exnode.Chain.HeadersWriterTest do
     :ok = :sys.suspend(w)
     {:ok, _} = Headers.process_headers(hs, hdrs)
     # terminate/2 waits for the writer, which drains once resumed.
-    spawn(fn -> Process.sleep(50) && :sys.resume(w) end)
+    resume_once_called(w, &match?({:"$gen_call", _, :stop}, &1))
     :ok = GenServer.stop(hs)
     refute Process.alive?(w)
 
@@ -103,7 +117,7 @@ defmodule Exnode.Chain.HeadersWriterTest do
     w = writer(hs)
     :ok = :sys.suspend(w)
     {:ok, _} = Headers.process_headers(hs, hdrs)
-    spawn(fn -> Process.sleep(50) && :sys.resume(w) end)
+    resume_once_called(w, &match?({:"$gen_call", _, {:write, _}}, &1))
     :ok = Headers.invalidate(hs, bad.hash, fallback.hash)
     :ok = GenServer.stop(hs)
 

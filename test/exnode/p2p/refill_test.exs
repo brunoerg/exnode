@@ -270,14 +270,23 @@ defmodule Exnode.P2P.RefillTest do
     # Target spacing 0: anything in transit times out at the next tick.
     {:ok, headers} = StubHeaders.start_link(idx)
     {:ok, chain} = StubChain.start_link(hd(entries))
+    clock = Exnode.Clock.new()
+    Exnode.Clock.advance(clock, 0)
 
     {:ok, bd} =
-      BlockDownload.start_link(headers: headers, chain: chain, params: %{pow_target_spacing: 0})
+      BlockDownload.start_link(
+        headers: headers,
+        chain: chain,
+        params: %{pow_target_spacing: 0},
+        clock: clock
+      )
 
     a = self()
     picks = BlockDownload.request(bd, a, List.last(entries).hash)
     for h <- picks, do: BlockDownload.received(bd, a, h, 1)
-    refute_receive {:disconnect, _}, 1_200
+    Exnode.Clock.advance(clock, 1)
+    Exnode.Clock.tick(bd)
+    refute_received {:disconnect, _}
     assert BlockDownload.stats(bd).checking == 2
   end
 

@@ -220,6 +220,7 @@ defmodule Exnode.P2P.OutboundSelectionTest do
           group: nil,
           v2: false,
           evicting: false,
+          evict_deadline: nil,
           prefer_evict: false,
           stats: %{}
         })

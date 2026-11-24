@@ -22,6 +22,9 @@ defmodule Exnode.DoS.EvictionStallTest do
   test "blocked evicted peers are killed after the grace; pending evictions are capped",
        %{tmp_dir: dir} do
     {:ok, sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    # Frozen: the grace runs out only when the test moves the clock.
+    clock = Exnode.Clock.new()
+    Exnode.Clock.advance(clock, 0)
     # 51 connections - 8 full-relay - 2 block-relay - 1 feeler = 40 inbound.
     {:ok, cm} =
       Connman.start_link(
@@ -35,10 +38,10 @@ defmodule Exnode.DoS.EvictionStallTest do
           sync: nil
         },
         peer_sup: sup,
+        clock: clock,
         connect: [],
         magic: @p.magic,
         max_connections: 51,
-        evict_grace_ms: 300,
         discouraged_path: Path.join(dir, "discouraged.dat")
       )
 
@@ -65,8 +68,16 @@ defmodule Exnode.DoS.EvictionStallTest do
     assert length(evicting) == 8
     assert Enum.all?(evicting, &Process.alive?/1)
 
-    # After the grace they are killed and leave; new connections are accepted again.
+    # Within the 2 s grace a tick leaves them alone.
     refs = for pid <- evicting, do: Process.monitor(pid)
+    Exnode.Clock.advance(clock, 1)
+    Exnode.Clock.tick(cm)
+    refute_received {:DOWN, _, _, _, _}
+    assert Enum.all?(evicting, &Process.alive?/1)
+
+    # After the grace they are killed and leave; new connections are accepted again.
+    Exnode.Clock.advance(clock, 1)
+    Exnode.Clock.tick(cm)
     for ref <- refs, do: assert_receive({:DOWN, ^ref, _, _, :killed}, 2_000)
     _ = Connman.peers(cm)
     assert map_size(Connman.peers(cm)) == 40 - 8

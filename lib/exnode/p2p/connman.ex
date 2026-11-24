@@ -64,7 +64,8 @@ defmodule Exnode.P2P.Connman do
   # may be blocked (e.g. waiting on a busy TxRelay). Core closes the socket
   # on the socket thread whatever the message thread does (DisconnectNodes),
   # so a peer still alive after this grace is killed, which closes its
-  # socket.
+  # socket. The grace is on the clock's monotonic time and checked on each
+  # tick, so a peer goes between the grace and the grace plus one tick.
   @evict_grace_ms 2_000
   # While this many evicted peers have not exited yet, a full inbound side
   # refuses new connections instead of evicting more: connections cannot
@@ -264,20 +265,6 @@ defmodule Exnode.P2P.Connman do
 
   def handle_info({:peer_stats, pid, stats}, st), do: {:noreply, update_stats(st, pid, stats)}
 
-  # Still tracked (no DOWN yet): the peer did not act on its eviction.
-  def handle_info({:evict_deadline, pid}, st) do
-    case st.peers do
-      %{^pid => %{evicting: true} = p} ->
-        Logger.info("evicted peer #{inspect(p.target)} did not exit: killing it")
-        Process.exit(pid, :kill)
-
-      _ ->
-        :ok
-    end
-
-    {:noreply, st}
-  end
-
   # Core: VERSION from an outbound peer -> AddrMan::Good (moves it to tried,
   # or records a collision). Feelers report the same, then disconnect.
   def handle_info({:peer_ready, pid, target, type}, st),
@@ -356,8 +343,28 @@ defmodule Exnode.P2P.Connman do
     {:noreply, st}
   end
 
-  # The periodic pass: discouragement flush, seeding, outbound slots.
-  defp tick(st), do: st |> maybe_flush_discouraged() |> maybe_seed() |> fill_slots()
+  # The periodic pass: overdue evictions, discouragement flush, seeding,
+  # outbound slots.
+  defp tick(st) do
+    st
+    |> kill_overdue_evictions()
+    |> maybe_flush_discouraged()
+    |> maybe_seed()
+    |> fill_slots()
+  end
+
+  # An evicted peer still tracked past its deadline (no DOWN yet) did not act
+  # on its eviction: kill it. Its DOWN untracks it.
+  defp kill_overdue_evictions(st) do
+    now = Clock.mono(st.clock, :millisecond)
+
+    for {pid, %{evicting: true, evict_deadline: d} = p} <- st.peers, now >= d do
+      Logger.info("evicted peer #{inspect(p.target)} did not exit: killing it")
+      Process.exit(pid, :kill)
+    end
+
+    st
+  end
 
   defp mono_s(st), do: Clock.mono(st.clock, :second)
 
@@ -753,6 +760,7 @@ defmodule Exnode.P2P.Connman do
       ready: false,
       v2: v2,
       evicting: false,
+      evict_deadline: nil,
       prefer_evict: false,
       stats: default_stats(st),
       services: nil
@@ -833,8 +841,8 @@ defmodule Exnode.P2P.Connman do
       pid ->
         Logger.info("evicting inbound peer #{inspect(st.peers[pid].target)}")
         send(pid, {:disconnect, :evicted})
-        Process.send_after(self(), {:evict_deadline, pid}, st.evict_grace_ms)
-        {:ok, put_in(st.peers[pid].evicting, true)}
+        deadline = Clock.mono(st.clock, :millisecond) + st.evict_grace_ms
+        {:ok, update_in(st.peers[pid], &%{&1 | evicting: true, evict_deadline: deadline})}
     end
   end
 
