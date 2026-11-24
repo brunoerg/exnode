@@ -120,6 +120,7 @@ defmodule Exnode.P2P.DiscouragementTest do
         ready: false,
         v2: false,
         evicting: false,
+        evict_deadline: nil,
         prefer_evict: false,
         stats: %{},
         services: nil
