@@ -112,19 +112,14 @@ defmodule Exnode.P2P.AddrMan do
   days before `now`.
   """
   def dns_seed_addr(ip, port, now) do
-    %{
-      net: if(tuple_size(ip) == 4, do: :ipv4, else: :ipv6),
-      addr: ip_bytes(ip),
+    ip
+    |> NetAddr.from_ip()
+    |> Map.merge(%{
       port: port,
       services: @seeds_assumed_services,
       time: now - 3 * 86_400 - :rand.uniform(4 * 86_400)
-    }
+    })
   end
-
-  defp ip_bytes({a, b, c, d}), do: <<a, b, c, d>>
-
-  defp ip_bytes(t) when tuple_size(t) == 8,
-    do: for(x <- Tuple.to_list(t), into: <<>>, do: <<x::16>>)
 
   def key(%{net: n, addr: a, port: p}), do: {n, a, p}
 

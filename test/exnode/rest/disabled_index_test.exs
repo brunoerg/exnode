@@ -20,24 +20,21 @@ defmodule Exnode.REST.DisabledIndexTest do
   test "/tx/:txid/outspends with address indexing disabled: 200, confirmed spenders reported",
        %{tmp_dir: dir} do
     {:ok, kv} = KV.open(Path.join(dir, "kv"))
-    {:ok, hs} = Headers.start_link(params: @p, kv: kv)
     u = System.unique_integer([:positive])
     {cs, mp} = {:"svc1_cs_#{u}", :"svc1_mp_#{u}"}
 
-    {:ok, _} =
-      State.start_link(
-        name: cs,
-        params: @p,
-        headers: hs,
-        kv: kv,
-        hot: Path.join(dir, "hot"),
-        mempool: mp
-      )
+    start_supervised!({Exnode.Store.KVOwner, {kv, [{State, cs}]}}, id: :"kvo_#{u}")
+    hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_#{u}")
+
+    start_supervised!(
+      {State, name: cs, params: @p, headers: hs, kv: kv, hot: Path.join(dir, "hot"), mempool: mp},
+      id: cs
+    )
 
     {bs, _} = SpendChain.build(@p.genesis.header, 111)
     for b <- bs, do: {:ok, :connected} = State.submit_block(cs, b)
     State.commit_now(cs)
-    {:ok, _} = Mempool.start_link(name: mp, chain_state: cs, headers: hs, params: @p)
+    start_supervised!({Mempool, name: mp, chain_state: cs, headers: hs, params: @p}, id: mp)
 
     hex = &Exnode.Crypto.Hash.to_hex/1
     # A coinbase output never spent, and an output block 111's tx spends.

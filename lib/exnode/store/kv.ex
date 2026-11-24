@@ -55,36 +55,42 @@ defmodule Exnode.Store.KV do
   @spec open(Path.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def open(path, opts \\ []) do
     names = Keyword.get(opts, :column_families, @default_cfs)
-    File.mkdir_p!(path)
+    create? = Keyword.get(opts, :create_if_missing, true)
 
-    {:ok, cache} =
-      :rocksdb.new_cache(:lru, Keyword.get(opts, :block_cache_bytes, 256 * 1024 * 1024))
+    if not create? and not File.dir?(path) do
+      {:error, :enoent}
+    else
+      if create?, do: File.mkdir_p!(path)
 
-    # Table files RocksDB keeps open (its default, -1, keeps every SST open:
-    # 920 descriptors on a mainnet store at 593k, past a 1,024 soft limit).
-    # Bounded like Core's LevelDB max_open_files; the node sizes it from the
-    # process's descriptor limit (Exnode.FdBudget).
-    db_opts = [
-      create_if_missing: true,
-      create_missing_column_families: true,
-      max_background_jobs: 4,
-      bytes_per_sync: 1024 * 1024,
-      max_open_files: Keyword.get(opts, :max_open_files, @default_max_open_files)
-    ]
+      {:ok, cache} =
+        :rocksdb.new_cache(:lru, Keyword.get(opts, :block_cache_bytes, 256 * 1024 * 1024))
 
-    cf_descs = [
-      {~c"default", []} | Enum.map(names, &{Atom.to_charlist(&1), cf_options(&1, cache)})
-    ]
+      # Table files RocksDB keeps open (its default, -1, keeps every SST open:
+      # 920 descriptors on a mainnet store at 593k, past a 1,024 soft limit).
+      # Bounded like Core's LevelDB max_open_files; the node sizes it from the
+      # process's descriptor limit (Exnode.FdBudget).
+      db_opts = [
+        create_if_missing: create?,
+        create_missing_column_families: create?,
+        max_background_jobs: 4,
+        bytes_per_sync: 1024 * 1024,
+        max_open_files: Keyword.get(opts, :max_open_files, @default_max_open_files)
+      ]
 
-    deadline =
-      System.monotonic_time(:millisecond) + Keyword.get(opts, :lock_wait_ms, @lock_wait_ms)
+      cf_descs = [
+        {~c"default", []} | Enum.map(names, &{Atom.to_charlist(&1), cf_options(&1, cache)})
+      ]
 
-    case open_db(String.to_charlist(path), db_opts, cf_descs, deadline) do
-      {:ok, db, [_default | handles]} ->
-        {:ok, %__MODULE__{db: db, cfs: Map.new(Enum.zip(names, handles)), path: path}}
+      deadline =
+        System.monotonic_time(:millisecond) + Keyword.get(opts, :lock_wait_ms, @lock_wait_ms)
 
-      {:error, _} = err ->
-        err
+      case open_db(String.to_charlist(path), db_opts, cf_descs, deadline) do
+        {:ok, db, [_default | handles]} ->
+          {:ok, %__MODULE__{db: db, cfs: Map.new(Enum.zip(names, handles)), path: path}}
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -383,19 +389,43 @@ defmodule Exnode.Store.KV do
   Callers stop at the end of their prefix themselves.
   """
   def iterator(%__MODULE__{db: db, cfs: cfs}, cf) do
-    {:ok, it} = :rocksdb.iterator(db, Map.fetch!(cfs, cf), total_order_seek: true)
-    it
+    case :rocksdb.iterator(db, Map.fetch!(cfs, cf), total_order_seek: true) do
+      {:ok, it} -> it
+      {:error, reason} -> raise Error, op: :iterator, cf: cf, reason: reason
+    end
+  end
+
+  @doc "Runs `fun.(it)` with a total-order iterator over `cf`, always closing `it`."
+  def with_iterator(%__MODULE__{} = kv, cf, fun) do
+    it = iterator(kv, cf)
+
+    try do
+      fun.(it)
+    after
+      :rocksdb.iterator_close(it)
+    end
+  end
+
+  @doc """
+  Moves iterator `it` on `cf`. Returns `{:ok, key, value}` or `:end` when the
+  iterator reaches the end; raises `Exnode.Store.KV.Error` on any other error
+  tuple (note: upstream erlang-rocksdb 3.1.2 checks `itr->Valid()` before
+  `itr->status()`, returning `:invalid_iterator` when an SST read invalidates
+  the iterator).
+  """
+  def iter_move(it, cf, action) do
+    case :rocksdb.iterator_move(it, action) do
+      {:ok, k, v} -> {:ok, k, v}
+      {:error, :invalid_iterator} -> :end
+      {:error, reason} -> raise Error, op: :iterator_move, cf: cf, reason: reason
+    end
   end
 
   @doc "Folds over `{key, value}` pairs in `cf` whose key starts with `prefix`, in key order."
   def fold_prefix(%__MODULE__{} = kv, cf, prefix, acc, fun) do
-    it = iterator(kv, cf)
-
-    try do
-      do_fold(it, :rocksdb.iterator_move(it, {:seek, prefix}), prefix, acc, fun)
-    after
-      :rocksdb.iterator_close(it)
-    end
+    with_iterator(kv, cf, fn it ->
+      do_fold(it, cf, iter_move(it, cf, {:seek, prefix}), prefix, acc, fun)
+    end)
   end
 
   @doc """
@@ -405,14 +435,17 @@ defmodule Exnode.Store.KV do
   asks). Inline values are read with their keys as usual.
   """
   def fold_keys(%__MODULE__{db: db, cfs: cfs}, cf, prefix, acc, fun) do
-    {:ok, it} =
-      :rocksdb.iterator(db, Map.fetch!(cfs, cf),
-        total_order_seek: true,
-        allow_unprepared_value: true
-      )
+    it =
+      case :rocksdb.iterator(db, Map.fetch!(cfs, cf),
+             total_order_seek: true,
+             allow_unprepared_value: true
+           ) do
+        {:ok, it} -> it
+        {:error, reason} -> raise Error, op: :iterator, cf: cf, reason: reason
+      end
 
     try do
-      do_fold(it, :rocksdb.iterator_move(it, {:seek, prefix}), prefix, acc, fn {k, _v}, acc ->
+      do_fold(it, cf, iter_move(it, cf, {:seek, prefix}), prefix, acc, fn {k, _v}, acc ->
         fun.(k, acc)
       end)
     after
@@ -425,13 +458,13 @@ defmodule Exnode.Store.KV do
   def flush(%__MODULE__{db: db, cfs: cfs}, cf),
     do: :rocksdb.flush(db, Map.fetch!(cfs, cf), wait: true)
 
-  defp do_fold(it, {:ok, k, v}, prefix, acc, fun) do
+  defp do_fold(it, cf, {:ok, k, v}, prefix, acc, fun) do
     if :binary.longest_common_prefix([k, prefix]) == byte_size(prefix),
-      do: do_fold(it, :rocksdb.iterator_move(it, :next), prefix, fun.({k, v}, acc), fun),
+      do: do_fold(it, cf, iter_move(it, cf, :next), prefix, fun.({k, v}, acc), fun),
       else: acc
   end
 
-  defp do_fold(_it, {:error, _}, _prefix, acc, _fun), do: acc
+  defp do_fold(_it, _cf, :end, _prefix, acc, _fun), do: acc
 
   @doc """
   Folds over the `{key, value}` pairs in `cf` whose key starts with `prefix`,
@@ -440,27 +473,24 @@ defmodule Exnode.Store.KV do
   so a page reads only the rows it uses.
   """
   def fold_prefix_reverse(%__MODULE__{} = kv, cf, prefix, before, acc, fun) do
-    it = iterator(kv, cf)
     # Above every key with `prefix` (keys here are far shorter than this).
     target = before || prefix <> :binary.copy(<<0xFF>>, 256)
 
-    try do
+    with_iterator(kv, cf, fn it ->
       first =
-        case :rocksdb.iterator_move(it, {:seek_for_prev, target}) do
-          {:ok, ^before, _} -> :rocksdb.iterator_move(it, :prev)
+        case iter_move(it, cf, {:seek_for_prev, target}) do
+          {:ok, ^before, _} -> iter_move(it, cf, :prev)
           other -> other
         end
 
-      do_fold_reverse(it, first, prefix, acc, fun)
-    after
-      :rocksdb.iterator_close(it)
-    end
+      do_fold_reverse(it, cf, first, prefix, acc, fun)
+    end)
   end
 
-  defp do_fold_reverse(it, {:ok, k, v}, prefix, acc, fun) do
+  defp do_fold_reverse(it, cf, {:ok, k, v}, prefix, acc, fun) do
     if :binary.longest_common_prefix([k, prefix]) == byte_size(prefix) do
       case fun.({k, v}, acc) do
-        {:cont, acc} -> do_fold_reverse(it, :rocksdb.iterator_move(it, :prev), prefix, acc, fun)
+        {:cont, acc} -> do_fold_reverse(it, cf, iter_move(it, cf, :prev), prefix, acc, fun)
         {:halt, acc} -> acc
       end
     else
@@ -468,5 +498,5 @@ defmodule Exnode.Store.KV do
     end
   end
 
-  defp do_fold_reverse(_it, {:error, _}, _prefix, acc, _fun), do: acc
+  defp do_fold_reverse(_it, _cf, :end, _prefix, acc, _fun), do: acc
 end

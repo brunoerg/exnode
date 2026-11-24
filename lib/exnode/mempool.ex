@@ -51,7 +51,7 @@ defmodule Exnode.Mempool do
   alias Exnode.Chain.{Headers, HeaderIndex}
   alias Exnode.Chain.State, as: ChainState
   alias Exnode.Codec.Tx
-  alias Exnode.Mempool.{Accept, Package, Pool}
+  alias Exnode.Mempool.{Accept, Linearize, Package, Pool}
   alias Exnode.Validation.ScriptFlags
 
   import Bitwise, only: [&&&: 2]
@@ -78,6 +78,10 @@ defmodule Exnode.Mempool do
 
   @doc "Core `submitpackage` (child with parents). Returns the package result."
   def submit_package(server, txs), do: GenServer.call(server, {:submit_package, txs}, :infinity)
+
+  @doc "Core `submitpackage` with RPC options (`:unbroadcast`, `:max_feerate`)."
+  def submit_package(server, txs, opts),
+    do: GenServer.call(server, {:submit_package, txs, opts}, :infinity)
 
   def txids(server), do: GenServer.call(server, :txids, 5_000)
 
@@ -116,11 +120,25 @@ defmodule Exnode.Mempool do
   @doc "Core's unbroadcast set: txs submitted locally (RPC) not yet requested by any peer."
   def unbroadcast?(server, txid), do: GenServer.call(server, {:unbroadcast?, txid}, 5_000)
   def unbroadcast_count(server), do: GenServer.call(server, :unbroadcast_count, 5_000)
+  def unbroadcast_txids(server), do: GenServer.call(server, :unbroadcast_txids, 5_000)
   def remove_unbroadcast(server, txids), do: GenServer.cast(server, {:remove_unbroadcast, txids})
 
   @doc "`{mempool min fee rate (sat/kvB), policy opts}` (Core `GetMinFee`, `m_opts`)."
   def fee_info(server), do: GenServer.call(server, :fee_info, 5_000)
   def entry(server, txid), do: GenServer.call(server, {:entry, txid}, 5_000)
+
+  @doc "Summary stats for `getmempoolinfo` in a single call, without copying `%Pool{}`."
+  def stats(server), do: GenServer.call(server, :stats, 5_000)
+
+  @doc "Entry details for `entryToJSON` (`getmempoolentry`), without copying `%Pool{}`."
+  def entry_details(server, txid), do: GenServer.call(server, {:entry_details, txid}, 5_000)
+
+  @doc """
+  `getrawmempool` view without copying `%Pool{}`:
+  * `verbose == true`: `[{txid, details_map}, ...]` sorted by `txid`
+  * `verbose == false`: `{ordered_txids, mempool_sequence}` in mining order
+  """
+  def raw_mempool(server, verbose), do: GenServer.call(server, {:raw_mempool, verbose}, 5_000)
 
   # The queries below are reached from TxRelay while it handles peer
   # traffic: they wait like Core's peer thread on `cs_main` (no timeout).
@@ -273,6 +291,29 @@ defmodule Exnode.Mempool do
     {:reply, reply, %{st | state: s} |> prune_unbroadcast() |> refresh_soon()}
   end
 
+  def handle_call({:submit_package, txs, opts}, {origin, _}, st) do
+    st = sync(st)
+    chain = chain_context(st, txs)
+
+    {reply, s} =
+      submit_package_rpc(st.state, txs, chain, st.verify, Keyword.get(opts, :max_feerate))
+
+    for {:ok, tx, res} <- Package.accepted(reply, txs),
+        do: notify(st, {:mempool_accepted, tx, res, origin})
+
+    unbroadcast =
+      if Keyword.get(opts, :unbroadcast, false) do
+        Enum.reduce(txs, st.unbroadcast, fn tx, acc ->
+          if Pool.exists?(s.pool, tx.txid), do: MapSet.put(acc, tx.txid), else: acc
+        end)
+      else
+        st.unbroadcast
+      end
+
+    {:reply, reply,
+     %{st | state: s, unbroadcast: unbroadcast} |> prune_unbroadcast() |> refresh_soon()}
+  end
+
   def handle_call(:txids, _from, st), do: {:reply, Map.keys(st.state.pool.entries), st}
 
   def handle_call({:script_txs, sh, limit}, _from, st) do
@@ -347,9 +388,78 @@ defmodule Exnode.Mempool do
   def handle_call(:unbroadcast_count, _from, st),
     do: {:reply, Enum.count(st.unbroadcast, &Pool.exists?(st.state.pool, &1)), st}
 
+  def handle_call(:unbroadcast_txids, _from, st) do
+    pool = st.state.pool
+    {:reply, Enum.filter(st.unbroadcast, &Pool.exists?(pool, &1)), st}
+  end
+
   def handle_call(:fee_info, _from, st) do
     {rate, fees} = Accept.min_fee(st.state, st.clock.())
     {:reply, {rate, st.state.opts}, %{st | state: %{st.state | fees: fees}}}
+  end
+
+  def handle_call(:stats, _from, st) do
+    st = sync(st)
+    pool = st.state.pool
+    {min_fee, fees} = Accept.min_fee(st.state, st.clock.())
+    total_fee = Enum.reduce(pool.entries, 0, fn {_, e}, acc -> acc + e.fee end)
+    unbroadcast_count = Enum.count(st.unbroadcast, &Pool.exists?(pool, &1))
+
+    reply = %{
+      size: Pool.size(pool),
+      bytes: pool.total_vsize,
+      usage: pool.total_usage,
+      total_fee: total_fee,
+      min_fee: min_fee,
+      opts: st.state.opts,
+      unbroadcast_count: unbroadcast_count
+    }
+
+    {:reply, reply, %{st | state: %{st.state | fees: fees}}}
+  end
+
+  def handle_call({:entry_details, txid}, _from, st) do
+    st = sync(st)
+    pool = st.state.pool
+
+    reply =
+      case Pool.get(pool, txid) do
+        nil -> nil
+        e -> build_entry_details(pool, st.unbroadcast, e)
+      end
+
+    {:reply, reply, st}
+  end
+
+  def handle_call({:raw_mempool, true}, _from, st) do
+    st = sync(st)
+    {pool, _} = Pool.cluster_chunks(st.state.pool)
+
+    reply =
+      for t <- Enum.sort(Map.keys(pool.entries)) do
+        {t, build_entry_details(pool, st.unbroadcast, pool.entries[t])}
+      end
+
+    {:reply, reply, %{st | state: %{st.state | pool: pool}}}
+  end
+
+  def handle_call({:raw_mempool, false}, _from, st) do
+    st = sync(st)
+    {pool, cluster_chunks} = Pool.cluster_chunks(st.state.pool)
+
+    ordered =
+      cluster_chunks
+      |> Enum.concat()
+      |> Enum.sort(fn {{f1, w1}, ids1}, {{f2, w2}, ids2} ->
+        case Linearize.ratio_cmp({f1, w1}, {f2, w2}) do
+          :gt -> true
+          :lt -> false
+          :eq -> min_seq(pool, ids1) <= min_seq(pool, ids2)
+        end
+      end)
+      |> Enum.flat_map(fn {_, ids} -> ids end)
+
+    {:reply, {ordered, pool.sequence}, %{st | state: %{st.state | pool: pool}}}
   end
 
   def handle_call({:match_short_ids, {k0, k1}, wanted}, _from, st) do
@@ -823,5 +933,269 @@ defmodule Exnode.Mempool do
   # subtree; `send/2` to an unregistered name would raise here.
   defp notify(st, msg) do
     Enum.each(st.listeners, fn l -> if pid = GenServer.whereis(l), do: send(pid, msg) end)
+  end
+
+  # --- RPC views & submitpackage helpers -------------------------------------------
+
+  defp min_seq(pool, ids), do: ids |> Enum.map(&Pool.get(pool, &1).sequence) |> Enum.min()
+
+  defp build_entry_details(pool, unbroadcast, e) do
+    anc = Pool.ancestors(pool, e.txid) |> MapSet.put(e.txid)
+    desc = Pool.descendants(pool, e.txid) |> MapSet.put(e.txid)
+    sum = fn set, f -> Enum.reduce(set, 0, &(&2 + f.(Pool.get(pool, &1)))) end
+    {chunk_fee, chunk_weight} = entry_chunk(pool, e.txid)
+
+    depends =
+      for i <- e.tx.inputs, Pool.exists?(pool, i.prev_hash), uniq: true, do: i.prev_hash
+
+    %{
+      entry: %{e | parents: MapSet.new(), children: MapSet.new(), spent: nil},
+      ancestor_count: MapSet.size(anc),
+      ancestor_size: sum.(anc, & &1.vsize),
+      ancestor_fee: sum.(anc, & &1.fee),
+      descendant_count: MapSet.size(desc),
+      descendant_size: sum.(desc, & &1.vsize),
+      descendant_fee: sum.(desc, & &1.fee),
+      chunk_fee: chunk_fee,
+      chunk_weight: chunk_weight,
+      depends: depends,
+      spentby: MapSet.to_list(e.children),
+      unbroadcast: MapSet.member?(unbroadcast, e.txid)
+    }
+  end
+
+  defp entry_chunk(pool, txid) do
+    with cid when cid != nil <- pool.lin.cluster_of[txid],
+         %{chunks: chunks} when chunks != nil <- pool.lin.clusters[cid],
+         {{fee, w}, _} <- Enum.find(chunks, fn {_, ids} -> txid in ids end) do
+      {fee, w}
+    else
+      _ ->
+        {fee, w, _} = Enum.find(Pool.chunks(pool, txid), fn {_, _, ids} -> txid in ids end)
+        {fee, w}
+    end
+  end
+
+  @mempool_height 0x7FFFFFFF
+
+  # Core ProcessNewPackage(test_accept = false, client_maxfeerate): preserves
+  # per-subpackage effective feerate/includes and enforces client_maxfeerate.
+  defp submit_package_rpc(state, txs, chain, verify, max_feerate) do
+    cond do
+      (r = Package.well_formed(txs)) != :ok ->
+        {%{state: {:policy, elem(r, 1), nil}, txs: %{}}, state}
+
+      length(txs) > 1 and not Package.child_with_parents?(txs) ->
+        {%{state: {:policy, "package-not-child-with-parents", nil}, txs: %{}}, state}
+
+      true ->
+        {final, nonfinal, quit_early, to_eval, state} =
+          Enum.reduce(txs, {%{}, %{}, false, [], state}, fn tx,
+                                                            {final, nonfinal, quit, eval, state} ->
+            cond do
+              Pool.exists_wtxid?(state.pool, tx.wtxid) ->
+                e = Pool.get(state.pool, tx.txid)
+
+                {Map.put(final, tx.wtxid, {:mempool, %{vsize: e.vsize, fee: e.fee}}), nonfinal,
+                 quit, eval, state}
+
+              Pool.exists?(state.pool, tx.txid) ->
+                e = Pool.get(state.pool, tx.txid)
+
+                {Map.put(final, tx.wtxid, {:different_witness, e.wtxid}), nonfinal, quit, eval,
+                 state}
+
+              true ->
+                case accept_single_in_package(state, tx, chain, verify, max_feerate) do
+                  {:ok, res, state} ->
+                    res =
+                      Map.merge(res, %{
+                        effective_feerate: div(res.fee * 1000, res.vsize),
+                        effective_includes: [tx.wtxid]
+                      })
+
+                    {Map.put(final, tx.wtxid, {:valid, res}), nonfinal, quit, eval, state}
+
+                  {:error, e, state} ->
+                    retry = length(txs) > 1 and e.result in [:reconsiderable, :missing_inputs]
+                    nonfinal = Map.put(nonfinal, tx.wtxid, {:invalid, e})
+
+                    if retry,
+                      do: {final, nonfinal, quit, eval ++ [tx], state},
+                      else: {final, nonfinal, true, eval, state}
+                end
+            end
+          end)
+
+        {multi_res, state} =
+          cond do
+            quit_early ->
+              {%{state: {:tx, "transaction failed", nil}, txs: %{}},
+               Accept.limit_size(state, chain.now)}
+
+            to_eval == [] ->
+              {%{state: :ok, txs: %{}}, Accept.limit_size(state, chain.now)}
+
+            length(to_eval) == 1 ->
+              [only] = to_eval
+
+              case accept_single_in_package(state, only, chain, verify, max_feerate) do
+                {:ok, res, state} ->
+                  res =
+                    Map.merge(res, %{
+                      effective_feerate: div(res.fee * 1000, res.vsize),
+                      effective_includes: [only.wtxid]
+                    })
+
+                  {%{state: :ok, txs: %{only.wtxid => {:valid, res}}},
+                   Accept.limit_size(state, chain.now)}
+
+                {:error, e, state} ->
+                  {%{
+                     state: {:tx, "transaction failed", nil},
+                     txs: %{only.wtxid => {:invalid, e}}
+                   }, Accept.limit_size(state, chain.now)}
+              end
+
+            true ->
+              case precheck_package_max_feerate(state, to_eval, chain, max_feerate) do
+                {:failed, tx, e} ->
+                  {%{state: {:tx, "transaction failed", nil}, txs: %{tx.wtxid => {:invalid, e}}},
+                   Accept.limit_size(state, chain.now)}
+
+                :ok ->
+                  {pkg_res, state} = Package.accept(state, to_eval, chain)
+                  {enrich_multi_effective(pkg_res, to_eval), state}
+              end
+          end
+
+        full = Accept.err(:mempool_policy, "mempool full")
+
+        {pkg_state, results} =
+          Enum.reduce(txs, {multi_res.state, %{}}, fn tx, {ps, acc} ->
+            cond do
+              Map.has_key?(multi_res.txs, tx.wtxid) ->
+                case multi_res.txs[tx.wtxid] do
+                  {:valid, _} = r ->
+                    if Pool.exists_wtxid?(state.pool, tx.wtxid),
+                      do: {ps, Map.put(acc, tx.wtxid, r)},
+                      else:
+                        {{:tx, "transaction failed", nil},
+                         Map.put(acc, tx.wtxid, {:invalid, full})}
+
+                  r ->
+                    {ps, Map.put(acc, tx.wtxid, r)}
+                end
+
+              Map.has_key?(final, tx.wtxid) ->
+                if Pool.exists?(state.pool, tx.txid),
+                  do: {ps, Map.put(acc, tx.wtxid, final[tx.wtxid])},
+                  else:
+                    {{:tx, "transaction failed", nil}, Map.put(acc, tx.wtxid, {:invalid, full})}
+
+              Map.has_key?(nonfinal, tx.wtxid) ->
+                {ps, Map.put(acc, tx.wtxid, nonfinal[tx.wtxid])}
+
+              true ->
+                {ps, acc}
+            end
+          end)
+
+        {%{state: pkg_state, txs: results}, state}
+    end
+  end
+
+  defp accept_single_in_package(state, tx, chain, verify, max_feerate) do
+    args =
+      Accept.normalize_args(
+        test_accept: false,
+        package_submission: true,
+        allow_replacement: true,
+        allow_sibling_eviction: true
+      )
+
+    case Accept.prepare(state, tx, chain, args) do
+      {:error, e} ->
+        {:error, e, state}
+
+      {:ok, ws} ->
+        if max_feerate != nil and max_feerate > 0 and ws.fee * 1000 > max_feerate * ws.vsize do
+          {:error, Accept.err(:mempool_policy, "max feerate exceeded", ""), state}
+        else
+          {raw, spent, flags} = Accept.script_input(ws, chain)
+          Accept.complete(state, ws, verify.(raw, spent, flags), chain, args)
+        end
+    end
+  end
+
+  defp precheck_package_max_feerate(_state, _txs, _chain, max_feerate)
+       when max_feerate in [nil, 0],
+       do: :ok
+
+  defp precheck_package_max_feerate(state, txs, chain, max_feerate) do
+    args =
+      Accept.normalize_args(
+        package_submission: true,
+        package_feerates: true,
+        allow_sibling_eviction: false
+      )
+
+    res =
+      Enum.reduce_while(txs, %{}, fn tx, coins ->
+        case Accept.pre_checks(state, tx, chain, %{args | package_coins: coins}) do
+          {:error, e} ->
+            {:halt, {:failed, tx, e}}
+
+          {:ok, ws} ->
+            if ws.fee * 1000 > max_feerate * ws.vsize do
+              {:halt, {:failed, tx, Accept.err(:mempool_policy, "max feerate exceeded", "")}}
+            else
+              new =
+                for {o, v} <- Enum.with_index(tx.outputs),
+                    into: %{},
+                    do:
+                      {{tx.txid, v},
+                       %{
+                         value: o.value,
+                         script_pubkey: o.script_pubkey,
+                         height: @mempool_height,
+                         coinbase: false
+                       }}
+
+              {:cont, Map.merge(coins, new)}
+            end
+        end
+      end)
+
+    case res do
+      {:failed, _, _} = err -> err
+      _ -> :ok
+    end
+  end
+
+  defp enrich_multi_effective(%{txs: txs_map} = pkg_res, to_eval) do
+    valid_entries =
+      for tx <- to_eval, match?({:valid, _}, txs_map[tx.wtxid]), do: elem(txs_map[tx.wtxid], 1)
+
+    if valid_entries == [] do
+      pkg_res
+    else
+      includes = Enum.map(to_eval, & &1.wtxid)
+      total_fee = Enum.reduce(valid_entries, 0, &(&2 + &1.fee))
+      total_vsize = Enum.reduce(valid_entries, 0, &(&2 + &1.vsize))
+      eff_rate = div(total_fee * 1000, total_vsize)
+
+      enriched =
+        Map.new(txs_map, fn
+          {wtxid, {:valid, r}} ->
+            {wtxid,
+             {:valid, Map.merge(r, %{effective_feerate: eff_rate, effective_includes: includes})}}
+
+          other ->
+            other
+        end)
+
+      %{pkg_res | txs: enriched}
+    end
   end
 end

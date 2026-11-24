@@ -1,10 +1,10 @@
 defmodule Exnode.Replay.SeedTest do
   @moduledoc """
   Seeded ranges (`Exnode.Replay.Seed`) on the 150-block regtest fixture: a
-  seed at 100 built by ordinary processing is cloned (never written), each
-  preparation mode connects 101..150 on its own clone, and the range's
-  effects digest equals a fresh 1..150 run's; the tip and digest survive a
-  restart. Destinations overlapping a seed or export are refused.
+  seed at 100 built by ordinary processing is cloned (never written), a run
+  connects 101..150 on the clone, and the range's effects digest equals a
+  fresh 1..150 run's; the tip and digest survive a restart. Destinations
+  overlapping a seed or export are refused.
   """
   use ExUnit.Case, async: true
 
@@ -22,13 +22,10 @@ defmodule Exnode.Replay.SeedTest do
 
   defp blocks, do: for(raw <- BB.read_chain(@chain), do: elem(Block.decode_exact(raw), 1))
 
-  defp open(dir, opts \\ []) do
+  defp open(dir) do
     {:ok, kv} = KV.open(Path.join(dir, "index"))
     {:ok, hs} = Headers.start_link(params: @p, kv: kv)
-
-    {:ok, cs} =
-      State.start_link([params: @p, headers: hs, kv: kv, hot: Path.join(dir, "archive")] ++ opts)
-
+    {:ok, cs} = State.start_link(params: @p, headers: hs, kv: kv, hot: Path.join(dir, "archive"))
     %{kv: kv, hs: hs, cs: cs}
   end
 
@@ -53,7 +50,7 @@ defmodule Exnode.Replay.SeedTest do
     Dataset.build(dir, "regtest", 1, from)
   end
 
-  test "seeded ranges equal the fresh run in every mode, and survive a restart", %{tmp_dir: dir} do
+  test "seeded range equals the fresh run and survives a restart", %{tmp_dir: dir} do
     bs = blocks()
 
     # Fresh reference run 1..150.
@@ -89,30 +86,28 @@ defmodule Exnode.Replay.SeedTest do
 
     assert {:error, {:chain, _, _}} = Seed.compatible(seed, Map.put(m, "chain", "testnet4"))
 
-    for mode <- [:reference, :engine, :worker] do
-      dest = Path.join(dir, "run-#{mode}")
-      assert :ok = Seed.check_destination(dest, [seed_dir, Path.join(dir, "export")])
-      assert Seed.clone(seed_dir, dest) >= 0
-      refute File.exists?(Seed.path(dest))
+    dest = Path.join(dir, "run")
+    assert :ok = Seed.check_destination(dest, [seed_dir, Path.join(dir, "export")])
+    assert Seed.clone(seed_dir, dest) >= 0
+    refute File.exists?(Seed.path(dest))
 
-      n = open(dest, prep_mode: mode)
-      assert State.tip(n.cs).height == 100
-      assert State.peek_archive(n.cs, &Seed.describe/1) == d
-      connect(n, Enum.drop(bs, 100))
-      State.commit_now(n.cs)
-      assert digest(n, 101, 150) == fresh_digest, "#{mode}"
-      tip = State.tip(n.cs)
-      close(n)
+    n = open(dest)
+    assert State.tip(n.cs).height == 100
+    assert State.peek_archive(n.cs, &Seed.describe/1) == d
+    connect(n, Enum.drop(bs, 100))
+    State.commit_now(n.cs)
+    assert digest(n, 101, 150) == fresh_digest
+    tip = State.tip(n.cs)
+    close(n)
 
-      # Restart on the same store.
-      n = open(dest, prep_mode: mode)
-      assert State.tip(n.cs) == tip
-      assert tip.height == 150
-      assert digest(n, 101, 150) == fresh_digest
-      close(n)
-    end
+    # Restart on the same store.
+    n = open(dest)
+    assert State.tip(n.cs) == tip
+    assert tip.height == 150
+    assert digest(n, 101, 150) == fresh_digest
+    close(n)
 
-    # The seed itself was never opened for writing by the runs.
+    # The seed itself was never opened for writing by the run.
     assert File.ls!(Path.join(seed_dir, "index")) |> Enum.sort() == seed_files
     assert {:ok, ^seed} = Seed.read(seed_dir)
   end

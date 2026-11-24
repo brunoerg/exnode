@@ -401,6 +401,44 @@ defmodule Exnode.Chain.QuarantineTest do
     assert State.poisoned(cs2) == []
   end
 
+  test "an Exnode.StorageError raised outside Segments/KV is treated as a fatal storage fault, never quarantining the block",
+       %{tmp_dir: dir} do
+    %{bs: bs, kv: kv, hs: hs, b151: b} = setup_chain(dir)
+    hash = b.header.hash
+    armed = :atomics.new(1, [])
+    :atomics.put(armed, 1, 1)
+
+    rule = fn block, _ ->
+      if block.header.hash == hash and :atomics.get(armed, 1) == 1 do
+        raise Exnode.StorageError,
+          source: :archive,
+          reason: {:corrupt_record, :non_canonical_compact_size},
+          message: "corrupt archive record (non_canonical_compact_size)"
+      else
+        :ok
+      end
+    end
+
+    cs = start_cs(dir, kv, hs, rule_override: rule)
+    Process.unlink(cs)
+    ref = Process.monitor(cs)
+    for x <- bs, do: {:ok, :connected} = State.submit_block(cs, x)
+
+    capture_log(fn ->
+      assert {:ok, :stored} = State.submit_block(cs, b, defer: true, source: self())
+      assert_receive {:DOWN, ^ref, :process, ^cs, reason}, 5_000
+      refute match?({:shutdown, _}, reason)
+    end)
+
+    assert KV.get(kv, :poisoned, hash) == :not_found
+    refute_received {:block_checked, ^hash, _}
+
+    :atomics.put(armed, 1, 0)
+    cs2 = start_cs(dir, kv, hs, rule_override: rule)
+    wait_until(fn -> State.tip(cs2).hash == hash end)
+    assert State.poisoned(cs2) == []
+  end
+
   # The overlay's native tables raise :enomem when an allocation fails
   # (Archive.Overlay.apply_prepared, inside Archive.connect). A fault of
   # the host, not the block: fatal like a storage failure, no quarantine.

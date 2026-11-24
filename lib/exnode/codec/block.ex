@@ -6,22 +6,27 @@ defmodule Exnode.Codec.Header do
 
   @doc "Decodes an 80-byte header from the front of `bin`. Returns `{header, rest}`."
   def decode(<<raw::binary-size(80), rest::binary>>) do
-    <<version::little-signed-32, prev::binary-size(32), merkle::binary-size(32), time::little-32,
-      bits::little-32, nonce::little-32>> = raw
-
-    {%__MODULE__{
-       version: version,
-       prev_hash: prev,
-       merkle_root: merkle,
-       time: time,
-       bits: bits,
-       nonce: nonce,
-       hash: Hash.hash256(raw),
-       raw: raw
-     }, rest}
+    {decode_with_hash(raw, Hash.hash256(raw)), rest}
   end
 
   def decode(_), do: throw({:codec_error, :truncated})
+
+  @doc "Decodes an 80-byte header binary using a precomputed 32-byte `hash`."
+  def decode_with_hash(<<raw::binary-size(80)>>, <<hash::binary-size(32)>>) do
+    <<version::little-signed-32, prev::binary-size(32), merkle::binary-size(32), time::little-32,
+      bits::little-32, nonce::little-32>> = raw
+
+    %__MODULE__{
+      version: version,
+      prev_hash: prev,
+      merkle_root: merkle,
+      time: time,
+      bits: bits,
+      nonce: nonce,
+      hash: hash,
+      raw: raw
+    }
+  end
 
   def encode(%__MODULE__{} = h) do
     <<h.version::little-signed-32, h.prev_hash::binary, h.merkle_root::binary, h.time::little-32,

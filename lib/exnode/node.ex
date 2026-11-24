@@ -205,6 +205,7 @@ defmodule Exnode.Node do
           chain_state: n.chain_state,
           headers: n.headers,
           mempool: n.mempool,
+          tx_relay: n.tx_relay,
           connman: n.connman,
           params: params,
           services: node.services,
@@ -374,9 +375,18 @@ defmodule Exnode.Node do
       indexes ++
         rpc_children(opts, n, node, params, datadir, chain) ++ rest_children(opts, n, params)
 
-    # First, so it stops last and closes the store after all its users.
+    # First, so it stops last, erases published persistent_term handles and
+    # closes the store after all its users.
+    pterms = [
+      {Exnode.Chain.Headers, n.headers},
+      {Exnode.Chain.State, n.chain_state},
+      {Exnode.Validation.ScriptExec, :workers, n.script_exec},
+      {Exnode.Index.BlockFilter, n.filter_index},
+      {Exnode.Index.Scripthash, n.scripthash_index}
+    ]
+
     children =
-      [{Exnode.Store.KVOwner, kv} | shadow] ++
+      [{Exnode.Store.KVOwner, {kv, pterms}} | shadow] ++
         [
           {Headers,
            name: n.headers, params: params, kv: kv, now: fn -> Exnode.Clock.now(clock) end},

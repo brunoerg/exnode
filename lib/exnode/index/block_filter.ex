@@ -70,7 +70,14 @@ defmodule Exnode.Index.BlockFilter do
 
   # The KV handle, published by init/1 under the registered name (stable
   # across restarts) or, unnamed, the pid.
-  defp kv(server), do: :persistent_term.get({__MODULE__, server})
+  defp kv(server) when is_atom(server) do
+    case :persistent_term.get({__MODULE__, server}, nil) do
+      nil -> GenServer.call(server, :kv)
+      kv -> kv
+    end
+  end
+
+  defp kv(server), do: GenServer.call(server, :kv)
 
   @doc "Indexed tip `{height, hash}`."
   def tip(server), do: GenServer.call(server, :tip)
@@ -82,12 +89,16 @@ defmodule Exnode.Index.BlockFilter do
   @impl true
   def init(opts) do
     kv = Keyword.fetch!(opts, :kv)
-    :persistent_term.put({__MODULE__, Keyword.get(opts, :name, self())}, kv)
+
+    if (name = opts[:name]) && :persistent_term.get({__MODULE__, name}, nil) != kv,
+      do: :persistent_term.put({__MODULE__, name}, kv)
+
     send(self(), :tick)
     {:ok, %{kv: kv, chain_state: Keyword.fetch!(opts, :chain_state), waiters: []}}
   end
 
   @impl true
+  def handle_call(:kv, _from, st), do: {:reply, st.kv, st}
   def handle_call(:tip, _from, st), do: {:reply, Follower.tip(st.kv, @cf), st}
 
   def handle_call({:sync_to, hash}, from, st) do

@@ -37,6 +37,43 @@ defmodule Exnode.P2P.NetAddr do
   def ipv4?(%{net: n}), do: n == :ipv4
   def ipv6?(%{net: n}), do: n == :ipv6
 
+  @doc "Packs a 4- or 8-tuple IP address into its 4- or 16-byte network binary."
+  def ip_bytes({a, b, c, d}), do: <<a, b, c, d>>
+
+  def ip_bytes({a, b, c, d, e, f, g, h}),
+    do: <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>
+
+  @doc "Builds `%{net: :ipv4 | :ipv6, addr: binary()}` from an `:inet` IP tuple."
+  def from_ip({_, _, _, _} = ip), do: %{net: :ipv4, addr: ip_bytes(ip)}
+  def from_ip({_, _, _, _, _, _, _, _} = ip), do: %{net: :ipv6, addr: ip_bytes(ip)}
+
+  @doc "Unpacks an IPv4/IPv6 address map or 4-/16-byte binary into an `:inet` IP tuple."
+  def to_ip(%{net: :ipv4, addr: <<_::32>> = bin}), do: to_ip(bin)
+  def to_ip(%{net: :ipv6, addr: <<_::128>> = bin}), do: to_ip(bin)
+  def to_ip(<<a, b, c, d>>), do: {a, b, c, d}
+
+  def to_ip(<<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>),
+    do: {a, b, c, d, e, f, g, h}
+
+  @doc "Formats an IPv4 or IPv6 address map as an IP literal string."
+  def ip_string(%{net: :ipv4, addr: <<a, b, c, d>>}), do: "#{a}.#{b}.#{c}.#{d}"
+
+  def ip_string(%{net: :ipv6, addr: <<_::128>>} = x),
+    do: x |> to_ip() |> :inet.ntoa() |> to_string()
+
+  @doc """
+  Parses a `{host, port}` target (where `host` is a string, charlist, or IP
+  tuple) into `%{net: :ipv4 | :ipv6 | :dns, addr: binary(), port: port}`.
+  """
+  def from_target({host, port}) when is_tuple(host), do: Map.put(from_ip(host), :port, port)
+
+  def from_target({host, port}) do
+    case :inet.parse_address(to_charlist(host)) do
+      {:ok, ip} -> Map.put(from_ip(ip), :port, port)
+      {:error, _} -> %{net: :dns, addr: to_string(host), port: port}
+    end
+  end
+
   # --- the RFC ranges (CNetAddr::IsRFC*) --------------------------------------
 
   defp rfc1918?(%{net: :ipv4, addr: <<a, b, _, _>>}),
@@ -76,9 +113,13 @@ defmodule Exnode.P2P.NetAddr do
   defp he_net?(%{net: :ipv6, addr: <<0x20, 0x01, 0x04, 0x70, _::binary>>}), do: true
   defp he_net?(_), do: false
 
-  @doc "Core `CNetAddr::IsLocal`: 127/8, 0/8, ::1."
+  @doc "Core `CNetAddr::IsLocal`: 127/8, 0/8, ::1 (accepts address maps or `{net, addr[, port]}` keys)."
   def local?(%{net: :ipv4, addr: <<a, _, _, _>>}), do: a in [127, 0]
   def local?(%{net: :ipv6, addr: <<1::128>>}), do: true
+  def local?({:ipv4, <<a, _, _, _>>, _}), do: a in [127, 0]
+  def local?({:ipv6, <<1::128>>, _}), do: true
+  def local?({:ipv4, <<a, _, _, _>>}), do: a in [127, 0]
+  def local?({:ipv6, <<1::128>>}), do: true
   def local?(_), do: false
 
   @doc "Core `CNetAddr::IsValid`."

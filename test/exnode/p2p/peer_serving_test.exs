@@ -165,11 +165,32 @@ defmodule Exnode.P2P.PeerServingTest do
     end
   end
 
-  test "getheaders with a locator over 101 entries disconnects", %{n: n, bs: bs} do
+  test "getheaders with a locator over 101 entries disconnects (post-IBD and during IBD)", %{
+    n: n,
+    bs: bs
+  } do
     {_pid, sock, ref} = peer(n, tip_time(bs))
     locator = for i <- 1..(Message.max_locator_sz() + 1), do: <<i::256>>
     :ok = FakePeer.send_msgs(sock, {:getheaders, %{locator: locator, hash_stop: <<0::256>>}})
     assert_stopped(ref, :locator_too_large)
+
+    # During IBD (clock 48 h ahead of tip), oversized getheaders and getblocks still disconnect.
+    {_pid2, sock2, ref2} = peer(n, tip_time(bs) + 48 * 3600)
+    :ok = FakePeer.send_msgs(sock2, {:getheaders, %{locator: locator, hash_stop: <<0::256>>}})
+    assert_stopped(ref2, :locator_too_large)
+
+    {_pid3, sock3, ref3} = peer(n, tip_time(bs))
+    cnt = Message.max_locator_sz() + 1
+
+    pl =
+      IO.iodata_to_binary([
+        <<Message.protocol_version()::little-32>>,
+        Exnode.Codec.CompactSize.encode(cnt),
+        :binary.copy(<<0>>, cnt * 32 + 32)
+      ])
+
+    :ok = :gen_tcp.send(sock3, Frame.encode(@p.magic, "getblocks", pl))
+    assert_stopped(ref3, :locator_too_large)
   end
 
   describe "BIP157" do

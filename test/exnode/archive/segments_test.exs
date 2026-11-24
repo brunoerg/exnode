@@ -33,7 +33,7 @@ defmodule Exnode.Archive.SegmentsTest do
 
   defp read_all(root, locs) do
     r = Segments.open_reader(root, :outputs)
-    for {loc, i} <- locs, do: {Segments.read_nth(r, loc, 0, &decode/1) |> elem(1), i}
+    for {loc, i} <- locs, do: {Segments.read_nth(r, loc, 0, &decode/1), i}
   end
 
   defp reopen(root, committed, opts \\ []) do
@@ -86,7 +86,7 @@ defmodule Exnode.Archive.SegmentsTest do
     path = Path.join([root, "outputs", String.pad_leading("#{seg}", 5, "0") <> ".seg"])
     File.rm!(path)
 
-    assert_raise RuntimeError,
+    assert_raise Exnode.StorageError,
                  ~r/segment #{seg} missing but committed state references it: the archive is corrupt/,
                  fn ->
                    reopen(root, committed, max: 400)
@@ -109,15 +109,17 @@ defmodule Exnode.Archive.SegmentsTest do
     :ok = :file.truncate(fd)
     :ok = :file.close(fd)
 
-    assert_raise RuntimeError, ~r/shorter than the committed end \(#{off - 10} < #{off}\)/, fn ->
-      reopen(root, committed)
-    end
+    assert_raise Exnode.StorageError,
+                 ~r/shorter than the committed end \(#{off - 10} < #{off}\)/,
+                 fn ->
+                   reopen(root, committed)
+                 end
 
     assert File.stat!(path).size == off - 10
   end
 
   test "open/3 with a committed end checks it before creating anything", %{tmp_dir: root} do
-    assert_raise RuntimeError, ~r/outputs segment 0 missing/, fn ->
+    assert_raise Exnode.StorageError, ~r/outputs segment 0 missing/, fn ->
       Segments.open(root, :outputs, committed: {0, 1234})
     end
 
@@ -142,7 +144,7 @@ defmodule Exnode.Archive.SegmentsTest do
     {s, _} = write(Segments.open(root, :outputs, max: 10), 0, 1)
     s = %{s | seg: 0xFFFF}
 
-    assert_raise RuntimeError, ~r/no segment number left after 65535/, fn ->
+    assert_raise Exnode.StorageError, ~r/no segment number left after 65535/, fn ->
       Segments.append_block(s, [rec(0)])
     end
 
@@ -164,9 +166,11 @@ defmodule Exnode.Archive.SegmentsTest do
     _ = Segments.take_stats()
     r = Segments.open_reader(root, :outputs)
 
-    assert_raise RuntimeError, ~r/corrupt archive record \(non_canonical_compact_size\)/, fn ->
-      Segments.read_nth(r, loc, 0, &Exnode.Archive.decode_output/1)
-    end
+    assert_raise Exnode.StorageError,
+                 ~r/corrupt archive record \(non_canonical_compact_size\)/,
+                 fn ->
+                   Segments.read_nth(r, loc, 0, &Exnode.Archive.decode_output/1)
+                 end
 
     assert Segments.take_stats().preads == 1
     Segments.close_reader(r)
@@ -193,7 +197,7 @@ defmodule Exnode.Archive.SegmentsTest do
       _ = Exnode.Archive.flush(a)
       File.rm!(Path.join([dir, "hot", "outputs", "00000.seg"]))
 
-      assert_raise RuntimeError,
+      assert_raise Exnode.StorageError,
                    ~r/outputs segment 0 missing but committed state references it/,
                    fn ->
                      Exnode.Archive.open(kv, Path.join(dir, "hot"), nil, p.genesis)
@@ -207,10 +211,10 @@ end
 
 defmodule Exnode.Archive.SegmentsSparseTest do
   @moduledoc """
-  `Segments.append_sparse/4` writes exactly what `append_block/2` writes
-  (same bytes, same rollovers) and returns the first location and the
-  locations of ids that are multiples of `every`, as derived from
-  `append_block/2`'s per-record locations.
+  `Segments.append_layout/2` with `Segments.layout/3` writes exactly what
+  `append_block/2` writes (same bytes, same rollovers) and returns the first
+  location and the locations of ids that are multiples of `every`, as derived
+  from `append_block/2`'s per-record locations.
   """
   use ExUnit.Case, async: true
   use ExUnitProperties
@@ -219,7 +223,7 @@ defmodule Exnode.Archive.SegmentsSparseTest do
 
   @moduletag :tmp_dir
 
-  property "append_sparse equals append_block's locations, filtered", %{tmp_dir: root} do
+  property "append_layout equals append_block's locations, filtered", %{tmp_dir: root} do
     check all(
             blocks <-
               list_of(list_of(integer(1..90), min_length: 1, max_length: 40), max_length: 12),
@@ -236,7 +240,7 @@ defmodule Exnode.Archive.SegmentsSparseTest do
         Enum.reduce(blocks, {a, b, base}, fn sizes, {a, b, id0} ->
           recs = for {sz, k} <- Enum.with_index(sizes), do: [<<k>>, :binary.copy(<<id0>>, sz - 1)]
           {a, locs} = Segments.append_block(a, recs)
-          {b, first, sparse} = Segments.append_sparse(b, recs, id0, every)
+          {b, first, sparse} = Segments.append_layout(b, Segments.layout(recs, id0, every))
           assert first == hd(locs)
 
           assert sparse ==
@@ -307,8 +311,7 @@ defmodule Exnode.Archive.SegmentsHandlesTest do
 
         # Every record, twice, in an order that cycles through all segments.
         for {loc, i} <- locs ++ Enum.reverse(locs) do
-          assert {_, payload} = Segments.read_nth(r, loc, 0, &decode/1)
-          assert payload == payload(i)
+          assert Segments.read_nth(r, loc, 0, &decode/1) == payload(i)
           assert Segments.open_read_handles() <= Segments.read_handles()
         end
 
@@ -342,8 +345,7 @@ defmodule Exnode.Archive.SegmentsHandlesTest do
         shrunk = Segments.open_read_handles()
 
         for {loc, i} <- locs do
-          assert {_, payload} = Segments.read_nth(r, loc, 0, &decode/1)
-          assert payload == payload(i)
+          assert Segments.read_nth(r, loc, 0, &decode/1) == payload(i)
           assert Segments.open_read_handles() <= 2
         end
 

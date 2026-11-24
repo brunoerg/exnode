@@ -195,7 +195,16 @@ defmodule Exnode.P2P.Connman do
     {:reply, :ok, update_in(st.peers[pid], &%{&1 | prefer_evict: prefer})}
   end
 
-  def handle_call(:peers, _from, st), do: {:reply, st.peers, st}
+  def handle_call(:peers, _from, st) do
+    peers =
+      Map.new(st.peers, fn {pid, p} ->
+        last_block = Map.get(p, :last_block) || get_in(p, [:stats, :last_block_time]) || 0
+        last_tx = Map.get(p, :last_tx) || get_in(p, [:stats, :last_tx_time]) || 0
+        {pid, Map.merge(p, %{last_block: last_block, last_tx: last_tx})}
+      end)
+
+    {:reply, peers, st}
+  end
 
   # Core CreateNodeFromAcceptedSocket.
   def handle_call({:accept_inbound?, target}, _from, st) do
@@ -514,12 +523,13 @@ defmodule Exnode.P2P.Connman do
     if NetAddr.valid?(a) and not NetAddr.local?(a) and a.net in [:ipv4, :ipv6] and
          desirable?(a.services) and not already_connected?(connected_targets(st), k) and
          AddrMan.group(a) not in outbound_groups(st) do
-      Logger.info("reconnecting anchor #{inspect(ip_string(a))}:#{a.port}")
+      ip_str = NetAddr.ip_string(a)
+      Logger.info("reconnecting anchor #{inspect(ip_str)}:#{a.port}")
       AddrMan.attempt(st.node.addrman, k, count_failures?(st))
 
       start_outbound(
         st,
-        {ip_string(a), a.port},
+        {ip_str, a.port},
         :block_relay,
         local_v2?(st.node) and v2_bit?(a.services)
       )
@@ -564,7 +574,7 @@ defmodule Exnode.P2P.Connman do
         AddrMan.attempt(st.node.addrman, info.key, count_failures?(st))
         # Core: v2 when both we and the address advertise NODE_P2P_V2.
         v2 = local_v2?(st.node) and v2_bit?(info.services)
-        start_outbound(st, {ip_string(info), info.port}, type, v2)
+        start_outbound(st, {NetAddr.ip_string(info), info.port}, type, v2)
     end
   end
 
@@ -763,6 +773,8 @@ defmodule Exnode.P2P.Connman do
       evict_deadline: nil,
       prefer_evict: false,
       stats: default_stats(st),
+      last_block: 0,
+      last_tx: 0,
       services: nil
     })
   end
@@ -810,8 +822,19 @@ defmodule Exnode.P2P.Connman do
 
   defp update_stats(st, pid, stats) do
     case st.peers do
-      %{^pid => p} -> put_in(st.peers[pid], %{p | stats: Map.merge(p.stats, stats)})
-      _ -> st
+      %{^pid => p} ->
+        merged = Map.merge(p.stats, stats)
+
+        p =
+          p
+          |> Map.put(:stats, merged)
+          |> Map.put(:last_block, Map.get(merged, :last_block_time, Map.get(p, :last_block, 0)))
+          |> Map.put(:last_tx, Map.get(merged, :last_tx_time, Map.get(p, :last_tx, 0)))
+
+        put_in(st.peers[pid], p)
+
+      _ ->
+        st
     end
   end
 
@@ -829,7 +852,7 @@ defmodule Exnode.P2P.Connman do
           prefer_evict: p.prefer_evict,
           conn_type: p.type,
           keyed_netgroup: keyed_netgroup(st, p.group),
-          is_local: local?(key),
+          is_local: NetAddr.local?(key),
           network: network(key)
         })
       end
@@ -851,28 +874,14 @@ defmodule Exnode.P2P.Connman do
     k
   end
 
-  # Core CNetAddr::IsLocal: 127.0.0.0/8 and ::1 (and 0.0.0.0/8).
-  defp local?({:ipv4, <<127, _, _, _>>, _}), do: true
-  defp local?({:ipv4, <<0, _, _, _>>, _}), do: true
-  defp local?({:ipv6, <<1::128>>, _}), do: true
-  defp local?(_), do: false
-
   defp network({:ipv4, _, _}), do: :ipv4
   defp network({:ipv6, _, _}), do: :ipv6
   defp network(_), do: :unroutable
 
-  defp ip_string(%{net: :ipv4, addr: <<a, b, c, d>>}), do: "#{a}.#{b}.#{c}.#{d}"
-
-  defp ip_string(%{net: :ipv6, addr: bin}),
-    do: for(<<x::16 <- bin>>, do: x) |> List.to_tuple() |> :inet.ntoa() |> to_string()
-
   # AddrMan-facing key, (IP, port) as AddrMan entries are. Discouragement
   # uses Discouraged.key/1 (IP only).
-  def addr_key({host, port}) do
-    case :inet.parse_address(to_charlist(host)) do
-      {:ok, {a, b, c, d}} -> {:ipv4, <<a, b, c, d>>, port}
-      {:ok, t} -> {:ipv6, for(x <- Tuple.to_list(t), into: <<>>, do: <<x::16>>), port}
-      _ -> {:dns, to_string(host), port}
-    end
+  def addr_key(target) do
+    %{net: net, addr: addr, port: port} = NetAddr.from_target(target)
+    {net, addr, port}
   end
 end

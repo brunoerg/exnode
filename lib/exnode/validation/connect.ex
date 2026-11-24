@@ -211,8 +211,7 @@ defmodule Exnode.Validation.Connect do
 
   # --- view ------------------------------------------------------------------
 
-  # Core: CCoinsViewCache::HaveInputs + AccessCoin. Public for the pure
-  # preparation engine (Exnode.Validation.Prepare), which shares it.
+  # Core: CCoinsViewCache::HaveInputs + AccessCoin.
   @doc false
   def have_inputs(a, tx, st) do
     tx.inputs
@@ -427,8 +426,7 @@ defmodule Exnode.Validation.Connect do
     end
   end
 
-  # Core: BIP30 block in ConnectBlock. Public for the preparation engine,
-  # which takes its result as a population fact.
+  # Core: BIP30 block in ConnectBlock.
   @doc false
   def bip30(a, view, block, entry, prev, p, idx, committed) do
     stat_timed(:perf_bip30_us, fn ->

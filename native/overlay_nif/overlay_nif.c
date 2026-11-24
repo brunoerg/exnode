@@ -26,7 +26,6 @@
  * binary is badarg and leaves the tables as they were.
  */
 #include <erl_nif.h>
-#include <malloc.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,8 +59,12 @@ typedef struct {
     size_t cap;   /* power of two */
     size_t size;  /* live entries */
     size_t tombs;
-    size_t entry_bytes; /* malloc_usable_size of live entries */
+    size_t entry_bytes; /* aligned allocation footprint of live entries */
 } table_t;
+
+static inline size_t entry_alloc_size(const entry_t *e) {
+    return (sizeof(entry_t) + e->key_len + e->spk_len + 15u) & ~(size_t)15u;
+}
 
 typedef struct {
     ErlNifRWLock *lock;
@@ -182,7 +185,7 @@ static int table_reserve(table_t *t) {
 
 static void table_remove_at(table_t *t, size_t i) {
     entry_t *e = t->slots[i].e;
-    t->entry_bytes -= malloc_usable_size(e);
+    t->entry_bytes -= entry_alloc_size(e);
     free(e);
     t->size--;
     /* The next slot empty: no probe sequence passes here, so empty it. */
@@ -205,10 +208,10 @@ static int table_delete(table_t *t, uint64_t h, const unsigned char *key, size_t
 static int table_put(table_t *t, uint64_t h, entry_t *e) {
     long i = table_find(t, h, e->data, e->key_len, e->vout);
     if (i >= 0) {
-        t->entry_bytes -= malloc_usable_size(t->slots[i].e);
+        t->entry_bytes -= entry_alloc_size(t->slots[i].e);
         free(t->slots[i].e);
         t->slots[i].e = e;
-        t->entry_bytes += malloc_usable_size(e);
+        t->entry_bytes += entry_alloc_size(e);
         return 1;
     }
     if (!table_reserve(t)) return 0;
@@ -218,7 +221,7 @@ static int table_put(table_t *t, uint64_t h, entry_t *e) {
     t->slots[j].h = h;
     t->slots[j].e = e;
     t->size++;
-    t->entry_bytes += malloc_usable_size(e);
+    t->entry_bytes += entry_alloc_size(e);
     return 1;
 }
 
@@ -426,6 +429,10 @@ static ERL_NIF_TERM nif_lookup(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
         entry_t *e = ov->coins.slots[i].e;
         ERL_NIF_TERM spk;
         unsigned char *p = enif_make_new_binary(env, e->spk_len, &spk);
+        if (!p) {
+            enif_rwlock_runlock(ov->lock);
+            return enomem(env);
+        }
         memcpy(p, e->data + e->key_len, e->spk_len);
         ERL_NIF_TERM keys[5] = {k_output_id, k_value, k_script_pubkey, k_height, k_coinbase};
         ERL_NIF_TERM vals[5] = {enif_make_uint64(env, e->output_id), enif_make_uint64(env, e->value), spk,
@@ -499,6 +506,7 @@ static ERL_NIF_TERM nif_evict(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
             n++;
         }
     }
+    if (ov->coins.size == 0 && ov->coins.cap > MIN_CAP) table_clear(&ov->coins);
     enif_rwlock_rwunlock(ov->lock);
     return enif_make_uint64(env, n);
 }

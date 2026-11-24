@@ -40,7 +40,10 @@ defmodule Exnode.Chain.GcProbe do
           {:tracer, self()}
         ])
 
-        :erlang.system_monitor(self(), [{:long_schedule, @long_schedule_ms}])
+        if :erlang.system_monitor() == :undefined do
+          :erlang.system_monitor(self(), [{:long_schedule, @long_schedule_ms}])
+        end
+
         send(parent, {__MODULE__, :started})
         loop(target, c, nil)
       end)

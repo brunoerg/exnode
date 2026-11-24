@@ -144,7 +144,8 @@ defmodule Exnode.Mempool.Accept do
           allow_sibling_eviction: true,
           package_feerates: false,
           package_submission: false,
-          package_coins: %{}
+          package_coins: %{},
+          max_feerate: nil
         },
         Map.new(args)
       )
@@ -250,6 +251,13 @@ defmodule Exnode.Mempool.Accept do
            :ok <-
              if(not args.bypass_limits and not args.package_feerates,
                do: check_fee_rate(state, vsize, fee, chain.now),
+               else: :ok
+             ),
+           :ok <-
+             if(
+               args.max_feerate != nil and args.max_feerate > 0 and
+                 fee > Policy.fee_for(args.max_feerate, vsize),
+               do: {:error, err(:mempool_policy, "max-fee-exceeded")},
                else: :ok
              ),
            {:ok, ws} <-

@@ -17,18 +17,18 @@ defmodule Exnode.Archive do
     `flush/2` commits them together. Until then, reads see them through the
     batch maps and `Archive.Overlay`.
 
+  Wire codecs live in `Exnode.Archive.Codec`; serving, undo, indexer and
+  block-reconstruction queries live in `Exnode.Archive.Query` (re-exported
+  here via `defdelegate`).
+
   This struct is owned by a single writer process (the chain state). The
   segment readers it holds are raw file handles of that process.
   """
-  import Bitwise
 
-  alias Exnode.Archive.{Overlay, Segments}
-  alias Exnode.Codec.{Block, CompactSize, Header, Tx}
-  alias Exnode.Crypto.Hash
+  alias Exnode.Archive.{Codec, Overlay, Query, Segments}
+  alias Exnode.Codec.{Block, Header}
   alias Exnode.Script
   alias Exnode.Store.KV
-  alias Exnode.Validation.Block, as: BlockRules
-  alias Exnode.Validation.Merkle
 
   @sparse 64
 
@@ -77,6 +77,35 @@ defmodule Exnode.Archive do
     # commitment (Core DeploymentActiveAfter(SEGWIT)); 0: every block.
     segwit_height: 0
   ]
+
+  # --- query & codec delegations -----------------------------------------------
+
+  defdelegate tx_location(a, txid), to: Query
+  defdelegate tx_location_in_block(a, txid, block_id), to: Query
+  defdelegate output(a, txid, vout), to: Query
+  defdelegate outputs(a, outpoints), to: Query
+  defdelegate spenders(a, outpoints), to: Query
+  defdelegate read_tx(a, txid), to: Query
+  defdelegate read_tx_strict(a, id, pos), to: Query
+  defdelegate spent_outputs(a, block_id), to: Query
+  defdelegate spent_outputs_slice(a, rec, skip, count), to: Query
+  defdelegate read_block_txs(a, id), to: Query
+  defdelegate read_block_txs(a, id, rec), to: Query
+  defdelegate block_scripts(a, id), to: Query
+  defdelegate undo_outputs(a, rec), to: Query
+  defdelegate read_index_facts(a, id), to: Query
+  defdelegate read_index_facts(a, id, rec), to: Query
+  defdelegate output_origin(a, out_id), to: Query
+  defdelegate read_block(a, id), to: Query
+
+  defdelegate decode_output(bin), to: Codec
+  defdelegate decode_input(bin), to: Codec
+  defdelegate decode_witness(bin), to: Codec
+
+  @doc false
+  defdelegate encode_txindex(list), to: Codec
+  @doc false
+  defdelegate decode_txindex(bin), to: Codec
 
   # The uncommitted batch: KV ops (reversed list of per-block op lists) and
   # the maps reads need before they are committed.
@@ -181,7 +210,8 @@ defmodule Exnode.Archive do
 
   # From the tip down; each `chain` row first holds its block's tx count.
   defp walk(a, id, rec) do
-    :ets.insert(a.chain, {rec.height, id, length(rec.txs)})
+    n_tx = Map.get_lazy(rec, :n_tx, fn -> length(rec.txs) end)
+    :ets.insert(a.chain, {rec.height, id, n_tx})
     :ets.insert(a.onchain, {id, rec.height})
     if rec.prev_id != nil, do: walk(a, rec.prev_id, block_record!(a, rec.prev_id))
   end
@@ -230,12 +260,16 @@ defmodule Exnode.Archive do
     end
   end
 
-  def on_chain?(%__MODULE__{onchain: t, visible: nil}, id), do: :ets.member(t, id)
+  def on_chain?(a, id), do: match?({:ok, _}, chain_height(a, id))
 
-  def on_chain?(%__MODULE__{onchain: t, visible: v}, id) do
+  # Single atomic ETS lookup returning `{:ok, height}` when `id` is on the
+  # visible selected chain, or `:off_chain` (avoids TOCTOU between checking
+  # membership and reading height while `disconnect_tip/1` mutates `onchain`).
+  @doc false
+  def chain_height(%__MODULE__{onchain: t, visible: v}, id) do
     case :ets.lookup(t, id) do
-      [{_, h}] -> visible?(v, h)
-      [] -> false
+      [{_, h}] -> if visible?(v, h), do: {:ok, h}, else: :off_chain
+      [] -> :off_chain
     end
   end
 
@@ -269,8 +303,24 @@ defmodule Exnode.Archive do
         rec
 
       _ ->
-        {:ok, bin} = KV.get(kv, :blocks, <<id::32>>)
-        :erlang.binary_to_term(bin)
+        case KV.get(kv, :blocks, <<id::32>>) do
+          {:ok, bin} ->
+            try do
+              :erlang.binary_to_term(bin)
+            rescue
+              e in ArgumentError ->
+                raise Exnode.StorageError,
+                  source: :archive,
+                  reason: {:corrupt_block_record, id, e},
+                  message: "corrupt block record #{id}"
+            end
+
+          :not_found ->
+            raise Exnode.StorageError,
+              source: :archive,
+              reason: {:missing_block_record, id},
+              message: "missing block record #{id}"
+        end
     end
   end
 
@@ -325,464 +375,6 @@ defmodule Exnode.Archive do
 
   @doc "The committed-state epoch (see the struct): bumped by every commit and disconnect."
   def epoch(%__MODULE__{epoch: e}), do: e
-
-  @doc """
-  Where txid's newest occurrence is (on-chain preferred, as Core's txindex
-  returns the active-chain copy): `{:ok, block_id, pos}` or `:missing`.
-  """
-  def tx_location(%__MODULE__{} = a, txid) do
-    case KV.get(a.kv, :txindex, txid) do
-      :not_found ->
-        :missing
-
-      {:ok, bin} ->
-        entries = decode_txindex(bin)
-        on = Enum.filter(entries, fn {b, _, _, _, _} -> on_chain?(a, b) end)
-
-        pick =
-          if on != [],
-            do: Enum.max_by(on, fn {b, _, _, _, _} -> :ets.lookup_element(a.onchain, b, 2) end),
-            else: List.last(entries)
-
-        {b, pos, _, _, _} = pick
-        {:ok, b, pos}
-    end
-  end
-
-  @doc """
-  Output `vout` of `txid` as `%Tx.Out{}`, or nil: unknown txid, `vout`
-  out of range, or no occurrence on the selected chain (BIP30: the newest
-  on-chain occurrence, as `resolve/3`). Spent outputs are returned too
-  (this serves prevouts; spentness is `resolve/3`'s business). One output
-  read, no block reconstruction and no merkle check: the data was checked
-  when the block connected. For serving (REST), not validation.
-  """
-  def output(%__MODULE__{} = a, txid, vout), do: outputs(a, [{txid, vout}])[{txid, vout}]
-
-  @doc """
-  `output/3` for many outpoints: `%{{txid, vout} => %Tx.Out{} | nil}`, one
-  txindex `multi_get` and output reads grouped by location.
-  """
-  def outputs(_a, []), do: %{}
-
-  def outputs(%__MODULE__{} = a, outpoints) do
-    outpoints = Enum.uniq(outpoints)
-    ids = output_ids(a, outpoints)
-    recs = read_outputs(a, Map.values(ids))
-
-    Map.new(outpoints, fn op ->
-      case ids do
-        %{^op => id} ->
-          (fn {v, spk} -> {op, %Tx.Out{value: v, script_pubkey: spk}} end).(Map.fetch!(recs, id))
-
-        _ ->
-          {op, nil}
-      end
-    end)
-  end
-
-  # outpoint => output id, at the txid's newest on-chain occurrence (one
-  # txindex multi_get); unknown txids and vouts out of range left out.
-  defp output_ids(a, outpoints) do
-    txids = outpoints |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
-
-    located =
-      txids
-      |> Enum.zip(KV.multi_get(a.kv, :txindex, txids))
-      |> Enum.flat_map(fn {txid, r} ->
-        case newest_on_chain(a, r) do
-          nil -> []
-          {_b, _pos, base_out, nout, _} -> [{txid, {base_out, nout}}]
-        end
-      end)
-      |> Map.new()
-
-    for {txid, vout} = op <- outpoints,
-        {base, n} = Map.get(located, txid, {nil, 0}),
-        vout >= 0 and vout < n,
-        into: %{},
-        do: {op, base + vout}
-  end
-
-  @doc """
-  The on-chain spenders of `outpoints` (for serving):
-  `%{outpoint => {spending_txid, input_index, header, pos}}`; unspent,
-  unknown and BIP30-overwritten outpoints are absent. The outpoint is its
-  txid's newest on-chain occurrence (as `outputs/2`); its spend record
-  (`spends`, one seek per output, one iterator) in a block on the selected
-  chain gives that block and the input id, the block's record the spending
-  tx's position and input index, and that tx's base records its txid (one
-  tx read per spending tx, no block reconstruction).
-  """
-  def spenders(_a, []), do: %{}
-
-  def spenders(%__MODULE__{} = a, outpoints) do
-    ids = output_ids(a, Enum.uniq(outpoints))
-    spends = spend_records(a, Map.values(ids))
-
-    {result, _cache} =
-      Enum.reduce(ids, {%{}, %{}}, fn {op, out_id}, {acc, cache} ->
-        case spends do
-          %{^out_id => {b, input_id}} ->
-            {rec, cache} = cached(cache, {:rec, b}, fn -> block_record!(a, b) end)
-            {pos, vin} = input_position(rec.txs, input_id - rec.base_in, 0)
-            {txid, cache} = cached(cache, {:txid, b, pos}, fn -> tx_at(a, rec, pos).txid end)
-            {header, ""} = Header.decode(rec.header)
-            {Map.put(acc, op, {txid, vin, header, pos}), cache}
-
-          _ ->
-            {acc, cache}
-        end
-      end)
-
-    result
-  end
-
-  defp cached(cache, k, f) do
-    case cache do
-      %{^k => v} -> {v, cache}
-      _ -> (fn v -> {v, Map.put(cache, k, v)} end).(f.())
-    end
-  end
-
-  # out_id => {block_id, input_id} of its spend record in an on-chain block.
-  defp spend_records(_a, []), do: %{}
-
-  defp spend_records(a, ids) do
-    it = KV.iterator(a.kv, :spends)
-
-    try do
-      ids
-      |> Enum.sort()
-      |> Enum.uniq()
-      |> Enum.reduce(%{}, fn id, acc ->
-        case spend_record(a, it, :rocksdb.iterator_move(it, {:seek, <<id::64>>}), id) do
-          nil -> acc
-          r -> Map.put(acc, id, r)
-        end
-      end)
-    after
-      :rocksdb.iterator_close(it)
-    end
-  end
-
-  defp spend_record(a, it, {:ok, <<id::64, b::32>>, <<input::64>>}, id) do
-    if on_chain?(a, b),
-      do: {b, input},
-      else: spend_record(a, it, :rocksdb.iterator_move(it, :next), id)
-  end
-
-  defp spend_record(_a, _it, _, _id), do: nil
-
-  # {tx position, input index} of the block's `k`th input (counting every
-  # input, the coinbase's too, as input ids do).
-  defp input_position([{_, _, ni, _, _} | txs], k, pos) when k >= ni,
-    do: input_position(txs, k - ni, pos + 1)
-
-  defp input_position([_ | _], k, pos), do: {pos, k}
-
-  @doc """
-  One tx read from the archive without reconstructing its block, at
-  `tx_location/2`: `{:ok, %Tx{}, header, block_id, pos}` or `:missing`. The
-  tx is decoded from its exact serialization, as in `read_block_txs/2`
-  (witnesses empty when they are pruned).
-  """
-  def read_tx(%__MODULE__{} = a, txid) do
-    case tx_location(a, txid) do
-      :missing ->
-        :missing
-
-      {:ok, id, pos} ->
-        rec = block_record!(a, id)
-        {header, ""} = Header.decode(rec.header)
-        {:ok, tx_at(a, rec, pos), header, id, pos}
-    end
-  end
-
-  defp read_tx_witness(a, rec, in0, ni) do
-    if Map.has_key?(rec, :wloc),
-      do: elem(Segments.read_run(a.readers.witness, rec.wloc, in0, ni, &decode_witness/1), 1),
-      else: read_records(a, :witness, rec.base_in + in0, ni, &decode_witness/1)
-  end
-
-  # The tx at `pos` in the block of record `rec`, from its records (its
-  # exact serialization; witnesses empty when pruned).
-  defp tx_at(a, rec, pos) do
-    {before, [{ver, lt, ni, no, _} | _]} = Enum.split(rec.txs, pos)
-    in0 = Enum.reduce(before, 0, fn {_, _, n, _, _}, acc -> acc + n end)
-    out0 = Enum.reduce(before, 0, fn {_, _, _, n, _}, acc -> acc + n end)
-    ins = read_records(a, :inputs, rec.base_in + in0, ni, &decode_input/1)
-
-    wits =
-      cond do
-        rec_pruned?(a, rec) ->
-          List.duplicate([], ni)
-
-        ni == 0 ->
-          []
-
-        true ->
-          if_not_pruned(
-            a,
-            rec,
-            fn -> read_tx_witness(a, rec, in0, ni) end,
-            List.duplicate([], ni)
-          )
-      end
-
-    outs = read_records(a, :outputs, rec.base_out + out0, no, &decode_output/1)
-
-    inputs =
-      for {{ph, pi, ss, seq}, w} <- Enum.zip(ins, wits),
-          do: %Tx.In{prev_hash: ph, prev_index: pi, script_sig: ss, sequence: seq, witness: w}
-
-    tx = %Tx{
-      version: ver,
-      inputs: inputs,
-      outputs: for({v, spk} <- outs, do: %Tx.Out{value: v, script_pubkey: spk}),
-      locktime: lt
-    }
-
-    {:ok, tx} = tx |> Tx.encode() |> IO.iodata_to_binary() |> Tx.decode_exact()
-    tx
-  end
-
-  @doc """
-  The outputs a block's non-coinbase inputs spent (Core's undo data), in
-  input order: `[%{value, script_pubkey, height, coinbase}]`.
-  """
-  def spent_outputs(%__MODULE__{} = a, block_id) do
-    rec = block_record!(a, block_id)
-
-    for out_id <- rec.undo do
-      {value, spk} = read_output(a, out_id)
-      {height, coinbase} = output_origin(a, out_id)
-      %{value: value, script_pubkey: spk, height: height, coinbase: coinbase}
-    end
-  end
-
-  @doc """
-  The block's transactions. With pruned witness data the witnesses are
-  empty, so txids, inputs and outputs are exact but wtxids are not.
-  `{:ok, %Block{}}`.
-  """
-  def read_block_txs(%__MODULE__{} = a, id) do
-    committed!(a, id)
-    read_block_txs(a, id, block_record!(a, id))
-  end
-
-  @doc "`read_block_txs/2` with block `id`'s record already read (`block_record!/2`)."
-  def read_block_txs(%__MODULE__{} = a, id, rec) do
-    case read_checked(a, id, rec) do
-      {:ok, _raw, block} ->
-        {:ok, block}
-
-      {:error, :witness_pruned} ->
-        {header, ""} = Header.decode(rec.header)
-        n_in = Enum.reduce(rec.txs, 0, fn {_, _, ni, _, _}, acc -> acc + ni end)
-        n_out = Enum.reduce(rec.txs, 0, fn {_, _, _, no, _}, acc -> acc + no end)
-        ins = read_records(a, :inputs, rec.base_in, n_in, &decode_input/1)
-        outs = read_records(a, :outputs, rec.base_out, n_out, &decode_output/1)
-
-        {txs, _} =
-          Enum.map_reduce(rec.txs, {ins, outs}, fn {ver, lt, ni, no, _}, {ins, outs} ->
-            {tin, ins} = Enum.split(ins, ni)
-            {tout, outs} = Enum.split(outs, no)
-
-            inputs =
-              for {ph, pi, ss, seq} <- tin,
-                  do: %Tx.In{
-                    prev_hash: ph,
-                    prev_index: pi,
-                    script_sig: ss,
-                    sequence: seq,
-                    witness: []
-                  }
-
-            {%Tx{
-               version: ver,
-               inputs: inputs,
-               outputs: for({v, spk} <- tout, do: %Tx.Out{value: v, script_pubkey: spk}),
-               locktime: lt
-             }, {ins, outs}}
-          end)
-
-        %Block{header: header, txs: txs}
-        |> Block.encode()
-        |> IO.iodata_to_binary()
-        |> Block.decode_exact()
-    end
-  end
-
-  @doc """
-  The block's output scripts (all txs, in order) and the scripts its inputs
-  spent, without reconstructing the block (so witness pruning does not matter).
-  """
-  def block_scripts(%__MODULE__{} = a, id) do
-    rec = block_record!(a, id)
-    n_out = Enum.reduce(rec.txs, 0, fn {_, _, _, no, _}, acc -> acc + no end)
-
-    outs =
-      for {_v, spk} <- read_records(a, :outputs, rec.base_out, n_out, &decode_output/1), do: spk
-
-    spent = for out_id <- rec.undo, do: elem(read_output(a, out_id), 1)
-    {outs, spent}
-  end
-
-  @doc """
-  The outputs a block spent, `{value, script_pubkey}` for each of its
-  record's `undo` ids (`block_record!/2`), in that order: the exact
-  archived outputs (spent, overwritten or disconnected since, all the
-  same). Each distinct id is read once, grouped by sparse-index base in
-  physical order (`read_outputs/2`); an id listed twice (storage
-  fixtures) fills both positions.
-  """
-  def undo_outputs(%__MODULE__{} = a, %{undo: undo}) do
-    outs = read_outputs(a, undo)
-    for id <- undo, do: Map.fetch!(outs, id)
-  end
-
-  @doc """
-  The base (non-witness) transaction data of committed block `id`, for
-  building indexes. Reads only the block record and its input and output
-  records, never witness records, so pruned or cold witnesses make no
-  difference. Returns `{:ok, %{hash, header, txs}}` with, per tx in block
-  order, `{txid, prevouts, outputs}`: `prevouts` are `[{prev_hash,
-  prev_index}]` and `outputs` `[{value, script_pubkey}]`, both in order.
-
-  Integrity contract. Each txid is double SHA-256 of the stripped
-  serialization (`version || vin || vout || locktime`, no marker, flag or
-  witness) built from the stored input and output records. Those records
-  are already in wire format: prevout, CompactSize scriptSig and sequence;
-  signed 64-bit value and CompactSize scriptPubKey, decoded strictly
-  (canonical sizes). The ordered txids must give the header's merkle root
-  without a duplicated-subtree mutation (as
-  `Exnode.Validation.Block.check_merkle_root/1`). The header must hash to
-  the record's hash, and that hash must map to `id` in the archive. Any
-  change to the base data (scriptSig and sequence included) therefore
-  fails instead of producing other txids or outputs.
-
-  Not covered: witnesses, wtxids and the witness commitment are neither
-  read nor checked. This is no substitute for `read_block/2` or
-  `read_block_txs/2` (serving, validation).
-
-  Failures are archive faults, never verdicts on a block:
-  `{:error, {:archive_integrity, reason}}` for a mismatch, and a raise for
-  a truncated segment, as in the strict readers. A pending (uncommitted)
-  block raises.
-  """
-  def read_index_facts(%__MODULE__{} = a, id) do
-    committed!(a, id)
-    read_index_facts(a, id, block_record!(a, id))
-  end
-
-  @doc "`read_index_facts/2` with block `id`'s record already read (`block_record!/2`); it must be `id`'s record."
-  def read_index_facts(%__MODULE__{} = a, id, rec) do
-    committed!(a, id)
-    t0 = System.monotonic_time(:microsecond)
-
-    with {:ok, header} <- facts_header(a, id, rec),
-         {:ok, n_in, n_out} <- facts_counts(rec) do
-      ins = read_records(a, :inputs, rec.base_in, n_in, &decode_input_raw/1)
-      outs = read_records(a, :outputs, rec.base_out, n_out, &decode_output_raw/1)
-      t1 = System.monotonic_time(:microsecond)
-
-      {txs, {ins_left, outs_left}} =
-        Enum.map_reduce(rec.txs, {ins, outs}, fn {ver, lt, ni, no, _hw}, {ins, outs} ->
-          {tin, ins} = Enum.split(ins, ni)
-          {tout, outs} = Enum.split(outs, no)
-
-          stripped = [
-            <<ver::little-32>>,
-            CompactSize.encode(ni),
-            Enum.map(tin, &elem(&1, 2)),
-            CompactSize.encode(no),
-            Enum.map(tout, &elem(&1, 2)),
-            <<lt::little-32>>
-          ]
-
-          {{Hash.hash256(stripped), for({ph, pi, _} <- tin, do: {ph, pi}),
-            for({v, spk, _} <- tout, do: {v, spk})}, {ins, outs}}
-        end)
-
-      t2 = System.monotonic_time(:microsecond)
-      {root, mutated} = Merkle.compute_root(for {txid, _, _} <- txs, do: txid)
-      count(:facts_blocks, 1)
-      count(:facts_read_us, t1 - t0)
-      count(:facts_txid_us, t2 - t1)
-      count(:facts_merkle_us, System.monotonic_time(:microsecond) - t2)
-
-      cond do
-        ins_left != [] or outs_left != [] -> {:error, {:archive_integrity, :leftover_records}}
-        root != header.merkle_root -> {:error, {:archive_integrity, "bad-txnmrklroot"}}
-        mutated -> {:error, {:archive_integrity, "bad-txns-duplicate"}}
-        not coinbase_prevouts?(hd(txs)) -> {:error, {:archive_integrity, :first_tx_not_coinbase}}
-        true -> {:ok, %{hash: header.hash, header: header, txs: txs}}
-      end
-    end
-  end
-
-  # The record's header, if it is block `id`'s: hash matches the record's
-  # (when the record has one) and maps to `id`.
-  defp facts_header(a, id, rec) do
-    {header, ""} = Header.decode(rec.header)
-
-    cond do
-      Map.get(rec, :hash, header.hash) != header.hash ->
-        {:error, {:archive_integrity, :record_hash}}
-
-      block_id(a, header.hash) != id ->
-        {:error, {:archive_integrity, :record_not_block}}
-
-      true ->
-        {:ok, header}
-    end
-  end
-
-  # Input and output totals; every tx needs at least one input and one output
-  # (a stripped tx with no inputs would read as a segwit marker), 32-bit
-  # version and locktime, and the record's tx count must agree.
-  defp facts_counts(%{txs: [_ | _] = txs} = rec) do
-    ok? =
-      Map.get(rec, :n_tx, length(txs)) == length(txs) and
-        Enum.all?(txs, fn
-          {ver, lt, ni, no, _} ->
-            is_integer(ver) and ver in -0x80000000..0xFFFFFFFF and is_integer(lt) and
-              lt in 0..0xFFFFFFFF and
-              is_integer(ni) and ni >= 1 and is_integer(no) and no >= 1
-
-          _ ->
-            false
-        end)
-
-    if ok?,
-      do:
-        {:ok, Enum.reduce(txs, 0, &(elem(&1, 2) + &2)), Enum.reduce(txs, 0, &(elem(&1, 3) + &2))},
-      else: {:error, {:archive_integrity, :tx_metadata}}
-  end
-
-  defp facts_counts(_rec), do: {:error, {:archive_integrity, :tx_metadata}}
-
-  defp coinbase_prevouts?({_txid, [{<<0::256>>, 0xFFFFFFFF}], _outs}), do: true
-  defp coinbase_prevouts?(_), do: false
-
-  @doc "`{height, coinbase?}` of the block that created output `out_id` (binary search on block base ids)."
-  def output_origin(%__MODULE__{} = a, out_id) do
-    id = search_block(a, out_id, 0, a.next.block - 1)
-    rec = block_record!(a, id)
-    {_, _, _, n0, _} = hd(rec.txs)
-    {rec.height, out_id < rec.base_out + n0}
-  end
-
-  defp search_block(_a, _out, lo, hi) when lo >= hi, do: lo
-
-  defp search_block(a, out, lo, hi) do
-    mid = div(lo + hi + 1, 2)
-
-    if block_record!(a, mid).base_out <= out,
-      do: search_block(a, out, mid, hi),
-      else: search_block(a, out, lo, mid - 1)
-  end
 
   @doc "Next ids the archive will assign: `%{block, out, inp}`."
   def next_ids(%__MODULE__{next: n}), do: n
@@ -929,12 +521,8 @@ defmodule Exnode.Archive do
   (`overlay_hint/1`) answers now are omitted: `resolve_many/3` asks the
   overlay first, so their committed answers would not be used. An omitted
   outpoint is **absent** from the returned map (never `:missing`), and no
-  overlay answer is ever put in it, so it stays a committed-only map. If
-  the overlay changes before the answers are used (an eviction, a commit
-  clearing the spent mask), `resolve_many/3` looks up every outpoint the
-  map lacks, as without prefetch: a race can lose the saving, not change a
-  result. `hint` nil omits nothing. Returns `{answers, %{considered,
-  omitted, sent}}` (unique outpoints; `sent` went to committed resolution).
+  overlay answer is ever put in it, so it stays a committed-only map. `hint`
+  nil omits nothing. Returns `{answers, %{considered, omitted, sent}}`.
   """
   def prefetch_answers(%__MODULE__{} = a, outpoints, hint) do
     a = live_chain(a)
@@ -949,10 +537,7 @@ defmodule Exnode.Archive do
   `prefetch_answers/3` plus the committed txindex rows of `txids` (a
   block's own txids) for `connect/5`'s `:history`: `{answers, stats,
   history}`. One `multi_get` reads the rows of the answers' txids and of
-  `txids` together (a txid the BIP30 outpoints already read is not read
-  twice). `history` is `%{epoch, rows: %{txid => {:ok, bin} | :not_found}}`:
-  the exact persistent rows at this reader's epoch. `stats` adds
-  `history_rows` and `history_extra` (rows read only for the history).
+  `txids` together.
   """
   def prefetch_block(%__MODULE__{} = a, outpoints, hint, txids) do
     a = live_chain(a)
@@ -984,21 +569,6 @@ defmodule Exnode.Archive do
   Carries `prefetch_block/4` results computed at `epoch` over the one
   commit since, instead of discarding them: `{:ok, answers, history,
   dropped}` valid at the current epoch, or `:stale`.
-
-  Only when the current epoch is `epoch + 1` and that step was a commit
-  (`flush/2`; a disconnect clears `last_commit`, and so does a commit
-  whose batch reconnected an archived block). A commit adds exactly
-  its batch to the committed state: txindex rows for the batch's txids,
-  spend records for the output ids its blocks spent, and their outputs.
-  A committed answer for `{txid, vout}` reads only the txindex row of
-  `txid`, the spend record of that output's id, the (immutable) output
-  and the on-chain table. So an answer is unchanged unless `txid` is one
-  of the batch's or (`{:ok, coin}`) its output was spent by the batch:
-  those are dropped (absent: `resolve_many/3` looks them up, as for an
-  omitted outpoint), every other one is kept as it is. The same holds for
-  a worker's reads that straddled the commit: every key a kept answer read
-  is equal before and after it. `history` (the block's own txids' rows)
-  is kept, at the current epoch, only if none of its txids is the batch's.
   """
   def revalidate(%__MODULE__{epoch: cur, last_commit: lc}, epoch, answers, history) do
     case lc do
@@ -1086,47 +656,7 @@ defmodule Exnode.Archive do
   ]
 
   @doc """
-  Takes (and resets) this process's archive work counters: `committed_ops`
-  (outpoints resolved against the committed archive), `output_groups`
-  (sparse-index groups of output reads), `preads` and `pread_bytes`
-  (positional segment reads and bytes requested, any record kind), and
-  `commits`, `commit_sync_us`, `commit_kv_us`, `commit_us` (`flush/2`:
-  segment fsync, the KV batch write, and the whole flush). Counted per batch
-  or group, not per input, in the process dictionary of whoever does the
-  work, so a prefetch worker returns its own and the chain state reads its.
-
-  Attribution (per block or per commit, never per input):
-  * `flush/2`: `commit_blocks`; `commit_kv_us` splits into
-    `commit_materialize_us` (op list flattening, meta encoding) and the KV
-    write's `kv_build_us` (native batch construction) and `kv_write_us`
-    (`write_batch`, WAL fsync included), with `kv_writes`, `kv_ops`,
-    `kv_bytes`, `kv_write_max_us` (`Store.KV.take_stats/0`); a whole-flush
-    latency histogram `commit_le_4ms` .. `commit_gt_1s`.
-  * `append` (new blocks): `append_encode_us` (record encoding),
-    `append_segments_us` (segment writes and sparse-index ops; the write
-    calls alone are `seg_write_us`, rollovers `seg_rolls`/`seg_roll_us`),
-    `append_txindex_us` (occurrence lists: `txindex_reads` lookups),
-    `append_overwritten_us`, `append_record_us` (block record, ops),
-    `append_ops`, `append_repeated`. `append_txindex_us` includes the
-    `multi_get` itself (`txindex_read_us`, `txindex_found` rows existed;
-    `txindex_reused`: rows taken from `:history` instead of read,
-    `txindex_hint_stale`: blocks whose `:history` epoch had passed);
-    `append_record_us` splits into `append_tx_ops_us` (txindex value
-    encoding), `append_spend_ops_us`, `append_ops_list_us` (block record
-    encoding, op list) and `append_batch_us` (batch maps).
-  * `prepare_append/7` results passed to `connect/5`: `append_prepared`
-    (used), `append_prepared_mismatch` (ids or block no longer matched:
-    encoded in place). With one used, `append_encode_us` is only the
-    remaining check and the encoding cost was paid by the preparing process.
-  * `connect/5` (whole: `connect_us`): `connect_lookup_us` (is the block
-    archived), the append above, `connect_overlay_us` (`Overlay.apply_block`;
-    the overlay's own `ov_*` counters split it) and `connect_chain_us`
-    (batch accounting and the selected-chain rows).
-  * `flush/2` after the KV write: `commit_overlay_us` (`Overlay.committed`:
-    `ov_mask_clear_us`, `ov_evict_us`) and `commit_prune_us`.
-  * resolution labelled by `labeled/2`: `inputs_*` and `bip30_*` (`view`:
-    speculative deltas, `overlay`, `given`, `lookup`, `output_groups`; the
-    first four add up to the unique outpoints).
+  Takes (and resets) this process's archive work counters.
   """
   def take_stats do
     seg = Segments.take_stats()
@@ -1150,6 +680,9 @@ defmodule Exnode.Archive do
     |> Map.merge(plain)
   end
 
+  @doc false
+  def bump_stat(key, n), do: count(key, n)
+
   defp count(key, n),
     do: Process.put({__MODULE__, key}, (Process.get({__MODULE__, key}) || 0) + n)
 
@@ -1171,20 +704,20 @@ defmodule Exnode.Archive do
     entries =
       txids
       |> Enum.zip(read)
-      |> Map.new(fn {t, r} -> {t, newest_on_chain(a, r)} end)
+      |> Map.new(fn {t, r} -> {t, newest_on_chain_with_height(a, r)} end)
 
-    # outpoint -> {out_id, block_id, pos}
+    # outpoint -> {out_id, block_id, pos, height}
     candidates =
       for {t, v} = op <- outpoints,
-          {block_id, pos, base_out, nout, _} <- List.wrap(entries[t]),
+          {height, {block_id, pos, base_out, nout, _}} <- List.wrap(entries[t]),
           v >= 0 and v < nout,
           into: %{},
-          do: {op, {base_out + v, block_id, pos}}
+          do: {op, {base_out + v, block_id, pos, height}}
 
     spent = spent_many(a, candidates |> Map.values() |> Enum.map(&elem(&1, 0)))
 
     live =
-      for {op, {id, _, _} = c} <- candidates,
+      for {op, {id, _, _, _} = c} <- candidates,
           not MapSet.member?(spent, id),
           into: %{},
           do: {op, c}
@@ -1192,11 +725,9 @@ defmodule Exnode.Archive do
     outputs = read_outputs(a, live |> Map.values() |> Enum.map(&elem(&1, 0)))
 
     Map.new(outpoints, fn op ->
-      with {id, block_id, pos} <- live[op],
+      with {id, _block_id, pos, height} <- live[op],
            {value, spk} = Map.fetch!(outputs, id),
            false <- Script.unspendable?(spk) do
-        [{_, height}] = :ets.lookup(a.onchain, block_id)
-
         {op,
          {:ok,
           %{output_id: id, value: value, script_pubkey: spk, height: height, coinbase: pos == 0}}}
@@ -1206,46 +737,58 @@ defmodule Exnode.Archive do
     end)
   end
 
-  defp newest_on_chain(_a, :not_found), do: nil
+  @doc false
+  def newest_on_chain(_a, :not_found), do: nil
 
-  defp newest_on_chain(a, {:ok, bin}) do
-    bin
-    |> decode_txindex()
-    |> Enum.filter(fn {b, _, _, _, _} -> on_chain?(a, b) end)
-    |> Enum.max_by(fn {b, _, _, _, _} -> :ets.lookup_element(a.onchain, b, 2) end, fn -> nil end)
+  def newest_on_chain(a, {:ok, bin}) do
+    case newest_on_chain_with_height(a, {:ok, bin}) do
+      nil -> nil
+      {_h, e} -> e
+    end
+  end
+
+  defp newest_on_chain_with_height(_a, :not_found), do: nil
+
+  defp newest_on_chain_with_height(a, {:ok, bin}) do
+    on =
+      for {b, _, _, _, _} = e <- Codec.decode_txindex(bin),
+          {:ok, h} <- [chain_height(a, b)],
+          do: {h, e}
+
+    case on do
+      [] -> nil
+      _ -> Enum.max_by(on, &elem(&1, 0))
+    end
   end
 
   @doc "Output ids (of `ids`) that have a spend record in an on-chain block. Uses a single iterator."
   def spent_many(_a, []), do: MapSet.new()
 
   def spent_many(a, ids) do
-    it = KV.iterator(a.kv, :spends)
-
-    try do
+    KV.with_iterator(a.kv, :spends, fn it ->
       ids
       |> Enum.sort()
       |> Enum.uniq()
       |> Enum.reduce(MapSet.intersection(a.overwritten, MapSet.new(ids)), fn id, acc ->
-        if spent_scan(a, it, :rocksdb.iterator_move(it, {:seek, <<id::64>>}), id),
+        if spent_scan(a, it, KV.iter_move(it, :spends, {:seek, <<id::64>>}), id),
           do: MapSet.put(acc, id),
           else: acc
       end)
-    after
-      :rocksdb.iterator_close(it)
-    end
+    end)
   end
 
   defp spent_scan(a, it, {:ok, <<id::64, b::32>>, _}, id) do
-    on_chain?(a, b) or spent_scan(a, it, :rocksdb.iterator_move(it, :next), id)
+    on_chain?(a, b) or spent_scan(a, it, KV.iter_move(it, :spends, :next), id)
   end
 
   defp spent_scan(_a, _it, _, _id), do: false
 
   # Reads outputs grouped by their sparse-index base: one pread run per group,
   # the groups in physical order ({segment, offset} ascending) for locality.
-  defp read_outputs(_a, []), do: %{}
+  @doc false
+  def read_outputs(_a, []), do: %{}
 
-  defp read_outputs(a, ids) do
+  def read_outputs(a, ids) do
     groups = ids |> Enum.uniq() |> Enum.group_by(&div(&1, @sparse))
     bases = Map.keys(groups)
     count(:output_groups, length(bases))
@@ -1255,19 +798,26 @@ defmodule Exnode.Archive do
 
     located =
       bases
-      |> Enum.zip(KV.multi_get(a.kv, :locs, Enum.map(bases, &loc_key(:outputs, &1))))
-      |> Enum.map(fn {base, {:ok, <<seg::16, off::48>>}} -> {{seg, off}, base} end)
+      |> Enum.zip(KV.multi_get(a.kv, :locs, Enum.map(bases, &Codec.loc_key(:outputs, &1))))
+      |> Enum.map(fn {base, {:ok, bin}} -> {Codec.unpack_loc(bin), base} end)
       |> Enum.sort()
 
-    Enum.reduce(located, %{}, fn {{seg, off}, base}, acc ->
+    Enum.reduce(located, %{}, fn {loc, base}, acc ->
       gids = Map.fetch!(groups, base)
       lo = Enum.min(gids) - base * @sparse
       hi = Enum.max(gids) - base * @sparse
       # ~40 bytes per output record; start small, read_run grows the chunk if needed.
       chunk = max(1024, (hi + 1) * 64)
 
-      {_r, recs} =
-        Segments.read_run(a.readers.outputs, {seg, off}, lo, hi - lo + 1, &decode_output/1, chunk)
+      recs =
+        Segments.read_run(
+          a.readers.outputs,
+          loc,
+          lo,
+          hi - lo + 1,
+          &Codec.decode_output/1,
+          chunk
+        )
 
       recs_by_id =
         recs |> Enum.with_index(base * @sparse + lo) |> Map.new(fn {r, i} -> {i, r} end)
@@ -1283,15 +833,14 @@ defmodule Exnode.Archive do
         :missing
 
       {:ok, bin} ->
-        bin
-        |> decode_txindex()
-        |> Enum.filter(fn {b, _, _, _, _} -> on_chain?(a, b) end)
-        |> Enum.max_by(fn {b, _, _, _, _} -> :ets.lookup_element(a.onchain, b, 2) end, fn ->
-          nil
-        end)
-        |> case do
-          nil -> :missing
-          e -> {:ok, e}
+        on =
+          for {b, _, _, _, _} = e <- Codec.decode_txindex(bin),
+              {:ok, h} <- [chain_height(a, b)],
+              do: {h, e}
+
+        case on do
+          [] -> :missing
+          _ -> {:ok, on |> Enum.max_by(&elem(&1, 0)) |> elem(1)}
         end
     end
   end
@@ -1305,33 +854,29 @@ defmodule Exnode.Archive do
   end
 
   @doc "Reads output `id`: `{value, script_pubkey}`."
-  def read_output(a, id), do: read_record(a, :outputs, id, &decode_output/1)
-
-  def read_input(a, id), do: read_record(a, :inputs, id, &decode_input/1)
-  def read_witness(a, id), do: read_record(a, :witness, id, &decode_witness/1)
+  def read_output(a, id), do: read_record(a, :outputs, id, &Codec.decode_output/1)
 
   defp read_record(a, kind, id, decode) do
-    {:ok, <<seg::16, off::48>>} = KV.get(a.kv, :locs, loc_key(kind, div(id, @sparse)))
-    {_r, rec} = Segments.read_nth(a.readers[kind], {seg, off}, rem(id, @sparse), decode)
-    rec
+    {:ok, bin} = KV.get(a.kv, :locs, Codec.loc_key(kind, div(id, @sparse)))
+    Segments.read_nth(a.readers[kind], Codec.unpack_loc(bin), rem(id, @sparse), decode)
   end
 
-  defp read_records(a, kind, first, count, decode) do
+  @doc false
+  def read_records(a, kind, first, count, decode) do
     if count == 0 do
       []
     else
-      {:ok, <<seg::16, off::48>>} = KV.get(a.kv, :locs, loc_key(kind, div(first, @sparse)))
+      {:ok, bin} = KV.get(a.kv, :locs, Codec.loc_key(kind, div(first, @sparse)))
 
-      {_r, recs} =
-        Segments.read_run(a.readers[kind], {seg, off}, rem(first, @sparse), count, decode)
-
-      recs
+      Segments.read_run(
+        a.readers[kind],
+        Codec.unpack_loc(bin),
+        rem(first, @sparse),
+        count,
+        decode
+      )
     end
   end
-
-  defp loc_key(:outputs, n), do: <<0, n::64>>
-  defp loc_key(:inputs, n), do: <<1, n::64>>
-  defp loc_key(:witness, n), do: <<2, n::64>>
 
   # --- connect / disconnect ----------------------------------------------------
 
@@ -1339,23 +884,6 @@ defmodule Exnode.Archive do
   Connects `block` at the tip. `spent` lists, in block input order, the
   output id each non-coinbase input spends (from `resolve_many/2`, or an
   output of an earlier tx in the same block).
-
-  Options:
-  * `delta: %{created: %{op => coin}, spent: [op]}`: the block's effect on
-    the coin view (from `Validation.Connect`), applied to the overlay. Without
-    it the overlay is cleared (it would be stale).
-  * `commit: false`: keep the block in the in-memory batch; `flush/2`
-    commits it. Default `true` commits at once.
-  * `history: %{epoch, rows}` (`prefetch_block/4`): committed txindex rows
-    of the block's txids read at `epoch`. Used by a new block's append in
-    place of reading them again only while `epoch/1` is still `epoch` (no
-    commit or disconnect since: the committed rows are those rows) and for
-    txids the batch has no list for (the batch's is newer). Anything else
-    is read from the store as without it.
-  * `prepared:` a `prepare_append/7` result built from this block, `spent`
-    and `delta`: used for a new block when its ids are `next_ids/1` (else
-    ignored, the block is encoded here); its `:history`, if any, replaces
-    `history:`. The result is the same either way.
 
   New blocks are archived (segments, KV entries). Blocks archived before
   (disconnected by a reorg) only get their spend records and the tip
@@ -1575,12 +1103,12 @@ defmodule Exnode.Archive do
   # ever disconnects them (Core IsBIP30Repeat / DisconnectBlock).
   defp legacy_overwritten(a, rec) do
     if Exnode.Consensus.bip30_repeat?(rec.height, rec.hash) do
-      {:ok, block} = read_block_txs(a, a.tip.id)
+      {:ok, block} = Query.read_block_txs(a, a.tip.id)
       cb = hd(block.txs)
       {:ok, bin} = KV.get(a.kv, :txindex, cb.txid)
-      previous = decode_txindex(bin) |> Enum.reject(&(elem(&1, 0) == a.tip.id))
+      previous = Codec.decode_txindex(bin) |> Enum.reject(&(elem(&1, 0) == a.tip.id))
 
-      case newest_on_chain(a, {:ok, encode_txindex(previous)}) do
+      case newest_on_chain(a, {:ok, Codec.encode_txindex(previous)}) do
         nil ->
           []
 
@@ -1616,14 +1144,6 @@ defmodule Exnode.Archive do
   as `next_ids/1` will return just before it is connected) and, optionally,
   its connect `delta`: segment records and their layout, tx metadata, the
   block's own txindex occurrences, its spend records and its overlay rows.
-  Pure (no archive state), so a process other than the owner may build it
-  while the owner works on something else; `connect/5` takes it as
-  `:prepared` and uses it only if the ids still match (otherwise the block
-  is encoded again in place), so it never changes what is archived.
-
-  `reader` (`reader/1`) with `history` (see `connect/5`): when `history` is
-  not of the reader's epoch, the block's committed txindex rows are read
-  anew, at the reader's epoch, and returned as `:history`.
   """
   def prepare_append(
         %Block{} = block,
@@ -1676,22 +1196,9 @@ defmodule Exnode.Archive do
          spent,
          %{block: id, out: base_out, inp: base_in} = ids
        ) do
-    out_recs =
-      for tx <- block.txs,
-          o <- tx.outputs,
-          do: [<<o.value::little-signed-64>>, CompactSize.encode_bytes(o.script_pubkey)]
-
-    in_recs =
-      for tx <- block.txs,
-          i <- tx.inputs,
-          do: [
-            i.prev_hash,
-            <<i.prev_index::little-32>>,
-            CompactSize.encode_bytes(i.script_sig),
-            <<i.sequence::little-32>>
-          ]
-
-    wit_recs = for tx <- block.txs, i <- tx.inputs, do: Tx.encode_witness(i.witness)
+    out_recs = for tx <- block.txs, o <- tx.outputs, do: Codec.encode_output(o)
+    in_recs = for tx <- block.txs, i <- tx.inputs, do: Codec.encode_input(i)
+    wit_recs = for tx <- block.txs, i <- tx.inputs, do: Codec.encode_witness(i.witness)
 
     {tx_meta, {_, _}} =
       Enum.map_reduce(block.txs, {base_out, base_in}, fn tx, {o, i} ->
@@ -1786,7 +1293,7 @@ defmodule Exnode.Archive do
                into: <<>>,
                do:
                  (
-                   v = encode_txindex(list)
+                   v = Codec.encode_txindex(list)
                    <<txid::binary-size(32), byte_size(v)::32, v::binary>>
                  ) do
         <<>> -> []
@@ -1829,18 +1336,11 @@ defmodule Exnode.Archive do
   end
 
   # One location every @sparse ids (ids that are multiples of @sparse).
-  defp sparse_ops(kind, sparse),
-    do:
-      for(
-        {id, {seg, off}} <- sparse,
-        do: {:put, :locs, loc_key(kind, div(id, @sparse)), <<seg::16, off::48>>}
-      )
+  defp sparse_ops(kind, sparse) do
+    for {id, loc} <- sparse,
+        do: {:put, :locs, Codec.loc_key(kind, div(id, @sparse)), Codec.pack_loc(loc)}
+  end
 
-  # New txindex lists (`txid => [entry]`) for the block's txs. Existing lists
-  # come from the batch first, then the exact committed rows of `history`
-  # (see connect/5) when its epoch is current, then one multi_get. The
-  # block's own occurrences are collected in one pass (a txid twice in the
-  # block keeps both, in order) and appended to the existing list.
   # The block's own occurrences, `txid => [entry]` newest first (a txid
   # twice in the block keeps both).
   defp own_txindex(id, block, base_out, base_in) do
@@ -1895,7 +1395,7 @@ defmodule Exnode.Archive do
 
           _ ->
             case Map.fetch!(rows, t) do
-              {:ok, bin} -> decode_txindex(bin)
+              {:ok, bin} -> Codec.decode_txindex(bin)
               :not_found -> []
             end
         end
@@ -1904,21 +1404,6 @@ defmodule Exnode.Archive do
     end)
   end
 
-  # txindex value: one 22-byte entry per occurrence of the txid,
-  # <<block_id::32, pos::24, nout::24, base_out::48, base_in::48>>. Archives
-  # in the first format stored an Erlang term, which starts with byte 131; a binary entry
-  # starts with the block id's top byte, which is 131 only from block id
-  # 131 * 2^24 (2.2 billion), so both formats are read.
-  @doc false
-  def encode_txindex(list),
-    do: for({b, pos, o, n, i} <- list, into: <<>>, do: <<b::32, pos::24, n::24, o::48, i::48>>)
-
-  @doc false
-  def decode_txindex(<<131, _::binary>> = bin), do: :erlang.binary_to_term(bin)
-
-  def decode_txindex(bin),
-    do: for(<<b::32, pos::24, n::24, o::48, i::48 <- bin>>, do: {b, pos, o, n, i})
-
   # spent: output ids for each non-coinbase input, in block order. Input ids
   # count every input (the coinbase's too). One walk over the inputs; a
   # `spent` list longer or shorter than the non-coinbase inputs raises.
@@ -1926,9 +1411,7 @@ defmodule Exnode.Archive do
   defp spend_count([{:put_packed, :spends, 12, 8, bin}]), do: div(byte_size(bin), 20)
 
   # The block's spend records as one packed put (KV.write/3): in input order,
-  # key <<out::64, block::32>>, value <<input::64>>. One binary, built by
-  # appending, stays in the batch until the commit instead of a tuple and two
-  # small binaries per input.
+  # key <<out::64, block::32>>, value <<input::64>>.
   defp spend_ops(block_id, base_in, %Block{txs: [cb | txs]}, spent) do
     case spend_txs(txs, base_in + length(cb.inputs), spent, block_id, <<>>) do
       {<<>>, []} -> []
@@ -1981,12 +1464,6 @@ defmodule Exnode.Archive do
 
   # --- witness pruning ---------------------------------------------------------
 
-  # Core keeps MIN_BLOCKS_TO_KEEP (288) blocks when pruning; peers may ask a
-  # NODE_NETWORK_LIMITED node for the last 288 (NODE_NETWORK_LIMITED_MIN_BLOCKS).
-  # Deletes, oldest first, every witness segment (never the one being
-  # written) whose highest block is more than `prune_keep` below the tip. The
-  # prune is recorded before the files go, so a crash cannot leave a block
-  # that claims witness data the disk no longer has.
   defp prune_witness(%{prune_keep: nil} = a), do: a
 
   defp prune_witness(a) do
@@ -2020,9 +1497,7 @@ defmodule Exnode.Archive do
   @doc """
   Whether block `hash` is archived with what connecting it needs (Core
   BLOCK_HAVE_DATA): on the active chain (already connected), or off it with
-  its witness data kept. A block a reorg disconnected below the pruning
-  horizon has lost its witnesses: it cannot be validated again from the
-  archive and must be downloaded again before it is reconnected.
+  its witness data kept.
   """
   def have_block_data?(%__MODULE__{} = a, hash) do
     case block_id(a, hash) do
@@ -2035,166 +1510,14 @@ defmodule Exnode.Archive do
   def witness_pruned?(%__MODULE__{} = a, id), do: rec_pruned?(a, block_record!(a, id))
 
   # A block record without `:wseg` has no witness segment to lose.
-  defp rec_pruned?(a, rec) do
+  @doc false
+  def rec_pruned?(a, rec) do
     case rec do
       %{wseg: s} -> s <= witness_pruned(a)
       _ -> false
     end
   end
 
-  # Runs a witness read; if it fails because the segment was pruned
-  # meanwhile (the prune point is raised before the files go), `pruned`
-  # instead. Any other failure is raised: a missing file that was not
-  # pruned is data loss, not a race.
-  defp if_not_pruned(a, rec, read, pruned) do
-    read.()
-  rescue
-    e -> if rec_pruned?(a, rec), do: pruned, else: reraise(e, __STACKTRACE__)
-  end
-
-  # --- reconstruction ----------------------------------------------------------
-
-  @doc """
-  Reconstructs the block's exact serialized bytes from the archive, and checks
-  them against the stored merkle root and witness commitment before returning.
-  """
-  def read_block(%__MODULE__{} = a, id) do
-    committed!(a, id)
-
-    case read_checked(a, id, block_record!(a, id)) do
-      {:ok, raw, _block} -> raw
-      err -> err
-    end
-  end
-
-  # `{:ok, raw, %Block{}}`: the reconstructed bytes and their decoded, checked
-  # block (one decode; `read_block_txs/3` reuses it), or `{:error, :witness_pruned}`.
-  defp read_checked(%__MODULE__{} = a, id, rec) do
-    committed!(a, id)
-
-    if rec_pruned?(a, rec),
-      do: {:error, :witness_pruned},
-      else: if_not_pruned(a, rec, fn -> reconstruct(a, rec) end, {:error, :witness_pruned})
-  end
-
-  defp committed!(%__MODULE__{batch: %{blocks: pending}}, id),
-    do:
-      if(is_map_key(pending, id), do: raise("read_block of uncommitted block #{id}; flush first"))
-
-  defp reconstruct(a, rec) do
-    {header, ""} = Header.decode(rec.header)
-    n_in = Enum.reduce(rec.txs, 0, fn {_, _, ni, _, _}, acc -> acc + ni end)
-    n_out = Enum.reduce(rec.txs, 0, fn {_, _, _, no, _}, acc -> acc + no end)
-    ins = read_records(a, :inputs, rec.base_in, n_in, &decode_input/1)
-
-    wits =
-      case rec do
-        %{wloc: loc} ->
-          elem(Segments.read_run(a.readers.witness, loc, 0, n_in, &decode_witness/1), 1)
-
-        _ ->
-          read_records(a, :witness, rec.base_in, n_in, &decode_witness/1)
-      end
-
-    outs = read_records(a, :outputs, rec.base_out, n_out, &decode_output/1)
-
-    {txs, {[], [], []}} =
-      Enum.map_reduce(rec.txs, {ins, wits, outs}, fn {ver, lt, ni, no, _hw}, {ins, wits, outs} ->
-        {tin, ins} = Enum.split(ins, ni)
-        {twit, wits} = Enum.split(wits, ni)
-        {tout, outs} = Enum.split(outs, no)
-
-        inputs =
-          for {{ph, pi, ss, seq}, w} <- Enum.zip(tin, twit),
-              do: %Tx.In{prev_hash: ph, prev_index: pi, script_sig: ss, sequence: seq, witness: w}
-
-        outputs = for {v, spk} <- tout, do: %Tx.Out{value: v, script_pubkey: spk}
-        {%Tx{version: ver, inputs: inputs, outputs: outputs, locktime: lt}, {ins, wits, outs}}
-      end)
-
-    raw = IO.iodata_to_binary(Block.encode(%Block{header: header, txs: txs}))
-    {:ok, block} = Block.decode_exact(raw)
-    :ok = BlockRules.check_merkle_root(block)
-
-    # Core ContextualCheckBlock: a commitment is expected once segwit is
-    # active, whatever the coinbase looks like. A pre-segwit block may carry
-    # a commitment-shaped output without a coinbase witness.
-    :ok = BlockRules.check_witness_malleation(block, rec.height >= a.segwit_height)
-
-    {:ok, raw, block}
-  end
-
-  # --- record codecs (return :more on truncation) -------------------------------
-
-  def decode_output(<<v::little-signed-64, rest::binary>>),
-    do: guard(fn -> cs_bytes(rest, &{v, &1}) end)
-
-  def decode_output(_), do: :more
-
-  def decode_input(<<ph::binary-size(32), pi::little-32, rest::binary>>) do
-    guard(fn ->
-      {ss, rest} = CompactSize.decode_bytes(rest)
-
-      case rest do
-        <<seq::little-32, r::binary>> -> {{ph, pi, ss, seq}, r}
-        _ -> :more
-      end
-    end)
-  end
-
-  def decode_input(_), do: :more
-
-  # The record with its exact bytes (the wire encoding, used for the
-  # stripped txid by read_index_facts/3): {prev_hash, prev_index, raw} and
-  # {value, script_pubkey, raw}. Same strict decoding as above.
-  defp decode_input_raw(bin) do
-    case decode_input(bin) do
-      {{ph, pi, _ss, _seq}, rest} ->
-        {{ph, pi, binary_part(bin, 0, byte_size(bin) - byte_size(rest))}, rest}
-
-      :more ->
-        :more
-    end
-  end
-
-  defp decode_output_raw(bin) do
-    case decode_output(bin) do
-      {{v, spk}, rest} -> {{v, spk, binary_part(bin, 0, byte_size(bin) - byte_size(rest))}, rest}
-      :more -> :more
-    end
-  end
-
-  def decode_witness(bin) do
-    guard(fn ->
-      {n, rest} = CompactSize.decode(bin)
-      take_items(n, rest, [])
-    end)
-  end
-
-  defp take_items(0, rest, acc), do: {Enum.reverse(acc), rest}
-
-  defp take_items(n, bin, acc) do
-    {item, rest} = CompactSize.decode_bytes(bin)
-    take_items(n - 1, rest, [item | acc])
-  end
-
-  defp cs_bytes(bin, f) do
-    {b, rest} = CompactSize.decode_bytes(bin)
-    {f.(b), rest}
-  end
-
-  # Only truncation means "read more": a corrupt length (non-canonical or
-  # above MAX_SIZE) raises at once instead of growing the read to the
-  # segment's end.
-  defp guard(f) do
-    f.()
-  catch
-    {:codec_error, :truncated} -> :more
-    {:codec_error, reason} -> raise "corrupt archive record (#{reason})"
-  end
-
   @doc false
   def sparse, do: @sparse
-  @doc false
-  def mask48, do: (1 <<< 48) - 1
 end

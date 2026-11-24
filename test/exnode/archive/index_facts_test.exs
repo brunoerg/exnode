@@ -321,7 +321,7 @@ defmodule Exnode.Archive.IndexFactsTest do
     [f | _] = Path.wildcard(Path.join([d, "hot", "inputs", "*"])) |> Enum.reverse()
     File.write!(f, binary_part(File.read!(f), 0, File.stat!(f).size - 10))
 
-    assert_raise RuntimeError, ~r/truncated/, fn ->
+    assert_raise Exnode.StorageError, ~r/truncated/, fn ->
       Archive.read_index_facts(r, Archive.id_at(r, 1))
     end
 

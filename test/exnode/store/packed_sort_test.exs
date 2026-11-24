@@ -68,6 +68,9 @@ defmodule Exnode.Store.PackedSortTest do
     assert PackedSort.sort(<<>>, 2, 3) == <<>>
     assert PackedSort.sort(<<9, 9, "abc">>, 2, 3) == <<9, 9, "abc">>
     assert PackedSort.sort(<<9, 9, 0::32>>, 2, :var) == <<9, 9, 0::32>>
+    assert PackedSort.sort(<<>>, 2, 0) == <<>>
+    assert PackedSort.sort(<<3, 3, 1, 1, 2, 2>>, 2, 0) == <<1, 1, 2, 2, 3, 3>>
+    assert_raise ArgumentError, fn -> PackedSort.sort(<<1, 2, 3>>, 2, 0) end
 
     # Empty values between non-empty ones: every record keeps its whole length.
     bin = <<3, 0::32, 1, 2::32, "xy", 2, 0::32, 1, 0::32>>

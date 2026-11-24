@@ -31,6 +31,7 @@ defmodule Exnode.CLI do
     batch_mib: :integer,
     chain_state_heap_mib: :integer,
     decode_budget_mib: :integer,
+    max_connections: :integer,
     rpcport: :integer,
     rpcuser: :string,
     rpcpassword: :string,
@@ -53,12 +54,18 @@ defmodule Exnode.CLI do
       Enum.find(Exnode.ChainParams.networks(), &(Atom.to_string(&1) == name)) ||
         fail("unknown chain #{name}; expected one of #{inspect(Exnode.ChainParams.networks())}")
 
+    params = Exnode.ChainParams.get(chain)
     datadir = opts |> Keyword.get(:datadir, Path.expand("~/.exnode")) |> Path.expand()
 
     connect =
       for c <- Keyword.get_values(opts, :connect) do
-        [host, port] = String.split(c, ":")
-        {host, String.to_integer(port)}
+        case parse_connect(c, params.default_port) do
+          {:ok, target} ->
+            target
+
+          :error ->
+            fail("invalid --connect address #{inspect(c)}; expected host[:port] or [ipv6]:port")
+        end
       end
 
     node_opts =
@@ -110,7 +117,8 @@ defmodule Exnode.CLI do
         v2_transport: Keyword.get(opts, :v2transport, true)
       ] ++
         if(connect == [], do: [], else: [connect: connect]) ++
-        if(opts[:listen], do: [listen: opts[:listen]], else: [])
+        if(opts[:listen], do: [listen: opts[:listen]], else: []) ++
+        if(opts[:max_connections], do: [max_connections: opts[:max_connections]], else: [])
 
     # Under the application supervisor, so SIGTERM (init:stop) shuts the node
     # down in order and terminate callbacks run: Connman writes anchors.dat,
@@ -223,8 +231,10 @@ defmodule Exnode.CLI do
     IO.puts(line)
 
     if status_file do
+      tmp = status_file <> ".tmp"
+
       File.write!(
-        status_file,
+        tmp,
         Jason.encode!(%{
           height: best.height,
           hash: Hash.to_hex(best.hash),
@@ -238,6 +248,31 @@ defmodule Exnode.CLI do
           time: System.os_time(:second)
         })
       )
+
+      File.rename!(tmp, status_file)
+    end
+  end
+
+  defp parse_connect("[" <> rest, default_port) do
+    case String.split(rest, "]", parts: 2) do
+      [host, ""] when host != "" -> {:ok, {host, default_port}}
+      [host, ":" <> p] when host != "" -> parse_port(host, p)
+      _ -> :error
+    end
+  end
+
+  defp parse_connect(s, default_port) do
+    case String.split(s, ":") do
+      [host] when host != "" -> {:ok, {host, default_port}}
+      [host, p] when host != "" -> parse_port(host, p)
+      _ -> :error
+    end
+  end
+
+  defp parse_port(host, p) do
+    case Integer.parse(p) do
+      {port, ""} when port in 1..65_535 -> {:ok, {host, port}}
+      _ -> :error
     end
   end
 
@@ -253,47 +288,73 @@ defmodule Exnode.CLI do
         strict: [chain: :string, datadir: :string, all: :boolean, clear_halt: :boolean]
       )
 
-    chain = Keyword.get(opts, :chain, "mainnet")
+    name = Keyword.get(opts, :chain, "mainnet")
+
+    _chain =
+      Enum.find(Exnode.ChainParams.networks(), &(Atom.to_string(&1) == name)) ||
+        fail("unknown chain #{name}; expected one of #{inspect(Exnode.ChainParams.networks())}")
+
     datadir = opts |> Keyword.get(:datadir, "~/.exnode") |> Path.expand()
-    {:ok, kv} = KV.open(Path.join([datadir, chain, "index"]))
+    path = Path.join([datadir, name, "index"])
 
-    clear_halt? = Keyword.get(opts, :clear_halt, false)
-
-    case Exnode.Chain.State.halt_mark(kv) do
-      nil ->
-        IO.puts("block connection not halted")
-
-      m when clear_halt? ->
-        :ok = KV.write(kv, [{:delete, :meta, "halt"}], sync: true)
-        IO.puts("cleared halt: #{inspect(m.reason)} (height #{m.height})")
-
-      m ->
-        IO.puts(
-          "HALTED since #{m.time} at height #{m.height} (#{Hash.to_hex(m.hash)}): #{inspect(m.reason)} " <>
-            "(clear with --clear-halt)"
-        )
-    end
-
-    marks =
-      KV.fold_prefix(kv, :poisoned, <<>>, [], fn {k, v}, acc ->
-        [{k, :erlang.binary_to_term(v)} | acc]
-      end)
-
-    targets =
-      cond do
-        opts[:all] -> Enum.map(marks, &elem(&1, 0))
-        args != [] -> Enum.map(args, &Hash.from_hex/1)
-        true -> []
+    kv =
+      case KV.open(path, create_if_missing: false) do
+        {:ok, kv} -> kv
+        {:error, reason} -> fail("cannot open store at #{path}: #{inspect(reason)}")
       end
 
-    if targets == [] do
-      if marks == [] and not clear_halt?, do: IO.puts("no quarantined blocks")
+    try do
+      clear_halt? = Keyword.get(opts, :clear_halt, false)
 
-      for {h, m} <- marks,
-          do: IO.puts("#{Hash.to_hex(h)} height #{m.height} at #{m.time}: #{m.error}")
+      case Exnode.Chain.State.halt_mark(kv) do
+        nil ->
+          IO.puts("block connection not halted")
+
+        m when clear_halt? ->
+          :ok = KV.write(kv, [{:delete, :meta, "halt"}], sync: true)
+          IO.puts("cleared halt: #{inspect(m.reason)} (height #{m.height})")
+
+        m ->
+          IO.puts(
+            "HALTED since #{m.time} at height #{m.height} (#{Hash.to_hex(m.hash)}): #{inspect(m.reason)} " <>
+              "(clear with --clear-halt)"
+          )
+      end
+
+      marks =
+        KV.fold_prefix(kv, :poisoned, <<>>, [], fn {k, v}, acc ->
+          [{k, :erlang.binary_to_term(v)} | acc]
+        end)
+
+      targets =
+        cond do
+          opts[:all] -> Enum.map(marks, &elem(&1, 0))
+          args != [] -> Enum.map(args, &parse_hash_arg!/1)
+          true -> []
+        end
+
+      if targets == [] do
+        if marks == [] and not clear_halt?, do: IO.puts("no quarantined blocks")
+
+        for {h, m} <- marks,
+            do: IO.puts("#{Hash.to_hex(h)} height #{m.height} at #{m.time}: #{m.error}")
+      else
+        :ok = KV.write(kv, for(h <- targets, do: {:delete, :poisoned, h}), sync: true)
+        for h <- targets, do: IO.puts("cleared #{Hash.to_hex(h)}")
+      end
+    after
+      KV.close(kv)
+    end
+  end
+
+  defp parse_hash_arg!(hex) do
+    if is_binary(hex) and byte_size(hex) == 64 do
+      case Base.decode16(hex, case: :mixed) do
+        {:ok, _} -> Hash.from_hex(hex)
+        :error -> fail("invalid block hash #{inspect(hex)}")
+      end
     else
-      :ok = KV.write(kv, for(h <- targets, do: {:delete, :poisoned, h}), sync: true)
-      for h <- targets, do: IO.puts("cleared #{Hash.to_hex(h)}")
+      fail("invalid block hash #{inspect(hex)}")
     end
   end
 end
