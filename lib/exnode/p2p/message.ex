@@ -113,7 +113,18 @@ defmodule Exnode.P2P.Message do
 
   defp do_decode(cmd, <<version::little-32, rest::binary>>)
        when cmd in ["getheaders", "getblocks"] do
-    {locator, rest} = vector(rest, fn <<h::binary-size(32), r::binary>> -> {h, r} end)
+    {n, rest} = CompactSize.decode(rest)
+
+    if n > @max_locator_sz do
+      if byte_size(rest) < n * 32 + 32, do: throw({:codec_error, :truncated})
+      throw({:codec_error, {:locator_too_large, n}})
+    end
+
+    {locator, rest} =
+      take_n(n, rest, fn
+        <<h::binary-size(32), r::binary>> -> {h, r}
+        _ -> throw({:codec_error, :truncated})
+      end)
 
     case rest do
       <<stop::binary-size(32), _::binary>> ->
@@ -220,11 +231,6 @@ defmodule Exnode.P2P.Message do
       <<s::binary-size(len), r::binary>> -> {s, r}
       _ -> throw({:codec_error, :truncated})
     end
-  end
-
-  defp vector(bin, f) do
-    {n, rest} = CompactSize.decode(bin)
-    take_n(n, rest, f)
   end
 
   defp take_n(n, bin, f), do: take_n(n, bin, f, [])
