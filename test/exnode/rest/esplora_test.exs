@@ -30,31 +30,41 @@ defmodule Exnode.REST.EsploraTest do
 
   defp start(dir, mp_opts \\ []) do
     {:ok, kv} = KV.open(Path.join(dir, "kv"))
-    {:ok, hs} = Headers.start_link(params: @p, kv: kv)
     u = System.unique_integer([:positive])
     {cs_name, mp_name, idx_name} = {:"cs_#{u}", :"mp_#{u}", :"sh_#{u}"}
 
-    {:ok, _} =
-      State.start_link(
-        name: cs_name,
-        params: @p,
-        headers: hs,
-        kv: kv,
-        hot: Path.join(dir, "hot"),
-        mempool: mp_name
-      )
+    start_supervised!(
+      {Exnode.Store.KVOwner, {kv, [{State, cs_name}, {Scripthash, idx_name}]}},
+      id: :"kvo_#{u}"
+    )
+
+    hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_#{u}")
+
+    start_supervised!(
+      {State,
+       name: cs_name,
+       params: @p,
+       headers: hs,
+       kv: kv,
+       hot: Path.join(dir, "hot"),
+       mempool: mp_name},
+      id: cs_name
+    )
 
     {bs, cbs} = SpendChain.build(@p.genesis.header, 130)
     for b <- bs, do: {:ok, :connected} = State.submit_block(cs_name, b)
     State.commit_now(cs_name)
 
-    {:ok, _} =
-      Mempool.start_link(
-        [name: mp_name, chain_state: cs_name, headers: hs, params: @p, index_scripts: true] ++
-          mp_opts
-      )
+    start_supervised!(
+      {Mempool,
+       [name: mp_name, chain_state: cs_name, headers: hs, params: @p, index_scripts: true] ++
+         mp_opts},
+      id: mp_name
+    )
 
-    {:ok, idx} = Scripthash.start_link(name: idx_name, kv: kv, chain_state: cs_name)
+    idx =
+      start_supervised!({Scripthash, name: idx_name, kv: kv, chain_state: cs_name}, id: idx_name)
+
     :ok = Scripthash.sync_to(idx_name, List.last(bs).header.hash)
 
     ctx = %{

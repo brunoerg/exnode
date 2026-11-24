@@ -13,27 +13,33 @@ defmodule Exnode.Store.KVOwner do
 
   alias Exnode.Store.KV
 
-  def start_link(%KV{} = kv), do: GenServer.start_link(__MODULE__, kv)
+  def start_link(%KV{} = kv), do: GenServer.start_link(__MODULE__, {kv, []})
 
-  def child_spec(kv),
-    do: %{id: __MODULE__, start: {__MODULE__, :start_link, [kv]}, shutdown: 60_000}
+  def start_link({%KV{} = kv, terms}) when is_list(terms),
+    do: GenServer.start_link(__MODULE__, {kv, terms})
+
+  def child_spec(arg),
+    do: %{id: __MODULE__, start: {__MODULE__, :start_link, [arg]}, shutdown: 60_000}
 
   @impl true
-  def init(kv) do
+  def init({kv, terms}) do
     Process.flag(:trap_exit, true)
-    {:ok, kv}
+    {:ok, {kv, terms}}
   end
 
   @impl true
-  def handle_info({:EXIT, _, _}, kv), do: {:noreply, kv}
+  def handle_info({:EXIT, _, _}, st), do: {:noreply, st}
 
   # On every stop. The owner does no work of its own, so it only stops
   # when the node does: on shutdown, or when the root is killed (the exit
-  # reaches this trapping process as `:killed`). It used to close only on
-  # shutdown, and after an abnormal stop the handles kept in persistent_term
-  # by the indexes pinned the database and its LOCK for the life of the VM:
-  # a node restarted on the same datadir could not open it. erlang-rocksdb only flags the close; the database
-  # is closed once NIF calls in progress have released their references.
+  # reaches this trapping process as `:killed`). Erases the node's
+  # `:persistent_term` entries first so neither closed KV handles nor dead
+  # ETS table ids stay rooted across runs. erlang-rocksdb only flags the
+  # close; the database is closed once NIF calls in progress have released
+  # their references.
   @impl true
-  def terminate(_reason, kv), do: KV.close(kv)
+  def terminate(_reason, {kv, terms}) do
+    for k <- terms, do: :persistent_term.erase(k)
+    KV.close(kv)
+  end
 end

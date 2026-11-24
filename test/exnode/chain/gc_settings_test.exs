@@ -59,4 +59,35 @@ defmodule Exnode.Chain.GcSettingsTest do
     GenServer.stop(hs)
     KV.close(kv)
   end
+
+  test "GcProbe starts cleanly and never clobbers an existing VM system_monitor" do
+    prev = :erlang.system_monitor()
+
+    try do
+      holder = spawn_link(fn -> receive do: (:stop -> :ok) end)
+      :erlang.system_monitor(holder, [{:long_schedule, 1_000}])
+      assert {:erlang_monitor, {^holder, _}} = {:erlang_monitor, :erlang.system_monitor()}
+
+      target = spawn_link(fn -> receive do: (:stop -> :ok) end)
+      {probe_pid, _c} = probe = Exnode.Chain.GcProbe.start(target)
+      assert is_map(Exnode.Chain.GcProbe.take(probe))
+      # Existing monitor is untouched.
+      assert {^holder, _} = :erlang.system_monitor()
+
+      send(target, :stop)
+      send(holder, :stop)
+      Process.unlink(probe_pid)
+      Process.exit(probe_pid, :kill)
+    after
+      case prev do
+        :undefined ->
+          :erlang.system_monitor(:undefined)
+
+        {p, opts} ->
+          if Process.alive?(p),
+            do: :erlang.system_monitor(p, opts),
+            else: :erlang.system_monitor(:undefined)
+      end
+    end
+  end
 end

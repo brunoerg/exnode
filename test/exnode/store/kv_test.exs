@@ -83,7 +83,25 @@ defmodule Exnode.Store.KVTest do
              catch_error(KV.multi_get(kv, :pending, ["inline", "k"]))
 
     assert KV.multi_get(kv, :pending, ["inline", "none"]) == [{:ok, "v"}, :not_found]
+
+    # Non-:invalid_iterator errors from iterator_move raise KV.Error instead of
+    # silently terminating the scan as :end.
+    assert %KV.Error{op: :iterator_move, cf: :pending, reason: :einval} =
+             catch_error(
+               KV.with_iterator(kv, :pending, fn it ->
+                 KV.iter_move(it, :pending, {:seek, :not_a_binary})
+               end)
+             )
+
     KV.close(kv)
+  end
+
+  test "open with create_if_missing: false refuses a missing path without creating it", %{
+    tmp_dir: dir
+  } do
+    missing = Path.join(dir, "does_not_exist")
+    assert {:error, :enoent} = KV.open(missing, create_if_missing: false)
+    refute File.exists?(missing)
   end
 end
 

@@ -24,6 +24,12 @@ defmodule Exnode.Store.PackedSort do
   end
 
   @doc "`bin`'s records ordered by key (stable). Raises on a cut-short record."
+  def sort(bin, key_size, 0)
+      when is_binary(bin) and is_integer(key_size) and key_size > 0 do
+    if rem(byte_size(bin), key_size) != 0, do: raise(ArgumentError, "truncated packed keys")
+    if byte_size(bin) < 2 * key_size, do: bin, else: sort_keys(bin, key_size, [])
+  end
+
   def sort(bin, key_size, value_size)
       when is_binary(bin) and is_integer(key_size) and key_size > 0 do
     vs =
@@ -33,6 +39,14 @@ defmodule Exnode.Store.PackedSort do
       end
 
     sort_nif(bin, key_size, vs)
+  end
+
+  defp sort_keys(<<>>, _ks, acc),
+    do: acc |> Enum.reverse() |> Enum.sort() |> IO.iodata_to_binary()
+
+  defp sort_keys(bin, ks, acc) do
+    <<k::binary-size(ks), rest::binary>> = bin
+    sort_keys(rest, ks, [k | acc])
   end
 
   defp sort_nif(_bin, _ks, _vs), do: :erlang.nif_error(:nif_not_loaded)

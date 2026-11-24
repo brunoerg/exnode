@@ -47,8 +47,8 @@ defmodule Exnode.Archive.Overlay do
 
   # The budget counts real memory, as Core's -dbcache counts its cache's
   # dynamic usage: the native tables report their slots and each entry's
-  # allocation (`malloc_usable_size`), and the generation queue is charged
-  # its packed bytes plus about 64 bytes per block for the binary and the
+  # aligned allocation footprint, and the generation queue is charged its
+  # packed bytes plus about 64 bytes per block for the binary and the
   # queue element.
   @gen_bytes 64
 

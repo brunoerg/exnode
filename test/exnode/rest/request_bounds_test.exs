@@ -23,34 +23,31 @@ defmodule Exnode.REST.RequestBoundsTest do
 
   defp start(dir) do
     {:ok, kv} = KV.open(Path.join(dir, "kv"))
-    {:ok, hs} = Headers.start_link(params: @p, kv: kv)
     u = System.unique_integer([:positive])
     {cs, mp, idx} = {:"cs_#{u}", :"mp_#{u}", :"sh_#{u}"}
 
-    {:ok, _} =
-      State.start_link(
-        name: cs,
-        params: @p,
-        headers: hs,
-        kv: kv,
-        hot: Path.join(dir, "hot"),
-        mempool: mp
-      )
+    start_supervised!(
+      {Exnode.Store.KVOwner, {kv, [{State, cs}, {Scripthash, idx}]}},
+      id: :"kvo_#{u}"
+    )
+
+    hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_#{u}")
+
+    start_supervised!(
+      {State, name: cs, params: @p, headers: hs, kv: kv, hot: Path.join(dir, "hot"), mempool: mp},
+      id: cs
+    )
 
     {bs, _} = SpendChain.build(@p.genesis.header, 130)
     for b <- bs, do: {:ok, :connected} = State.submit_block(cs, b)
     State.commit_now(cs)
 
-    {:ok, _} =
-      Mempool.start_link(
-        name: mp,
-        chain_state: cs,
-        headers: hs,
-        params: @p,
-        index_scripts: true
-      )
+    start_supervised!(
+      {Mempool, name: mp, chain_state: cs, headers: hs, params: @p, index_scripts: true},
+      id: mp
+    )
 
-    {:ok, _} = Scripthash.start_link(name: idx, kv: kv, chain_state: cs)
+    start_supervised!({Scripthash, name: idx, kv: kv, chain_state: cs}, id: idx)
     :ok = Scripthash.sync_to(idx, List.last(bs).header.hash)
 
     %{
