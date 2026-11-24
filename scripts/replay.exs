@@ -14,8 +14,7 @@
 # replays only the first N blocks; REPLAY_PROFILE=1 runs :eprof on the chain
 # state (slow: for proportions, not timings) and prints its top functions.
 # REPLAY_MIN_HEAP sets the chain state's min heap (words; "0" = none; default:
-# the node's default when the tree has one). REPLAY_PREP_MODE=reference|engine|worker
-# selects the non-script preparation path. REPLAY_GC_TRACE=1 sums the chain
+# the node's default when the tree has one). REPLAY_GC_TRACE=1 sums the chain
 # state's GC pauses; REPLAY_LIVE_SAMPLE=<ms> samples its live data by part
 # (both diagnostic only). Always reported, after the measured interval: the
 # chain state's heap and the node's memory just after the final commit and
@@ -191,8 +190,7 @@ av_opt =
     pipeline_depth: env_int.("REPLAY_PIPELINE_DEPTH"),
     script_workers: env_int.("REPLAY_SCRIPT_WORKERS"),
     min_heap_size: min_heap,
-    min_bin_vheap_size: min_bin_vheap,
-    prep_mode: (m = System.get_env("REPLAY_PREP_MODE")) && String.to_atom(m)
+    min_bin_vheap_size: min_bin_vheap
   ]
   |> Enum.reject(&is_nil(elem(&1, 1)))
 
@@ -839,7 +837,6 @@ IO.puts(
     %{
       label: label,
       assume_valid: System.get_env("REPLAY_ASSUMEVALID", "default"),
-      prep_mode: System.get_env("REPLAY_PREP_MODE", "default"),
       dataset: %{chain: manifest["chain"], kind: dataset_kind, first_height: first_height, last_height: last_height,
                  seed: seed && %{height: seed["height"], digest: binary_part(seed["digest"], 0, 16)}},
       setup_ms: setup,
