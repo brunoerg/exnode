@@ -176,8 +176,9 @@ defmodule Exnode.Validation.ScriptExecTest do
     assert_receive :submitted
     [{{:o, 1}, p}] = started(1)
     Process.exit(owner, :kill)
-    # Wait until the executor has processed the DOWN (a call after it).
-    _ = ScriptExec.stats(ex)
+    # The kill and the executor's DOWN are asynchronous to this process: a call
+    # alone can be served before the DOWN arrives, so wait for the cancel itself.
+    Exnode.Test.Wait.wait_until(fn -> ScriptExec.stats(ex).cancelled_queued == 1 end)
     send(p, {:release, {:o, 1}})
     refute_receive {:started, _, _}, 200
     assert ScriptExec.stats(ex).cancelled_queued == 1
