@@ -54,6 +54,7 @@ defmodule Exnode.Node do
     * `:index_scripthash`: build the scripthash history index (Electrum style)
     * `:rest_port`: serve the Esplora REST API on this port (needs `:index_scripthash` for addresses)
     * `:cache_bytes`: coin cache budget (default 450 MiB, Core `DEFAULT_KERNEL_CACHE`)
+    * `:kv_cache_bytes`: RocksDB shared block cache budget (default 256 MiB)
     * `:chain_state_min_heap`: the chain state's minimum heap in words
       (default `Exnode.Chain.State.default_min_heap_size/0`, 384 MiB)
     * `:chain_state_min_bin_vheap`: the chain state's minimum binary virtual
@@ -265,7 +266,8 @@ defmodule Exnode.Node do
 
     {:ok, kv} =
       KV.open(Path.join([datadir, Atom.to_string(chain), "index"]),
-        max_open_files: budget.table_files
+        max_open_files: budget.table_files,
+        block_cache_bytes: Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
       )
 
     clock = Keyword.get_lazy(opts, :clock, &Exnode.Clock.new/0)

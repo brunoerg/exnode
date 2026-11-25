@@ -20,7 +20,8 @@ defmodule Mix.Tasks.Exnode.Node do
   Storage options: `--datadir-cold <dir>` (inputs and witness segments, which
   are rarely read), `--prune-witness` (keep witness data for the last 288
   blocks only), `--dbcache <MiB>` (coin cache budget, default 450 as Core's
-  `DEFAULT_KERNEL_CACHE`), `--batch-blocks <n>` / `--batch-mib <MiB>` (commit
+  `DEFAULT_KERNEL_CACHE`), `--kv-cache-mib <MiB>` (RocksDB block cache budget,
+  default 256), `--batch-blocks <n>` / `--batch-mib <MiB>` (commit
   batch limits, default 128 blocks / 64 MiB; larger values cut sync overhead
   during IBD at the cost of memory and crash replay), `--chain-state-heap-mib
   <MiB>` (the chain state's minimum heap, default 384; during IBD its live

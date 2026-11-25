@@ -103,6 +103,45 @@ defmodule Exnode.Store.KVTest do
     assert {:error, :enoent} = KV.open(missing, create_if_missing: false)
     refute File.exists?(missing)
   end
+
+  test "empty write, large multi-byte varint values, merges, and zero-length packed values", %{
+    tmp_dir: dir
+  } do
+    {:ok, kv} = KV.open(dir)
+    assert KV.write(kv, []) == :ok
+
+    big_key = :crypto.strong_rand_bytes(200)
+    big_val = :crypto.strong_rand_bytes(300)
+
+    :ok =
+      KV.write(
+        kv,
+        [
+          {:put, :blocks, big_key, big_val},
+          {:put, :scripthash, "s1", :erlang.term_to_binary(100)},
+          {:merge, :scripthash, "s1", :erlang.term_to_binary({:int_add, 55})},
+          {:put_packed, :spends, 2, 0, <<3, 3, 1, 1, 2, 2>>},
+          {:put_packed, :txindex, 4, :var, <<9::32, byte_size(big_val)::32, big_val::binary>>}
+        ],
+        sort_packed: true,
+        stats: true
+      )
+
+    stats = KV.take_stats()
+    assert stats.kv_ops == 7
+    assert KV.get(kv, :blocks, big_key) == {:ok, big_val}
+    assert {:ok, s1} = KV.get(kv, :scripthash, "s1")
+    assert :erlang.binary_to_term(s1) == 155
+
+    assert KV.multi_get(kv, :spends, [<<1, 1>>, <<2, 2>>, <<3, 3>>]) == [
+             {:ok, <<>>},
+             {:ok, <<>>},
+             {:ok, <<>>}
+           ]
+
+    assert KV.get(kv, :txindex, <<9::32>>) == {:ok, big_val}
+    KV.close(kv)
+  end
 end
 
 defmodule Exnode.Store.KVPackedTest do

@@ -100,10 +100,10 @@ defmodule Exnode.Store.PackedSortTest do
     end
 
     ops = [
-      {:put_packed, :spends, 12, 8, spends.(1)},
+      {:put_packed, :spends, 8, 12, spends.(1)},
       {:put_packed, :txindex, 32, :var, tx.(1)},
       {:put, :blocks, <<1::32>>, "b1"},
-      {:put_packed, :spends, 12, 8, spends.(2)},
+      {:put_packed, :spends, 8, 12, spends.(2)},
       {:put_packed, :txindex, 32, :var, tx.(2)},
       # A family with another op is written as given.
       {:put_packed, :locs, 4, 2, <<1::32, "aa", 1::32, "bb">>},
@@ -124,5 +124,31 @@ defmodule Exnode.Store.PackedSortTest do
     assert {:ok, "cc"} = KV.get(b, :locs, <<1::32>>)
     KV.close(a)
     KV.close(b)
+  end
+
+  test "encode_write_batch: multi-segment lists, cf_id 0 vs non-zero, and truncated inputs" do
+    assert {:ok, <<>>, 0, 0} = PackedSort.encode_write_batch(3, 8, 12, [], true)
+    assert {:ok, <<>>, 0, 0} = PackedSort.encode_write_batch(0, 8, :var, <<>>, false)
+
+    seg1 = <<2::16, "bb", 1::16, "a1">>
+    seg2 = <<1::16, "a2", 0::16, "00">>
+
+    assert {:ok, wb_cf0, 4, 16} = PackedSort.encode_write_batch(0, 2, 2, [seg1, seg2], true)
+    # cf_id == 0 uses kTypeValue (0x01) + varint(2) + key + varint(2) + val = 7 bytes/rec
+    assert wb_cf0 ==
+             <<0x01, 2, 0::16, 2, "00">> <>
+               <<0x01, 2, 1::16, 2, "a1">> <>
+               <<0x01, 2, 1::16, 2, "a2">> <>
+               <<0x01, 2, 2::16, 2, "bb">>
+
+    assert {:ok, wb_cf5, 2, 8} = PackedSort.encode_write_batch(5, 2, 2, seg1, false)
+    assert wb_cf5 == <<0x05, 5, 2, 2::16, 2, "bb", 0x05, 5, 2, 1::16, 2, "a1">>
+
+    assert :truncated == PackedSort.encode_write_batch(1, 2, 3, <<1, 2, 3, 4>>, false)
+
+    assert :truncated ==
+             PackedSort.encode_write_batch(1, 2, :var, <<1, 2, 0, 0, 0, 5, "ab">>, true)
+
+    assert :truncated == PackedSort.encode_write_batch(1, 2, 0, <<1, 2, 3>>, true)
   end
 end

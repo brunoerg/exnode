@@ -178,7 +178,7 @@ defmodule Exnode.Archive.TxindexHistoryTest do
     a = Archive.connect(a, b1, 1, [11, 12, 13])
 
     rows =
-      KV.fold_prefix(kv, :spends, "", [], fn {<<o::64, b::32>>, <<i::64>>}, acc ->
+      KV.fold_prefix(kv, :spends, "", [], fn {<<o::64>>, <<b::32, i::64>>}, acc ->
         [{o, b, i} | acc]
       end)
 
