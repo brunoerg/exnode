@@ -283,6 +283,60 @@ defmodule Exnode.CLI do
     System.halt(1)
   end
 
+  @doc "`mix exnode.restore` and `bin/exnode-restore`."
+  def restore(argv) do
+    {opts, _args} =
+      OptionParser.parse!(argv,
+        strict: [
+          chain: :string,
+          datadir: :string,
+          datadir_cold: :string,
+          force_from_snapshot: :boolean,
+          force: :boolean
+        ]
+      )
+
+    name = Keyword.get(opts, :chain, "mainnet")
+
+    _chain =
+      Enum.find(Exnode.ChainParams.networks(), &(Atom.to_string(&1) == name)) ||
+        fail("unknown chain #{name}; expected one of #{inspect(Exnode.ChainParams.networks())}")
+
+    datadir = opts |> Keyword.get(:datadir, "~/.exnode") |> Path.expand()
+    chain_dir = Path.join(datadir, name)
+    hot = Path.join(chain_dir, "archive")
+
+    cold =
+      case opts[:datadir_cold] do
+        nil -> hot
+        dir -> Path.join([Path.expand(dir), name, "archive"])
+      end
+
+    if not File.dir?(chain_dir) do
+      fail("store directory does not exist: #{chain_dir}")
+    end
+
+    try do
+      case Exnode.Store.Snapshot.restore!(chain_dir,
+             hot: hot,
+             cold: cold,
+             force_from_snapshot: Keyword.get(opts, :force_from_snapshot, false),
+             force: Keyword.get(opts, :force, false)
+           ) do
+        {:ok, :already_clean} ->
+          IO.puts("store at #{chain_dir} closed cleanly; nothing to restore")
+
+        {:ok, %{slot: slot, tip: tip}} ->
+          IO.puts(
+            "restored #{name} store from #{slot} snapshot to height #{tip.height} (#{Hash.to_hex(tip.hash)})"
+          )
+      end
+    rescue
+      e in Exnode.StorageError ->
+        fail(Exception.message(e))
+    end
+  end
+
   @doc "`mix exnode.reconsider` and `bin/exnode-reconsider`."
   def reconsider(argv) do
     {opts, args} =
