@@ -568,6 +568,7 @@ defmodule Exnode.Node do
              name: n.tx_relay,
              mempool: n.mempool,
              mempool_policies: true,
+             async_mempool: true,
              peer_sup: n.peer_sup,
              clock: fn -> Exnode.Clock.now_ms(clock) end}
           ]),

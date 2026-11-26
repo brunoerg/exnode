@@ -301,10 +301,17 @@ defmodule Exnode.P2P.Connman do
     do: {:noreply, %{st | dns: :idle}}
 
   def handle_info({:DOWN, ref, :process, pid, reason}, st) do
-    if Map.get(st.monitors, pid) == ref do
-      handle_peer_down(st, pid, reason)
-    else
-      {:noreply, st}
+    case Map.get(st.monitors, pid) do
+      ^ref ->
+        handle_peer_down(st, pid, reason)
+
+      nil ->
+        if Map.has_key?(st.peers, pid),
+          do: handle_peer_down(st, pid, reason),
+          else: {:noreply, st}
+
+      _other_ref ->
+        {:noreply, st}
     end
   end
 
