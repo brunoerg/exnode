@@ -126,6 +126,7 @@ defmodule Exnode.Node do
       scripthash_index: Module.concat(prefix, ScripthashIndex),
       connman: Module.concat(prefix, Connman),
       decode_budget: Module.concat(prefix, DecodeBudget),
+      decode_sup: Module.concat(prefix, DecodeSup),
       listener: Module.concat(prefix, Listener),
       relay_sup: Module.concat(prefix, RelaySup),
       p2p_sup: Module.concat(prefix, P2PSup),
@@ -285,6 +286,7 @@ defmodule Exnode.Node do
       mempool: n.mempool,
       high_bandwidth: n.high_bandwidth,
       decode_budget: n.decode_budget,
+      decode_sup: n.decode_sup,
       # Each peer sends its own version nonce; outbound ones still in the
       # handshake are registered here for the inbound self-connection check.
       local_nonces: n.local_nonces,
@@ -494,6 +496,7 @@ defmodule Exnode.Node do
                clock: clock},
               {Exnode.P2P.HighBandwidth, name: n.high_bandwidth},
               {Exnode.P2P.BlockServing, name: n.block_serving},
+              {Task.Supervisor, name: n.decode_sup},
               {Exnode.P2P.DecodeBudget,
                name: n.decode_budget,
                bytes:

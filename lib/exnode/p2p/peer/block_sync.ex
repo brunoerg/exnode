@@ -14,7 +14,7 @@ defmodule Exnode.P2P.Peer.BlockSync do
   alias Exnode.Consensus.Pow
   alias Exnode.Crypto.Hash
   alias Exnode.Mempool
-  alias Exnode.P2P.{BlockDownload, CompactBlock, HighBandwidth, Message, Peer}
+  alias Exnode.P2P.{BlockDownload, CompactBlock, DecodeBudget, HighBandwidth, Message, Peer}
   alias Exnode.P2P.Peer.{Data, HeadersHandler}
   alias Exnode.P2P.Peer.Data.Proto
 
@@ -49,6 +49,81 @@ defmodule Exnode.P2P.Peer.BlockSync do
   end
 
   def maybe_request_blocks(data), do: data
+
+  @doc """
+  Core `ProcessMessage` `BLOCK`: decodes `payload`, checks mutation against
+  known parent, runs `CheckBlock`, and submits to `ChainState`.
+
+  When `decode_sup` is configured on `data.node`, block decoding, mutation
+  checks, `CheckBlock`, and submission run inside a short-lived supervised
+  worker so the peer process never allocates a 25–45 MB decoded `%Block{}` on
+  its own heap; BEAM reclaims the worker heap in O(1) on exit.
+  """
+  def received_block_payload(%Data{} = data, payload) do
+    peer = self()
+    ibd = Peer.initial_block_download?(data)
+    headers_name = data.node.headers
+    params = data.p
+    bd = data.node[:block_download]
+    cs = data.node[:chain_state]
+
+    work = fn ->
+      case Block.decode_exact(payload) do
+        {:error, _} ->
+          :decode_error
+
+        {:ok, %Block{} = b} ->
+          idx = Headers.index(headers_name)
+
+          mutated? =
+            case HeaderIndex.lookup(idx, b.header.prev_hash) do
+              nil -> false
+              prev -> CompactBlock.mutated?(b, prev.height + 1 >= params.segwit_height)
+            end
+
+          if mutated? do
+            {:mutated, b.header.hash}
+          else
+            in_flight =
+              bd != nil and
+                BlockDownload.received(bd, peer, b.header.hash, byte_size(b.raw || <<>>))
+
+            outcome = submit_decoded_block(cs, b, params, ibd, in_flight, peer)
+
+            if bd != nil,
+              do:
+                BlockDownload.checked(
+                  bd,
+                  peer,
+                  b.header.hash,
+                  outcome in [nil, {:ok, :connected}, {:ok, :stored}, {:ok, :duplicate}]
+                )
+
+            {:processed, b.header.hash, outcome}
+          end
+      end
+    end
+
+    case DecodeBudget.with_worker(
+           data.node[:decode_budget],
+           data.node[:decode_sup],
+           byte_size(payload),
+           work
+         ) do
+      :unavailable ->
+        {:stop, {:shutdown, :decode_budget_unavailable}, data}
+
+      :decode_error ->
+        {:ok, data}
+
+      {:mutated, _hash} ->
+        Peer.misbehaving(data, "mutated block")
+
+      {:processed, hash, outcome} ->
+        data = Data.update_proto(data, &%{&1 | partials: Map.delete(&1.partials, hash)})
+        finalize_block_outcome(data, hash, outcome, false)
+    end
+  end
 
   @doc "Core `ProcessMessage` `BLOCK`: checks mutation against known parent before processing."
   def received_block(%Data{} = data, b) do
@@ -95,22 +170,8 @@ defmodule Exnode.P2P.Peer.BlockSync do
     requested = rebuilt or in_flight
     ibd = Peer.initial_block_download?(data)
 
-    submit = fn cs ->
-      case ChainState.precheck_block(cs, b.header, requested) do
-        :check ->
-          ChainState.submit_block(cs, b,
-            checked: ChainState.check_block(b, data.node.params),
-            defer: ibd,
-            requested: requested,
-            source: self()
-          )
-
-        reply ->
-          reply
-      end
-    end
-
-    outcome = data.node[:chain_state] && submit.(data.node.chain_state)
+    outcome =
+      submit_decoded_block(data.node[:chain_state], b, data.node.params, ibd, requested, self())
 
     if data.node[:block_download] != nil,
       do:
@@ -121,14 +182,34 @@ defmodule Exnode.P2P.Peer.BlockSync do
           outcome in [nil, {:ok, :connected}, {:ok, :stored}, {:ok, :duplicate}]
         )
 
+    finalize_block_outcome(data, b.header.hash, outcome, rebuilt)
+  end
+
+  defp submit_decoded_block(nil, _b, _params, _ibd, _requested, _peer), do: nil
+
+  defp submit_decoded_block(cs, %Block{} = b, params, ibd, requested, peer) do
+    case ChainState.precheck_block(cs, b.header, requested) do
+      :check ->
+        ChainState.submit_block(cs, b,
+          checked: ChainState.check_block(b, params),
+          defer: ibd,
+          requested: requested,
+          source: peer
+        )
+
+      reply ->
+        reply
+    end
+  end
+
+  defp finalize_block_outcome(data, hash, outcome, rebuilt) do
     data =
       if rebuilt and outcome == {:ok, :stored},
         do:
           Data.update_proto(data, fn proto ->
             %{
               proto
-              | rebuilt_deferred:
-                  Enum.take([b.header.hash | proto.rebuilt_deferred], @max_partials)
+              | rebuilt_deferred: Enum.take([hash | proto.rebuilt_deferred], @max_partials)
             }
           end),
         else: data
@@ -144,7 +225,7 @@ defmodule Exnode.P2P.Peer.BlockSync do
             else: data
 
         idx = Headers.index(data.node.headers)
-        e = HeaderIndex.lookup(idx, b.header.hash)
+        e = HeaderIndex.lookup(idx, hash)
 
         data =
           if e,

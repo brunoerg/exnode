@@ -96,8 +96,8 @@ defmodule Exnode.P2P.Connman do
   Waits with no timeout, as Core's accept thread does on its locks (a busy
   Connman must not kill the accept loop).
   """
-  def accept_inbound?(server, target \\ nil),
-    do: GenServer.call(server, {:accept_inbound?, target}, :infinity)
+  def accept_inbound?(server, target \\ nil, timeout \\ :infinity),
+    do: GenServer.call(server, {:accept_inbound?, target}, timeout)
 
   @doc """
   Tracks the inbound peer `pid`: `:ok`. A call, so the Listener knows the
@@ -107,8 +107,8 @@ defmodule Exnode.P2P.Connman do
   eviction. Exits like any call if Connman is
   not running; waits like `accept_inbound?/2`.
   """
-  def register_inbound(server, pid, target),
-    do: GenServer.call(server, {:register_inbound, pid, target}, :infinity)
+  def register_inbound(server, pid, target, timeout \\ :infinity),
+    do: GenServer.call(server, {:register_inbound, pid, target}, timeout)
 
   @doc """
   Core `MaybeDisconnectForTxRelayCapacity` for an inbound peer that relays
