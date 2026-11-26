@@ -1183,7 +1183,14 @@ defmodule Exnode.Chain.State do
     owner = self()
     tag = {:apre, st.plan.gen, ref}
     reader = Archive.kv_reader(st.a)
-    history = item.history
+
+    history =
+      cond do
+        ids.block == entry.height and unique_txids?(st, entry) -> :unique
+        item.history == :unique -> nil
+        true -> item.history
+      end
+
     body = if is_binary(block.raw), do: {:raw, block.raw}, else: {:decoded, block}
     %{spent: spent, delta: %{created: created, spent: sp}} = res
     delta = %{created: created, spent: sp}
@@ -1964,7 +1971,8 @@ defmodule Exnode.Chain.State do
         delta: res.delta,
         commit: false,
         history: item.history,
-        prepared: prepared
+        prepared: prepared,
+        unique_txids: unique_txids?(st, entry)
       )
 
     if hook = st.test_archive_hook, do: hook.(block)
@@ -1975,6 +1983,16 @@ defmodule Exnode.Chain.State do
         do: :erlang.raise(kind, reason, __STACKTRACE__)
 
       {:crash, {kind, reason}, __STACKTRACE__}
+  end
+
+  defp unique_txids?(st, entry) do
+    if Archive.linear?(st.a) do
+      idx = Headers.index(st.headers)
+      prev = HeaderIndex.prev(idx, entry)
+      Connect.bip34_unique_txids?(entry, prev, st.p, idx)
+    else
+      false
+    end
   end
 
   defp archive_crashed(st, %{entry: entry, block: block}, {:crash, error, stack}) do

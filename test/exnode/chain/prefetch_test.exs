@@ -315,4 +315,133 @@ defmodule Exnode.Chain.PrefetchTest do
     ops = for b <- bs ++ blocks, tx <- b.txs, v <- 0..(length(tx.outputs) - 1), do: {tx.txid, v}
     assert coins(pf, ops) == coins(ref, ops)
   end
+
+  test "post-BIP34 linear chain skips txindex history reads and falls back on reorg", %{
+    tmp_dir: dir
+  } do
+    bs = for raw <- BB.read_chain(@chain), do: elem(Block.decode_exact(raw), 1)
+    b150 = List.last(bs)
+    p_bip34 = %{@p | bip34_height: 150, bip34_hash: b150.header.hash}
+
+    start_node = fn name, extra ->
+      {:ok, kv} = KV.open(Path.join([dir, name, "kv"]))
+      {:ok, hs} = Headers.start_link(params: p_bip34, kv: kv)
+
+      {:ok, cs} =
+        State.start_link(
+          [
+            params: p_bip34,
+            headers: hs,
+            kv: kv,
+            hot: Path.join([dir, name, "hot"]),
+            listeners: [self()]
+          ] ++ extra
+        )
+
+      %{cs: cs, hs: hs, kv: kv}
+    end
+
+    pf = start_node.("pf", batch_blocks: 1000, prefetch_depth: 16, commit_at_tip: false)
+    ref = start_node.("ref", batch_blocks: 1000, prefetch_depth: 0, commit_at_tip: false)
+
+    for n <- [pf, ref] do
+      for b <- bs, do: {:ok, :connected} = State.submit_block(n.cs, b)
+      State.commit_now(n.cs)
+    end
+
+    cb = fn h -> hd(Enum.at(bs, h - 1).txs).txid end
+    txs = for i <- 1..6, do: BB.spend_op_true(cb.(i), 0, 50 * @coin)
+    blocks = chain(b150.header, 150, Enum.map(txs, &[&1]))
+
+    before_pf = State.work_stats(pf.cs)
+    assert Enum.uniq(for n <- [pf, ref], do: submit_path(n, blocks)) |> length() == 1
+    for n <- [pf, ref], do: State.commit_now(n.cs)
+    after_pf = State.work_stats(pf.cs)
+
+    pf_delta = fn part, k ->
+      Map.get(after_pf[part], k, 0) - Map.get(before_pf[part], k, 0)
+    end
+
+    # Past pinned BIP34 on a linear archive: prefetch and archive skip txindex history reads.
+    assert pf_delta.(:prefetch, :history_rows) == 0
+    assert pf_delta.(:prefetch, :history_extra) == 0
+    assert pf_delta.(:chain_state, :txindex_reads) == 0
+    assert pf_delta.(:chain_state, :txindex_skipped) == 12
+
+    # Trigger a reorg at height 156 re-confirming the exact same tx (tx6) on a competing fork.
+    b155 = Enum.at(blocks, 4)
+    tx6 = List.last(txs)
+
+    f156 =
+      BB.build(b155.header, [
+        BB.coinbase_with(156, 25 * @coin, outputs: [{25 * @coin, <<0x51>>}, {0, <<0x6A, 99>>}]),
+        tx6
+      ])
+
+    f157 = BB.build(f156.header, [BB.coinbase(157, 25 * @coin)])
+
+    before_reorg = State.work_stats(pf.cs)
+    assert Enum.uniq(for n <- [pf, ref], do: submit_path(n, [f156, f157])) |> length() == 1
+    for n <- [pf, ref], do: State.commit_now(n.cs)
+    after_reorg = State.work_stats(pf.cs)
+
+    assert Map.get(after_reorg.chain_state, :txindex_skipped, 0) ==
+             Map.get(before_reorg.chain_state, :txindex_skipped, 0)
+
+    # Both the orphaned block 156 and competing fork f156 occurrences of tx6 are kept.
+    for n <- [pf, ref] do
+      {:ok, bin} = KV.get(n.kv, :txindex, tx6.txid)
+      assert length(Archive.decode_txindex(bin)) == 2
+    end
+
+    ops =
+      for b <- bs ++ blocks ++ [f156, f157],
+          tx <- b.txs,
+          v <- 0..(length(tx.outputs) - 1),
+          do: {tx.txid, v}
+
+    assert coins(pf, ops) == coins(ref, ops)
+  end
+
+  test "bip34_unique_txids? enforces pinned BIP34 hash, height bounds, and BIP30 repeat exceptions",
+       %{tmp_dir: dir} do
+    alias Exnode.Validation.Connect
+
+    {:ok, kv} = KV.open(Path.join(dir, "kv-bip34"))
+    {:ok, hs} = Headers.start_link(params: @p, kv: kv)
+    b1 = BB.build(@p.genesis.header, [BB.coinbase(1, 50 * @coin)])
+    b2 = BB.build(b1.header, [BB.coinbase(2, 50 * @coin)])
+    {:ok, _} = Headers.process_headers(hs, [b1.header, b2.header])
+    idx = Headers.index(hs)
+    e0 = HeaderIndex.lookup(idx, @p.genesis.header.hash)
+    e1 = HeaderIndex.lookup(idx, b1.header.hash)
+    e2 = HeaderIndex.lookup(idx, b2.header.hash)
+
+    # Regtest has a zero bip34_hash, so bip34_unique_txids? is always false.
+    refute Connect.bip34_unique_txids?(e2, e1, @p, idx)
+
+    # Pin block 1 as the BIP34 activation block: block 1 itself is false, block 2 is true.
+    p_pinned = %{@p | bip34_height: 1, bip34_hash: e1.hash}
+    refute Connect.bip34_unique_txids?(e1, e0, p_pinned, idx)
+    assert Connect.bip34_unique_txids?(e2, e1, p_pinned, idx)
+
+    # At or above BIP34_IMPLIES_BIP30_LIMIT (1_983_702): false.
+    refute Connect.bip34_unique_txids?(%{e2 | height: 1_983_702}, e1, p_pinned, idx)
+
+    # Historical BIP30 repeat hash/height: false even if bip34_anc matched.
+    bip30_hash =
+      Base.decode16!("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+        case: :lower
+      )
+      |> :binary.decode_unsigned(:big)
+      |> :binary.encode_unsigned(:little)
+      |> then(fn b -> b <> :binary.copy(<<0>>, 32 - byte_size(b)) end)
+
+    refute Connect.bip34_unique_txids?(
+             %{e2 | height: 91_842, hash: bip30_hash},
+             e1,
+             p_pinned,
+             idx
+           )
+  end
 end

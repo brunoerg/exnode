@@ -514,6 +514,20 @@ defmodule Exnode.Validation.Connect do
       else: []
   end
 
+  @doc """
+  True when BIP34 is active on the pinned chain below `@bip34_implies_bip30_limit`
+  and `entry` is not one of the two historical BIP30 repeats: a consensus-valid
+  block at this height cannot duplicate any earlier on-chain txid.
+  """
+  def bip34_unique_txids?(entry, prev, p, idx) do
+    repeat = Consensus.bip30_repeat?(entry.height, entry.hash)
+    bip34_anc = if prev, do: Index.ancestor(idx, prev, p.bip34_height), else: nil
+
+    not repeat and
+      bip34_anc != nil and bip34_anc.hash == p.bip34_hash and
+      entry.height < @bip34_implies_bip30_limit
+  end
+
   @doc "Every outpoint `connect_block/6` looks up for `block`: its inputs, then the BIP30 outputs."
   def lookup_ops(block, entry, prev, p, idx) do
     for(tx <- tl(block.txs), i <- tx.inputs, do: {i.prev_hash, i.prev_index}) ++

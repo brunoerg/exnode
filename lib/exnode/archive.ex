@@ -380,6 +380,14 @@ defmodule Exnode.Archive do
   @doc "Next ids the archive will assign: `%{block, out, inp}`."
   def next_ids(%__MODULE__{next: n}), do: n
 
+  @doc """
+  True when every archived block is on the selected chain (`next.block == tip.height + 1`),
+  so no off-chain (disconnected) block exists in `:txindex`. Works on both the
+  owner `%Archive{}` and a `reader/1`.
+  """
+  def linear?(%__MODULE__{tip: %{height: h}, next: %{block: n}}), do: n == h + 1
+  def linear?(%__MODULE__{}), do: false
+
   @doc "Uncommitted blocks in the batch: `{count, raw bytes}`."
   def batch_size(%__MODULE__{batch: b}), do: {b.n, b.bytes}
 
@@ -546,19 +554,29 @@ defmodule Exnode.Archive do
     sent = if hint, do: Enum.reject(ops, &Overlay.answerable?(hint, &1)), else: ops
     n = length(ops)
     s = length(sent)
-    txids = txids |> Enum.sort() |> Enum.dedup()
     lookup = sent |> Enum.map(&elem(&1, 0)) |> Enum.sort() |> Enum.dedup()
-    all = (lookup ++ txids) |> Enum.sort() |> Enum.dedup()
-    rows = Map.new(Enum.zip(all, KV.multi_get(a.kv, :txindex, all)))
+
+    {txids_list, all, history} =
+      if txids == :unique do
+        rows = Map.new(Enum.zip(lookup, KV.multi_get(a.kv, :txindex, lookup)))
+        {[], lookup, {:unique, rows}}
+      else
+        txids_list = txids |> Enum.sort() |> Enum.dedup()
+        all = (lookup ++ txids_list) |> Enum.sort() |> Enum.dedup()
+        rows = Map.new(Enum.zip(all, KV.multi_get(a.kv, :txindex, all)))
+        {txids_list, all, {%{epoch: a.epoch, rows: Map.take(rows, txids_list)}, rows}}
+      end
+
+    {hist, rows} = history
 
     {resolve_committed(a, sent, rows),
      %{
        considered: n,
        omitted: n - s,
        sent: s,
-       history_rows: length(txids),
+       history_rows: length(txids_list),
        history_extra: length(all) - length(lookup)
-     }, %{epoch: a.epoch, rows: Map.take(rows, txids)}}
+     }, hist}
   end
 
   # The prefetch answers stand in for the chain-state process's own
@@ -571,7 +589,7 @@ defmodule Exnode.Archive do
   commit since, instead of discarding them: `{:ok, answers, history,
   dropped}` valid at the current epoch, or `:stale`.
   """
-  def revalidate(%__MODULE__{epoch: cur, last_commit: lc}, epoch, answers, history) do
+  def revalidate(%__MODULE__{epoch: cur, last_commit: lc} = a, epoch, answers, history) do
     case lc do
       %{from: ^epoch, txids: txids, spent: spent} when cur == epoch + 1 ->
         kept =
@@ -586,6 +604,9 @@ defmodule Exnode.Archive do
 
         history =
           case history do
+            :unique ->
+              if linear?(a), do: :unique, else: nil
+
             %{rows: rows} ->
               if Enum.any?(Map.keys(rows), &is_map_key(txids, &1)),
                 do: nil,
@@ -639,6 +660,7 @@ defmodule Exnode.Archive do
     :txindex_read_us,
     :txindex_found,
     :txindex_reused,
+    :txindex_skipped,
     :txindex_hint_stale,
     :append_tx_ops_us,
     :append_spend_ops_us,
@@ -910,7 +932,8 @@ defmodule Exnode.Archive do
           append(a, block, height, spent,
             index_txs: true,
             history: opts[:history],
-            prepared: prepared
+            prepared: prepared,
+            unique_txids: opts[:unique_txids]
           )
 
         id ->
@@ -1167,6 +1190,9 @@ defmodule Exnode.Archive do
 
     p =
       case {reader, history} do
+        {_, :unique} ->
+          Map.put(p, :history, :unique)
+
         {nil, _} ->
           Map.put(p, :history, history)
 
@@ -1257,7 +1283,8 @@ defmodule Exnode.Archive do
 
     txindex =
       if opts[:index_txs],
-        do: txindex_lists(a, p.own, history),
+        do:
+          txindex_lists(a, p.own, history, opts[:unique_txids] == true and a.next.block == height),
         else: %{}
 
     repeated =
@@ -1361,7 +1388,17 @@ defmodule Exnode.Archive do
     own
   end
 
-  defp txindex_lists(a, own, history) do
+  defp txindex_lists(a, own, _history, true) do
+    batch = a.batch.txindex
+    count(:txindex_skipped, map_size(own))
+
+    Map.new(own, fn {t, es} ->
+      prior = Map.get(batch, t, [])
+      {t, prior ++ Enum.reverse(es)}
+    end)
+  end
+
+  defp txindex_lists(a, own, history, false) do
     batch = a.batch.txindex
     missing = for {t, _} <- own, not is_map_key(batch, t), do: t
 
@@ -1375,7 +1412,7 @@ defmodule Exnode.Archive do
           count(:txindex_hint_stale, 1)
           {[], missing}
 
-        nil ->
+        _ ->
           {[], missing}
       end
 
