@@ -60,18 +60,19 @@ defmodule Exnode.P2P.Peer.Serving do
     st = serve_txs(%{st | getdata_queue: q}, tx_items)
 
     result =
-      case :queue.out(st.getdata_queue) do
-        _ when st.paused_since != nil ->
-          {:ok, st}
+      if Peer.paused?(st) do
+        {:ok, st}
+      else
+        case :queue.out(st.getdata_queue) do
+          {{:value, %{type: t} = item}, q} when t in [:block, :cmpct_block] ->
+            serve_block(%{st | getdata_queue: q}, item)
 
-        {{:value, %{type: t} = item}, q} when t in [:block, :cmpct_block] ->
-          serve_block(%{st | getdata_queue: q}, item)
+          {{:value, %{type: t}}, q} when t not in [:tx, :wtx, :block, :cmpct_block] ->
+            {:ok, %{st | getdata_queue: q}}
 
-        {{:value, %{type: t}}, q} when t not in [:tx, :wtx, :block, :cmpct_block] ->
-          {:ok, %{st | getdata_queue: q}}
-
-        _ ->
-          {:ok, st}
+          _ ->
+            {:ok, st}
+        end
       end
 
     case result do
@@ -218,15 +219,16 @@ defmodule Exnode.P2P.Peer.Serving do
 
   defp push_txs(st, [], _txs, _missing, nf), do: {st, [], Enum.reverse(nf)}
 
-  defp push_txs(st, items, _txs, _missing, nf) when st.paused_since != nil,
-    do: {st, items, Enum.reverse(nf)}
-
-  defp push_txs(st, [i | rest], txs, missing, nf) do
-    if MapSet.member?(missing, i) do
-      push_txs(st, rest, txs, missing, [i | nf])
+  defp push_txs(st, [i | rest] = items, txs, missing, nf) do
+    if Peer.paused?(st) do
+      {st, items, Enum.reverse(nf)}
     else
-      [tx | txs] = txs
-      push_txs(Peer.push(st, {:tx, tx_bytes(tx, i)}), rest, txs, missing, nf)
+      if MapSet.member?(missing, i) do
+        push_txs(st, rest, txs, missing, [i | nf])
+      else
+        [tx | txs] = txs
+        push_txs(Peer.push(st, {:tx, tx_bytes(tx, i)}), rest, txs, missing, nf)
+      end
     end
   end
 

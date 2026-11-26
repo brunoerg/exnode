@@ -232,7 +232,10 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
     for %{sock: s} <- peers, do: :ok = :gen_tcp.send(s, head)
     # Every peer holds its partial frame.
     for %{pid: p} <- peers do
-      wait_until(fn -> FrameBuffer.size(:sys.get_state(p).buf) == byte_size(head) end, 30_000)
+      wait_until(
+        fn -> FrameBuffer.size(:sys.get_state(p).conn.buf) == byte_size(head) end,
+        30_000
+      )
     end
 
     test = self()
