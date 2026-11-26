@@ -54,7 +54,7 @@ defmodule Exnode.P2P.PeerServingTest do
         monitor: true
       )
 
-    wait_until(fn -> :sys.get_state(pid).verack_received end)
+    wait_until(fn -> match?({{:ready, _}, _}, :sys.get_state(pid)) end)
     {pid, sock, ref}
   end
 

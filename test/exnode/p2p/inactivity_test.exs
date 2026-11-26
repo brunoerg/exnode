@@ -43,13 +43,13 @@ defmodule Exnode.P2P.InactivityTest do
     ref = Process.monitor(pid)
     :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version()})
     :ok = FakePeer.send_msgs(sock, :verack)
-    wait_until(fn -> :sys.get_state(pid).verack_received end)
+    wait_until(fn -> match?({{:ready, _}, _}, :sys.get_state(pid)) end)
     # The first pass pings; answer it, then go silent.
     :ok = Clock.tick(pid)
     {:ping, nonce} = read_until(sock, &match?({:ping, _}, &1))
     :ok = FakePeer.send_msgs(sock, {:pong, nonce})
     # The pong is processed (a call is answered after it).
-    wait_until(fn -> :sys.get_state(pid).ping_nonce == nil end)
+    wait_until(fn -> elem(:sys.get_state(pid), 1).proto.ping_nonce == nil end)
 
     # 19 minutes: still connected.
     Clock.advance(clock, 19 * 60)
@@ -58,7 +58,7 @@ defmodule Exnode.P2P.InactivityTest do
     # That tick pinged (2 min passed): we keep receiving pings, so only the
     # receive side times out. Wait for the writer's report of the send.
     {:ping, _} = read_until(sock, &match?({:ping, _}, &1))
-    wait_until(fn -> :sys.get_state(pid).conn.last_send == Clock.now(clock) end)
+    wait_until(fn -> elem(:sys.get_state(pid), 1).conn.last_send == Clock.now(clock) end)
     # Past 20 minutes since the last bytes from the peer.
     Clock.advance(clock, 60 + 5)
     :ok = Clock.tick(pid)
