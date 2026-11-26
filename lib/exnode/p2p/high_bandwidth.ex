@@ -24,11 +24,12 @@ defmodule Exnode.P2P.HighBandwidth do
   def peers(server), do: GenServer.call(server, :peers, 5_000)
 
   # list: [{peer, inbound?}], oldest first.
+  # monitors: %{peer => ref}
   @impl true
-  def init(_opts), do: {:ok, %{list: []}}
+  def init(_opts), do: {:ok, %{list: [], monitors: %{}}}
 
   @impl true
-  def handle_cast({:select, peer, inbound?}, %{list: list} = st) do
+  def handle_cast({:select, peer, inbound?}, %{list: list, monitors: monitors} = st) do
     cond do
       List.keymember?(list, peer, 0) ->
         {item, rest} = List.keytake(list, peer, 0)
@@ -38,18 +39,33 @@ defmodule Exnode.P2P.HighBandwidth do
         {:noreply, st}
 
       true ->
-        list =
+        {list, monitors} =
           if length(list) >= @max do
             [{oldest, _} | rest] = protect_outbound(list, inbound?)
             send(oldest, {:send, {:sendcmpct, %{announce: false, version: 2}}})
-            rest
+
+            monitors =
+              case Map.pop(monitors, oldest) do
+                {nil, m} ->
+                  m
+
+                {ref, m} ->
+                  Process.demonitor(ref, [:flush])
+                  m
+              end
+
+            {rest, monitors}
           else
-            list
+            {list, monitors}
           end
 
-        Process.monitor(peer)
+        monitors =
+          if Map.has_key?(monitors, peer),
+            do: monitors,
+            else: Map.put(monitors, peer, Process.monitor(peer))
+
         send(peer, {:send, {:sendcmpct, %{announce: true, version: 2}}})
-        {:noreply, %{st | list: list ++ [{peer, inbound?}]}}
+        {:noreply, %{st | list: list ++ [{peer, inbound?}], monitors: monitors}}
     end
   end
 
@@ -65,6 +81,18 @@ defmodule Exnode.P2P.HighBandwidth do
   def handle_call(:peers, _from, st), do: {:reply, Enum.map(st.list, &elem(&1, 0)), st}
 
   @impl true
-  def handle_info({:DOWN, _, :process, peer, _}, st),
-    do: {:noreply, %{st | list: List.keydelete(st.list, peer, 0)}}
+  def handle_info({:DOWN, ref, :process, peer, _}, st) do
+    case Map.get(st.monitors, peer) do
+      ^ref ->
+        {:noreply,
+         %{
+           st
+           | list: List.keydelete(st.list, peer, 0),
+             monitors: Map.delete(st.monitors, peer)
+         }}
+
+      _ ->
+        {:noreply, st}
+    end
+  end
 end
