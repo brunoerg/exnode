@@ -38,7 +38,8 @@ defmodule Exnode.Chain.State do
   alias Exnode.Codec.Block
   alias Exnode.Consensus.Pow
   alias Exnode.Crypto.Hash
-  alias Exnode.Store.KV
+  alias Exnode.StorageError
+  alias Exnode.Store.{Guard, KV, Snapshot}
   alias Exnode.Validation.AssumeValid
   alias Exnode.Validation.Block, as: BlockRules
   alias Exnode.Validation.{Connect, ScriptExec, Scripts}
@@ -61,6 +62,9 @@ defmodule Exnode.Chain.State do
     :headers,
     :a,
     :kv,
+    :staging_kv,
+    :guard,
+    :chain_dir,
     :view,
     :exec,
     :exec_private,
@@ -79,6 +83,7 @@ defmodule Exnode.Chain.State do
     :pf_wait_since,
     :perf,
     :gc_probe,
+    canonical_headers_count: 0,
     blocks: MapSet.new(),
     script_stats: %{checked: 0, skipped: 0},
     test_skip_scripts: false,
@@ -252,6 +257,26 @@ defmodule Exnode.Chain.State do
         :error -> Exnode.Node.Runtime.kv(Keyword.fetch!(opts, :node_name))
       end
 
+    staging_kv =
+      case Keyword.fetch(opts, :staging_kv) do
+        {:ok, skv} ->
+          skv
+
+        :error ->
+          if node_name = opts[:node_name],
+            do: Exnode.Node.Runtime.staging_kv(node_name) || kv,
+            else: kv
+      end
+
+    guard = Keyword.get(opts, :guard, kv.guard)
+    chain_dir = Keyword.get(opts, :chain_dir)
+
+    strict_clean? =
+      case Keyword.get(opts, :boot_open) do
+        nil -> Keyword.get(opts, :strict_clean, false)
+        ref -> :atomics.compare_exchange(ref, 1, 0, 1) == :ok
+      end
+
     a =
       Archive.open(
         kv,
@@ -262,11 +287,26 @@ defmodule Exnode.Chain.State do
           max: opts[:segment_max],
           cache_bytes: opts[:cache_bytes],
           prune_keep: if(opts[:prune_witness], do: Keyword.get(opts, :prune_keep, 288)),
-          segwit_height: p.segwit_height
+          segwit_height: p.segwit_height,
+          strict_clean: strict_clean?,
+          defer_prune: chain_dir != nil
         ]
         |> Enum.reject(&is_nil(elem(&1, 1)))
       )
       |> note_durable()
+
+    canonical_headers_count =
+      case KV.get(kv, :meta, Headers.headers_count_key()) do
+        {:ok, <<n::32>>} -> n
+        :not_found -> KV.fold_keys(kv, :headers, <<>>, 0, fn _, acc -> acc + 1 end)
+      end
+
+    # Ensure a fresh datadir immediately has a valid genesis snapshot on disk
+    # so even a crash at height 0 can be restored cleanly.
+    if chain_dir != nil and
+         match?({:error, :no_valid_snapshot}, Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))) do
+      {:ok, _safe} = take_canonical_snapshot!(a, chain_dir)
+    end
 
     {exec, private} =
       case Keyword.get(opts, :script_exec) do
@@ -294,6 +334,10 @@ defmodule Exnode.Chain.State do
       headers: headers,
       a: a,
       kv: kv,
+      staging_kv: staging_kv,
+      guard: guard,
+      chain_dir: chain_dir,
+      canonical_headers_count: canonical_headers_count,
       view: view,
       exec: exec,
       exec_private: private && {exec, private},
@@ -391,7 +435,7 @@ defmodule Exnode.Chain.State do
   end
 
   defp hold(st, hash, %Block{raw: raw}) do
-    :ok = KV.write(st.kv, [{:put, :pending, hash, raw}], sync: false)
+    :ok = KV.write(st.staging_kv, [{:put, :pending, hash, raw}], sync: false)
     View.hold(st.view, hash)
     %{st | blocks: MapSet.put(st.blocks, hash), retarget: true} |> received_block(hash)
   end
@@ -402,11 +446,70 @@ defmodule Exnode.Chain.State do
 
   defp commit(st) do
     hashes = Enum.map(st.uncommitted, &elem(&1, 0))
-    :ok = Headers.flush(st.headers)
-    a = Archive.flush(st.a, for(h <- hashes, do: {:delete, :pending, h})) |> note_durable()
+
+    {extra_ops, new_headers_count} =
+      if split_store?(st) do
+        # Commit canonical headers for newly archived blocks atomically in the
+        # same synced canonical WriteBatch as the archive records and meta.
+        idx = Headers.index(st.headers)
+        new_hashes = Map.keys(st.a.batch.blockhash)
+
+        new_entries =
+          for h <- new_hashes,
+              e = HeaderIndex.lookup(idx, h),
+              e != nil,
+              do: e
+
+        cnt = st.canonical_headers_count + length(new_entries)
+
+        ops =
+          Headers.canonical_ops(new_entries) ++
+            [{:put, :meta, Headers.headers_count_key(), <<cnt::32>>}]
+
+        {ops, cnt}
+      else
+        :ok = Headers.flush(st.headers)
+        {for(h <- hashes, do: {:delete, :pending, h}), st.canonical_headers_count}
+      end
+
+    a = Archive.flush(st.a, extra_ops) |> note_durable()
+    a = maybe_snapshot_and_prune(st, a)
+
+    if split_store?(st) and hashes != [] do
+      :ok = KV.write(st.staging_kv, for(h <- hashes, do: {:delete, :pending, h}), sync: false)
+    end
+
     View.unhold_many(st.view, hashes)
     View.put_committed(st.view, a)
-    %{st | a: a, round_connected: st.uncommitted ++ st.round_connected, uncommitted: []}
+
+    %{
+      st
+      | a: a,
+        canonical_headers_count: new_headers_count,
+        round_connected: st.uncommitted ++ st.round_connected,
+        uncommitted: []
+    }
+  end
+
+  defp split_store?(%__MODULE__{kv: kv, staging_kv: skv}), do: kv != skv
+
+  defp maybe_snapshot_and_prune(%__MODULE__{chain_dir: nil}, a), do: a
+
+  defp maybe_snapshot_and_prune(%__MODULE__{chain_dir: dir}, a) do
+    {:ok, safe_wpruned} = take_canonical_snapshot!(a, dir)
+    Archive.finalize_pruned_witness(a, safe_wpruned)
+  end
+
+  defp take_canonical_snapshot!(a, chain_dir) do
+    {:ok, bin} = KV.get(a.kv, :meta, "archive")
+    meta = :erlang.binary_to_term(bin)
+    tip = Archive.committed_tip(a)
+
+    Snapshot.take_canonical!(a.kv, chain_dir, %{
+      tip: %{id: meta.tip, height: tip.height, hash: tip.hash},
+      ends: meta.ends,
+      wpruned: Map.get(meta, :wpruned, -1)
+    })
   end
 
   defp note_durable(a) do
@@ -437,7 +540,7 @@ defmodule Exnode.Chain.State do
   end
 
   defp unhold(st, hash) do
-    :ok = KV.write(st.kv, [{:delete, :pending, hash}], sync: false)
+    :ok = KV.write(st.staging_kv, [{:delete, :pending, hash}], sync: false)
     View.unhold(st.view, hash)
     :ets.delete(st.availability, hash)
     %{st | blocks: MapSet.delete(st.blocks, hash), sources: Map.delete(st.sources, hash)}
@@ -478,7 +581,7 @@ defmodule Exnode.Chain.State do
   end
 
   defp load_pending(st) do
-    hashes = KV.fold_keys(st.kv, :pending, <<>>, [], &[&1 | &2])
+    hashes = KV.fold_keys(st.staging_kv, :pending, <<>>, [], &[&1 | &2])
     hashes = Enum.reject(hashes, &MapSet.member?(st.poisoned, &1))
     idx = Headers.index(st.headers)
 
@@ -490,7 +593,7 @@ defmodule Exnode.Chain.State do
       )
 
     if dropped != [],
-      do: :ok = KV.write(st.kv, for(h <- dropped, do: {:delete, :pending, h}), sync: false)
+      do: :ok = KV.write(st.staging_kv, for(h <- dropped, do: {:delete, :pending, h}), sync: false)
 
     View.hold_many(st.view, held)
     st = %{st | blocks: MapSet.new(held)}
@@ -506,12 +609,25 @@ defmodule Exnode.Chain.State do
   end
 
   defp load_candidates(st) do
-    disconnected =
-      KV.fold_prefix(st.kv, :blockhash, <<>>, MapSet.new(), fn {hash, <<id::32>>}, acc ->
+    {disconnected, count} =
+      KV.fold_prefix(st.kv, :blockhash, <<>>, {MapSet.new(), 0}, fn {hash, <<id::32>>},
+                                                                   {acc, n} ->
         active = Archive.on_chain?(st.a, id)
         :ets.insert(st.availability, {hash, if(active, do: 0, else: 1)})
-        if active, do: acc, else: MapSet.put(acc, hash)
+        acc = if active, do: acc, else: MapSet.put(acc, hash)
+        {acc, n + 1}
       end)
+
+    expected = st.a.next.block
+
+    if count != expected do
+      StorageError.raise_and_latch!(
+        st.guard,
+        :archive,
+        {:blockhash_count_mismatch, count, expected},
+        "blockhash scan returned #{count} row(s), expected #{expected}"
+      )
+    end
 
     %{st | disconnected: disconnected}
   end
@@ -547,7 +663,7 @@ defmodule Exnode.Chain.State do
   end
 
   defp pending_block(st, hash) do
-    case KV.get(st.kv, :pending, hash) do
+    case KV.get(st.staging_kv, :pending, hash) do
       {:ok, raw} ->
         {:ok, b} = Block.decode_exact(raw)
         b
@@ -674,22 +790,24 @@ defmodule Exnode.Chain.State do
 
   defp do_handle_call(:clear_halt, _from, st) do
     Quarantine.clear_halt_mark(st.kv, st.view)
+    a = maybe_snapshot_and_prune(st, st.a)
     Logger.warning("block connection halt cleared (was #{inspect(st.halted)})")
-    {:reply, st.halted, queue_drive(%{st | halted: false, retarget: true})}
+    {:reply, st.halted, queue_drive(%{st | a: a, halted: false, retarget: true})}
   end
 
   defp do_handle_call(:poisoned, _from, st), do: {:reply, MapSet.to_list(st.poisoned), st}
 
   defp do_handle_call({:reconsider_poisoned, which}, from, st) do
     {hashes, poisoned} = Quarantine.clear_poisoned(st.kv, st.view, st.poisoned, which)
-    st = %{st | poisoned: poisoned}
+    a = maybe_snapshot_and_prune(st, st.a)
+    st = %{st | a: a, poisoned: poisoned}
 
     st =
       Enum.reduce(hashes, st, fn h, st ->
         id = Archive.block_id(st.a, h)
 
         cond do
-          KV.get(st.kv, :pending, h) != :not_found ->
+          KV.get(st.staging_kv, :pending, h) != :not_found ->
             View.hold(st.view, h)
             %{st | blocks: MapSet.put(st.blocks, h)} |> received_block(h)
 
@@ -745,23 +863,35 @@ defmodule Exnode.Chain.State do
   defp do_handle_info(_msg, st), do: {:noreply, st}
 
   @impl true
-  def terminate(_reason, st) do
+  def terminate(reason, st) do
     st = cancel_plan(st)
+    clean_reason? = reason in [:normal, :shutdown]
 
-    if durable_current?(st.a) do
+    if clean_reason? and durable_current?(st.a) and not Guard.faulted?(st.guard) do
       try do
-        commit(st)
+        st = commit(st)
+        # On clean shutdown with snapshots enabled, ensure the latest state
+        # (and any 1-snapshot-deferred witness pruning) is captured before close.
+        a =
+          if st.chain_dir != nil and st.a.wpruned > st.a.wpruned_deleted do
+            maybe_snapshot_and_prune(st, st.a)
+          else
+            st.a
+          end
+
+        Archive.close(a)
+        Guard.mark_clean_close!(st.guard)
       catch
-        kind, reason ->
+        kind, err ->
           Logger.warning(
-            "chain state stopped without committing (the restart resumes from the disk): " <>
-              Exception.format_banner(kind, reason, __STACKTRACE__)
+            "chain state stopped without completing clean close (retaining flush.lock): " <>
+              Exception.format_banner(kind, err, __STACKTRACE__)
           )
       end
     else
       Logger.warning(
-        "chain state stopped with an archive state older than its last commit; " <>
-          "not committing it (the restart resumes from the disk)"
+        "chain state stopped without committing (reason=#{inspect(reason)}, " <>
+          "durable_current=#{durable_current?(st.a)}, faulted=#{Guard.faulted?(st.guard)})"
       )
     end
 
@@ -786,8 +916,9 @@ defmodule Exnode.Chain.State do
   defp do_handle_cast({:halt, reason}, %__MODULE__{halted: false} = st) do
     Logger.error("block connection halted: #{inspect(reason)}")
     Quarantine.put_halt_mark(st.kv, st.view, reason, Archive.tip(st.a))
+    a = maybe_snapshot_and_prune(st, st.a)
     ack_halt(st)
-    {:noreply, queue_drive(%{st | halted: reason})}
+    {:noreply, queue_drive(%{st | a: a, halted: reason})}
   end
 
   defp do_handle_cast({:halt, _reason}, st) do
@@ -937,8 +1068,29 @@ defmodule Exnode.Chain.State do
   end
 
   defp fail_submitted(st, hash, reason) do
-    Headers.invalidate(st.headers, hash, Archive.tip(st.a).hash)
+    st = invalidate_headers(st, hash)
     {{:error, reason}, unhold_failed(st)}
+  end
+
+  defp invalidate_headers(st, hash) do
+    failed = Headers.invalidate_entries(st.headers, hash, Archive.tip(st.a).hash)
+
+    if split_store?(st) and failed != [] do
+      new_count =
+        Enum.reduce(failed, st.canonical_headers_count, fn e, acc ->
+          if KV.get(st.kv, :headers, e.hash) == :not_found, do: acc + 1, else: acc
+        end)
+
+      ops =
+        Headers.canonical_ops(failed) ++
+          [{:put, :meta, Headers.headers_count_key(), <<new_count::32>>}]
+
+      :ok = KV.write(st.kv, ops, sync: true)
+      a = maybe_snapshot_and_prune(st, st.a)
+      %{st | a: a, canonical_headers_count: new_count}
+    else
+      st
+    end
   end
 
   defp have?(st, hash),
@@ -1067,7 +1219,7 @@ defmodule Exnode.Chain.State do
         depth = if archived, do: 0, else: st.prefetch_depth
 
         ctx = %{
-          kv: st.kv,
+          kv: st.staging_kv,
           params: st.p,
           idx: idx,
           current: current_block(st),
@@ -1953,6 +2105,7 @@ defmodule Exnode.Chain.State do
 
       old = Archive.tip(st.a).hash
       {a, _id} = Archive.disconnect_tip(st.a)
+      a = maybe_snapshot_and_prune(st, a)
       note_durable(a)
       View.publish(st.view, a)
       notify(st, {:block_disconnected, old})
@@ -2060,8 +2213,10 @@ defmodule Exnode.Chain.State do
     Logger.warning("block #{Hash.to_hex(entry.hash)} at #{entry.height} invalid: #{reason}")
     st = commit(st)
 
-    if result_kind != :mutated,
-      do: Headers.invalidate(st.headers, entry.hash, Archive.tip(st.a).hash)
+    st =
+      if result_kind != :mutated,
+        do: invalidate_headers(st, entry.hash),
+        else: st
 
     notify(st, {:block_invalid, entry.hash, r})
     {source, sources} = Map.pop(st.sources, entry.hash)
@@ -2092,7 +2247,7 @@ defmodule Exnode.Chain.State do
     )
 
     st = commit(st)
-    sources = poison(st, entry, block, error, msg)
+    {st, sources} = poison(st, entry, block, error, msg)
 
     %{
       st
@@ -2107,14 +2262,28 @@ defmodule Exnode.Chain.State do
 
   defp poison(st, entry, block, error, msg) do
     hash = entry.hash
-    Quarantine.mark_poisoned(st.kv, st.crash_dir, st.view, entry, block, error, msg)
+    new_count = MapSet.size(MapSet.put(st.poisoned, hash))
+
+    Quarantine.mark_poisoned(
+      st.kv,
+      st.crash_dir,
+      st.view,
+      entry,
+      block,
+      error,
+      msg,
+      new_count,
+      st.staging_kv
+    )
+
+    a = maybe_snapshot_and_prune(st, st.a)
     notify(st, {:block_quarantined, hash, error})
     {source, sources} = Map.pop(st.sources, hash)
 
     if is_pid(source),
       do: send(source, {:block_checked, hash, {:error, {:crash, "validation crashed locally"}}})
 
-    sources
+    {%{st | a: a}, sources}
   end
 
   defp load_block(st, entry) do

@@ -44,11 +44,43 @@ defmodule Exnode.Index.Scripthash do
   a long history costs the caller only and never holds the index process.
   """
   def history(server, sh) do
-    server
-    |> kv()
-    |> KV.fold_prefix(@cf, sh, [], &[row(&1) | &2])
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reverse()
+    kv = kv(server)
+    tip1 = Follower.tip(kv, @cf)
+
+    rows =
+      kv
+      |> KV.fold_prefix(@cf, sh, [], &[row(&1) | &2])
+      |> Enum.reject(&is_nil/1)
+      |> Enum.reverse()
+
+    verify_scan_count!(kv, sh, tip1, length(rows))
+    rows
+  end
+
+  # Cross-check scanned row count against persisted per-script totals when
+  # the index tip did not advance concurrently (defense-in-depth against silent
+  # iterator truncation).
+  defp verify_scan_count!(kv, sh, tip1, scanned) do
+    if KV.get(kv, @cf, "totals") == {:ok, <<1>>} do
+      [funded, spent] =
+        kv
+        |> KV.multi_get(@cf, [total_key(sh, 0), total_key(sh, 2)])
+        |> Enum.map(fn
+          {:ok, v} -> :erlang.binary_to_term(v)
+          :not_found -> 0
+        end)
+
+      expected = funded + spent
+
+      if scanned != expected and Follower.tip(kv, @cf) == tip1 do
+        Exnode.StorageError.raise_and_latch!(
+          kv.guard,
+          :scripthash,
+          {:scripthash_scan_count_mismatch, scanned, expected},
+          "scripthash scan returned #{scanned} row(s), expected #{expected}"
+        )
+      end
+    end
   end
 
   @doc """
@@ -229,7 +261,7 @@ defmodule Exnode.Index.Scripthash do
     kv =
       case Keyword.fetch(opts, :kv) do
         {:ok, kv} -> kv
-        :error -> Runtime.kv(Keyword.fetch!(opts, :node_name))
+        :error -> Runtime.derived_kv(Keyword.fetch!(opts, :node_name))
       end
 
     # Readers scan in their own process (`history/2`).

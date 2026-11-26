@@ -111,7 +111,17 @@ defmodule Exnode.Chain.Quarantine do
   end
 
   @doc false
-  def mark_poisoned(kv, crash_dir, view, entry, block, error, msg, new_count \\ nil) do
+  def mark_poisoned(
+        kv,
+        crash_dir,
+        view,
+        entry,
+        block,
+        error,
+        msg,
+        new_count \\ nil,
+        staging_kv \\ nil
+      ) do
     hash = entry.hash
 
     mark =
@@ -123,10 +133,13 @@ defmodule Exnode.Chain.Quarantine do
 
     ops =
       [{:put, :poisoned, hash, mark}] ++
-        if(is_integer(new_count), do: [{:put, :meta, @poisoned_count_key, <<new_count::32>>}], else: [])
+        if(is_integer(new_count),
+          do: [{:put, :meta, @poisoned_count_key, <<new_count::32>>}],
+          else: []
+        )
 
     :ok = KV.write(kv, ops, sync: true)
-    write_crash_report(kv, crash_dir, entry, block, msg)
+    write_crash_report(staging_kv || kv, crash_dir, entry, block, msg)
     View.quarantine(view, hash)
     :ok
   end

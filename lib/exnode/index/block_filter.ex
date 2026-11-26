@@ -92,7 +92,7 @@ defmodule Exnode.Index.BlockFilter do
     kv =
       case Keyword.fetch(opts, :kv) do
         {:ok, kv} -> kv
-        :error -> Runtime.kv(Keyword.fetch!(opts, :node_name))
+        :error -> Runtime.derived_kv(Keyword.fetch!(opts, :node_name))
       end
 
     if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, kv)

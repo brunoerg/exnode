@@ -80,6 +80,7 @@ defmodule Exnode.Node do
   alias Exnode.Node.Runtime
   alias Exnode.P2P.BlockDownload
   alias Exnode.P2P.{AddrMan, Connman, Listener, SyncState}
+  alias Exnode.Store.Guard
 
   def start_link(opts),
     do: Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -262,13 +263,71 @@ defmodule Exnode.Node do
     Runtime.clear_stopping(name)
     datadir = Keyword.fetch!(opts, :datadir)
     budget = fd_budget!(opts)
+    chain_dir = Path.join(datadir, Atom.to_string(chain))
+    File.mkdir_p!(chain_dir)
 
-    kv_path = Path.join([datadir, Atom.to_string(chain), "index"])
+    need_derived? =
+      Keyword.get(opts, :block_filter_index, false) or
+        Keyword.get(opts, :index_scripthash, false)
 
-    kv_opts = [
-      max_open_files: budget.table_files,
-      block_cache_bytes: Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
-    ]
+    # Acquire clean-close lock BEFORE opening RocksDB or any segment file.
+    # A dirty or faulted store is refused here and must be restored via
+    # `mix exnode.restore` (or resynced).
+    canonical_guard = Guard.acquire!(chain_dir, name: "canonical", require_clean_mark: true)
+
+    {canonical_fds, staging_fds, derived_fds} =
+      split_table_files(budget.table_files, need_derived?)
+
+    kv_cache = Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
+
+    derived_guard =
+      if need_derived? do
+        derived_dir = Path.join(chain_dir, "derived")
+        File.mkdir_p!(derived_dir)
+
+        try do
+          Guard.acquire!(derived_dir, name: "derived", require_clean_mark: false)
+        rescue
+          e ->
+            Guard.mark_clean_close!(canonical_guard)
+            Guard.release_clean!(canonical_guard)
+            reraise e, __STACKTRACE__
+        end
+      end
+
+    stores =
+      [
+        {:kv, Path.join(chain_dir, "index"),
+         [
+           mode: :canonical,
+           guard: canonical_guard,
+           max_open_files: canonical_fds,
+           block_cache_bytes: kv_cache
+         ]},
+        {:staging_kv, Path.join(chain_dir, "staging"),
+         [
+           mode: :staging,
+           max_open_files: staging_fds,
+           block_cache_bytes: min(16 * 1024 * 1024, max(4 * 1024 * 1024, div(kv_cache, 16)))
+         ]}
+      ] ++
+        if(need_derived?,
+          do: [
+            {:derived_kv, Path.join(chain_dir, "derived"),
+             [
+               mode: :derived,
+               guard: derived_guard,
+               max_open_files: derived_fds,
+               block_cache_bytes: min(64 * 1024 * 1024, max(8 * 1024 * 1024, div(kv_cache, 4)))
+             ]}
+          ],
+          else: []
+        )
+
+    # Track whether Chain.State is opening the archive for the first time on
+    # this node boot (strict_clean: true) vs an in-process non-storage restart.
+    boot_open = :atomics.new(1, signed: false)
+    :atomics.put(boot_open, 1, 0)
 
     clock = Keyword.get_lazy(opts, :clock, &Exnode.Clock.new/0)
 
@@ -395,8 +454,11 @@ defmodule Exnode.Node do
       {Runtime,
        name: n.runtime,
        node_name: name,
-       kv_path: kv_path,
-       kv_opts: kv_opts,
+       node_pid: self(),
+       stores: stores,
+       guards: Enum.reject([canonical_guard, derived_guard], &is_nil/1),
+       derived_guard: derived_guard,
+       chain_dir: chain_dir,
        cleanup_keys: cleanup_keys}
 
     children =
@@ -430,6 +492,9 @@ defmodule Exnode.Node do
             node_name: name,
             params: params,
             headers: n.headers,
+            guard: canonical_guard,
+            chain_dir: chain_dir,
+            boot_open: boot_open,
             assume_valid: Keyword.get(opts, :assume_valid),
             prune_witness: Keyword.get(opts, :prune_witness, false),
             commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
@@ -542,5 +607,16 @@ defmodule Exnode.Node do
       {:error, msg} ->
         raise ArgumentError, msg
     end
+  end
+
+  defp split_table_files(total, false) do
+    staging = min(64, max(16, div(total, 8)))
+    {max(32, total - staging), staging, 0}
+  end
+
+  defp split_table_files(total, true) do
+    staging = min(64, max(16, div(total, 8)))
+    derived = min(128, max(32, div(total, 4)))
+    {max(32, total - staging - derived), staging, derived}
   end
 end
