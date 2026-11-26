@@ -42,16 +42,13 @@ defmodule Exnode.P2P.Peer do
     Connman,
     DecodeBudget,
     FilterServing,
-    Frame,
-    FrameBuffer,
     HeadersSync,
     Message,
     NetAddr,
     TxRelay
   }
 
-  alias Exnode.P2P.Peer.{BlockSync, HeadersHandler, Serving}
-  alias Exnode.P2P.V2.Transport
+  alias Exnode.P2P.Peer.{BlockSync, Conn, HeadersHandler, Serving}
   alias Exnode.Util.RollingBloom
 
   # net.cpp m_peer_connect_timeout default (DEFAULT_PEER_CONNECT_TIMEOUT)
@@ -60,15 +57,6 @@ defmodule Exnode.P2P.Peer do
   @ping_interval_s 120
   @timeout_interval_s 20 * 60
   @tick_ms 1_000
-  # A send blocked this long (peer not reading) fails and closes the socket,
-  # so the writer cannot hang; Core's send-side TIMEOUT_INTERVAL.
-  # (node.send_timeout_ms overrides it in tests.)
-  @send_timeout_ms 20 * 60 * 1000
-  # net.h DEFAULT_MAXSENDBUFFER (1000) * 1000 bytes, Core -maxsendbuffer
-  # (node.max_send_buffer overrides it in tests).
-  @max_send_buffer 1_000 * 1_000
-  # Bytes the writer coalesces into one socket send.
-  @writer_batch 256 * 1024
 
   @sendheaders_version 70012
   @short_ids_blocks_version 70014
@@ -103,31 +91,33 @@ defmodule Exnode.P2P.Peer do
   def init(args) do
     node = Map.fetch!(args, :node)
     conn_type = Map.fetch!(args, :conn_type)
+    inbound = conn_type == :inbound
+
+    conn_opts =
+      [
+        magic: node.params.magic,
+        inbound: inbound,
+        v2: Map.get(args, :v2, false)
+      ] ++
+        if(Map.has_key?(node, :socket_send), do: [send_fun: node.socket_send], else: []) ++
+        if(Map.has_key?(node, :send_timeout_ms),
+          do: [send_timeout_ms: node.send_timeout_ms],
+          else: []
+        ) ++
+        if(Map.has_key?(node, :max_send_buffer),
+          do: [max_send_buffer: node.max_send_buffer],
+          else: []
+        )
 
     st = %{
       node: node,
       p: node.params,
       conn_type: conn_type,
-      inbound: conn_type == :inbound,
+      inbound: inbound,
       target: args[:target],
-      socket: nil,
-      # v1 receive buffer (FrameBuffer: linear in bytes received).
-      buf: FrameBuffer.new(),
+      conn: Conn.new(conn_opts),
       # Core m_getdata_requests: getdata items not served yet.
       getdata_queue: :queue.new(),
-      # v2 messages decoded but not processed while the getdata queue drains.
-      pending_msgs: [],
-      # Send buffer (Core vSendMsg / m_send_memusage / fPauseSend):
-      # bytes go to a linked writer process, which owns the blocking socket
-      # send; `send_queued` counts the bytes it has not written yet. Over
-      # the limit, `paused_since` is set: no more messages from the peer are
-      # processed and no more getdata is served until it drains.
-      writer: nil,
-      send_queued: 0,
-      paused_since: nil,
-      # :v1, or a V2.Transport (BIP324) once the session starts.
-      transport: :v1,
-      v2: Map.get(args, :v2, false),
       connected_at: nil,
       # handshake
       version: nil,
@@ -185,23 +175,13 @@ defmodule Exnode.P2P.Peer do
   end
 
   @impl true
-  def handle_continue(:connect, %{target: {host, port}} = st) do
-    # IP literals are parsed to tuples. IPv6 needs the :inet6 option, otherwise
-    # gen_tcp treats the literal as a hostname (nxdomain).
-    {host, family} =
-      case :inet.parse_address(to_charlist(host)) do
-        {:ok, ip} when tuple_size(ip) == 8 -> {ip, [:inet6]}
-        {:ok, ip} -> {ip, []}
-        {:error, _} -> {to_charlist(host), []}
-      end
+  def handle_continue(:connect, %{target: target} = st) do
+    t = now(st)
 
-    case connect(
-           host,
-           port,
-           family ++ [:binary, active: :once, packet: :raw, nodelay: true] ++ send_opts(st)
-         ) do
-      {:ok, sock} ->
-        st = start_session(%{st | socket: sock})
+    case Conn.connect(st.conn, target, t) do
+      {:ok, conn} ->
+        schedule_tick(st)
+        st = %{st | conn: conn, connected_at: t, next_ping_at: t}
         {:noreply, send_version(st)}
 
       {:error, reason} ->
@@ -209,60 +189,26 @@ defmodule Exnode.P2P.Peer do
     end
   end
 
-  defp connect(host, port, opts) do
-    :gen_tcp.connect(host, port, opts, 5_000)
-  catch
-    :exit, :badarg -> {:error, :einval}
-  end
-
-  defp start_session(st) do
-    schedule_tick(st)
-    st = %{start_writer(st) | connected_at: now(st), next_ping_at: now(st)}
-
-    if st.v2 do
-      {t, out} = Transport.new(not st.inbound, st.p.magic)
-      send_bytes(%{st | transport: t}, out)
-    else
-      st
-    end
-  end
-
   # --- socket ----------------------------------------------------------------
 
   @impl true
   def handle_info({:socket_ready, sock}, st) do
-    :ok = :inet.setopts(sock, [active: :once] ++ send_opts(st))
-    {:noreply, start_session(%{st | socket: sock})}
+    t = now(st)
+    conn = Conn.attach(st.conn, sock, t)
+    schedule_tick(st)
+    {:noreply, %{st | conn: conn, connected_at: t, next_ping_at: t}}
   end
 
-  def handle_info({:tcp, sock, data}, %{socket: sock} = st) do
-    st =
-      st
-      |> Map.update(:bytes_recv, byte_size(data), &(&1 + byte_size(data)))
-      |> Map.put(:last_recv, now(st))
+  def handle_info({:tcp, sock, data}, %{conn: %Conn{socket: sock}} = st) do
+    case Conn.on_tcp(st.conn, data, now(st)) do
+      {:v1, conn} ->
+        drain(%{st | conn: conn}) |> rearm()
 
-    case st.transport do
-      :v1 ->
-        drain(%{st | buf: FrameBuffer.append(st.buf, data)}) |> rearm()
+      {:v2, conn, msgs} ->
+        dispatch(%{st | conn: conn}, msgs) |> rearm()
 
-      %Transport{} = t ->
-        case Transport.received(t, data) do
-          {:ok, t, out, msgs} ->
-            st |> Map.put(:transport, t) |> send_bytes(out) |> dispatch(msgs) |> rearm()
-
-          {:v1, bytes} ->
-            st = %{st | transport: :v1, buf: FrameBuffer.from_binary(bytes)}
-
-            st =
-              Enum.reduce(Transport.queued(t), st, fn {cmd, p}, acc ->
-                send_bytes(acc, Frame.encode(acc.p.magic, cmd, p))
-              end)
-
-            drain(st) |> rearm()
-
-          {:error, reason} ->
-            {:stop, {:shutdown, {:v2_error, reason}}, st}
-        end
+      {:error, reason} ->
+        {:stop, {:shutdown, reason}, st}
     end
   end
 
@@ -300,13 +246,11 @@ defmodule Exnode.P2P.Peer do
         if getdata_pending?(st) do
           {:noreply, st}
         else
-          case st.transport do
-            :v1 ->
-              drain(st)
-
-            _ ->
-              msgs = st.pending_msgs
-              dispatch(%{st | pending_msgs: []}, msgs)
+          if Conn.v1?(st.conn) do
+            drain(st)
+          else
+            {msgs, conn} = Conn.take_pending(st.conn)
+            dispatch(%{st | conn: conn}, msgs)
           end
           |> rearm()
         end
@@ -320,18 +264,9 @@ defmodule Exnode.P2P.Peer do
     do: {:stop, {:shutdown, {:send_failed, reason}}, st}
 
   def handle_info({:sent, n}, st) do
-    st =
-      st
-      |> Map.update(:bytes_sent, n, &(&1 + n))
-      |> Map.put(:last_send, now(st))
-      |> Map.put(:send_queued, st.send_queued - n)
-
-    if st.paused_since != nil and st.send_queued <= max_send_buffer(st) do
-      send(self(), :continue_getdata)
-      {:noreply, %{st | paused_since: nil}}
-    else
-      {:noreply, st}
-    end
+    {resumed?, conn} = Conn.on_sent(st.conn, n, now(st))
+    if resumed?, do: send(self(), :continue_getdata)
+    {:noreply, %{st | conn: conn}}
   end
 
   def handle_info(:novel_tx, st), do: {:noreply, report_stats(st, %{last_tx_time: now(st)})}
@@ -346,10 +281,12 @@ defmodule Exnode.P2P.Peer do
     end
   end
 
-  def handle_info({:send, {:sendcmpct, %{announce: a}} = msg}, %{socket: s} = st) when s != nil,
-    do: {:noreply, push(%{st | hb_selected: a}, msg)}
+  def handle_info({:send, {:sendcmpct, %{announce: a}} = msg}, %{conn: %Conn{socket: s}} = st)
+      when s != nil,
+      do: {:noreply, push(%{st | hb_selected: a}, msg)}
 
-  def handle_info({:send, msg}, %{socket: s} = st) when s != nil, do: {:noreply, push(st, msg)}
+  def handle_info({:send, msg}, %{conn: %Conn{socket: s}} = st) when s != nil,
+    do: {:noreply, push(st, msg)}
 
   def handle_info(:tx_relay_resync, st) do
     if handshake_done?(st), do: tx_relay_connected(st)
@@ -359,18 +296,8 @@ defmodule Exnode.P2P.Peer do
   def handle_info(_msg, st), do: {:noreply, st}
 
   @impl true
-  def terminate(_reason, st) do
-    if st.writer && st.send_queued > 0 do
-      send(st.writer, {:flush, self()})
-
-      receive do
-        :flushed -> :ok
-      after
-        1_000 -> :ok
-      end
-    end
-
-    :ok
+  def terminate(reason, st) do
+    Conn.flush_on_terminate(st.conn, reason)
   end
 
   @impl true
@@ -398,10 +325,10 @@ defmodule Exnode.P2P.Peer do
        min_ping_us: st.min_ping_us,
        best_known: st.best_known && st.best_known.height,
        synced_blocks: st.best_known_block,
-       bytes_sent: Map.get(st, :bytes_sent, 0),
-       bytes_recv: Map.get(st, :bytes_recv, 0),
-       last_send: Map.get(st, :last_send, 0),
-       last_recv: Map.get(st, :last_recv, 0),
+       bytes_sent: st.conn.bytes_sent,
+       bytes_recv: st.conn.bytes_recv,
+       last_send: st.conn.last_send || 0,
+       last_recv: st.conn.last_recv || 0,
        conntime: st.connected_at || 0,
        relay: v[:relay] != false,
        hb_to: st.hb_requested,
@@ -409,16 +336,10 @@ defmodule Exnode.P2P.Peer do
        feefilter: st.feefilter || 0,
        provides_cmpct: st.provides_cmpct,
        timeoffset: (v[:time] && now(st) - v[:time]) || 0,
-       transport_protocol_type: transport_type(st.transport),
-       session_id:
-         (match?(%Transport{}, st.transport) && Transport.session_id(st.transport)) || nil
+       transport_protocol_type: Conn.transport_type(st.conn),
+       session_id: Conn.session_id(st.conn)
      }, st}
   end
-
-  defp transport_type(:v1), do: "v1"
-
-  defp transport_type(%Transport{} = t),
-    do: if(Transport.established?(t), do: "v2", else: "detecting")
 
   # --- frame & message dispatch ----------------------------------------------
 
@@ -426,18 +347,18 @@ defmodule Exnode.P2P.Peer do
     if blocked?(st) do
       {:noreply, st}
     else
-      case FrameBuffer.next(st.buf, st.p.magic) do
-        {:more, buf} ->
-          {:noreply, %{st | buf: buf}}
+      case Conn.next_v1_frame(st.conn) do
+        {:more, conn} ->
+          {:noreply, %{st | conn: conn}}
 
         {:error, reason} ->
           {:stop, {:shutdown, {:bad_frame, reason}}, st}
 
-        {:reject, _cmd, buf} ->
-          drain(%{st | buf: buf})
+        {:reject, _cmd, conn} ->
+          drain(%{st | conn: conn})
 
-        {:ok, cmd, payload, buf} ->
-          case process_message(%{st | buf: buf}, cmd, payload) do
+        {:ok, cmd, payload, conn} ->
+          case process_message(%{st | conn: conn}, cmd, payload) do
             {:ok, st} -> drain(st)
             stop -> stop
           end
@@ -449,12 +370,12 @@ defmodule Exnode.P2P.Peer do
   def getdata_pending?(st), do: not :queue.is_empty(st.getdata_queue)
 
   @doc false
-  def paused?(st), do: st.paused_since != nil
+  def paused?(st), do: Conn.paused?(st.conn)
 
   defp blocked?(st), do: getdata_pending?(st) or paused?(st)
 
   defp rearm({:noreply, st} = r) do
-    if not blocked?(st) and st.socket != nil, do: :inet.setopts(st.socket, active: :once)
+    if not blocked?(st), do: Conn.rearm(st.conn)
     r
   end
 
@@ -464,7 +385,7 @@ defmodule Exnode.P2P.Peer do
 
   defp dispatch(st, msgs) do
     if blocked?(st),
-      do: {:noreply, %{st | pending_msgs: st.pending_msgs ++ msgs}},
+      do: {:noreply, %{st | conn: Conn.append_pending(st.conn, msgs)}},
       else: dispatch_now(st, msgs)
   end
 
@@ -522,15 +443,9 @@ defmodule Exnode.P2P.Peer do
   end
 
   defp closing(st, reason) do
-    case st.transport do
-      %Transport{} = t ->
-        if Transport.should_reconnect_v1?(t),
-          do: {:stop, {:shutdown, {:reconnect_v1, reason}}, st},
-          else: {:stop, {:shutdown, reason}, st}
-
-      _ ->
-        {:stop, {:shutdown, reason}, st}
-    end
+    if Conn.should_reconnect_v1?(st.conn),
+      do: {:stop, {:shutdown, {:reconnect_v1, reason}}, st},
+      else: {:stop, {:shutdown, reason}, st}
   end
 
   # --- handshake -------------------------------------------------------------
@@ -718,14 +633,10 @@ defmodule Exnode.P2P.Peer do
     do: HeadersHandler.process_headers_message(st, headers)
 
   defp handle_msg({:block, payload}, st) do
-    result =
-      case Block.decode_exact(payload) do
-        {:ok, b} -> BlockSync.received_block(st, b)
-        {:error, _} -> {:ok, st}
-      end
-
-    :erlang.garbage_collect()
-    result
+    case Block.decode_exact(payload) do
+      {:ok, b} -> BlockSync.received_block(st, b)
+      {:error, _} -> {:ok, st}
+    end
   end
 
   defp handle_msg({:getheaders, gh}, st) do
@@ -895,21 +806,11 @@ defmodule Exnode.P2P.Peer do
   @doc false
   def push(st, msg) do
     {cmd, payload} = Message.encode(msg)
-
-    st =
-      case st.transport do
-        %Transport{} = t ->
-          {t, out} = Transport.send_message(t, cmd, payload)
-          send_bytes(%{st | transport: t}, out)
-
-        :v1 ->
-          send_bytes(st, Frame.encode(st.p.magic, cmd, payload))
-      end
-
-    trace(st, {:out, cmd})
+    conn = Conn.send_msg(st.conn, cmd, payload, now(st))
+    trace(%{st | conn: conn}, {:out, cmd})
   end
 
-  # --- internal helpers & writer ---------------------------------------------
+  # --- internal helpers ------------------------------------------------------
 
   defp target_addr(%{target: target}), do: NetAddr.from_target(target)
 
@@ -927,24 +828,14 @@ defmodule Exnode.P2P.Peer do
     end
   end
 
-  defp send_opts(st),
-    do: [
-      send_timeout: Map.get(st.node, :send_timeout_ms, @send_timeout_ms),
-      send_timeout_close: true
-    ]
-
   defp inactivity(st, now) do
-    last_send = Map.get(st, :last_send)
-    last_recv = Map.get(st, :last_recv)
-
-    cond do
-      st.connected_at == nil or now - st.connected_at <= @handshake_timeout_s -> nil
-      last_send == nil or last_recv == nil -> :no_message_in_connect_timeout
-      now > last_send + @timeout_interval_s -> :send_timeout
-      now > last_recv + @timeout_interval_s -> :receive_timeout
-      st.paused_since != nil and now > st.paused_since + @timeout_interval_s -> :send_buffer_full
-      true -> nil
-    end
+    Conn.inactivity_reason(
+      st.conn,
+      st.connected_at,
+      now,
+      @handshake_timeout_s,
+      @timeout_interval_s
+    )
   end
 
   defp desirable_services?(st, services) do
@@ -956,70 +847,6 @@ defmodule Exnode.P2P.Peer do
         else: Message.service(:network) ||| Message.service(:witness)
 
     (services &&& want) == want
-  end
-
-  defp send_bytes(st, bytes) do
-    case IO.iodata_length(bytes) do
-      0 ->
-        st
-
-      n ->
-        send(st.writer, {:write, bytes})
-        queued = st.send_queued + n
-
-        if queued > max_send_buffer(st) and st.paused_since == nil,
-          do: %{st | send_queued: queued, paused_since: now(st)},
-          else: %{st | send_queued: queued}
-    end
-  end
-
-  defp max_send_buffer(st), do: Map.get(st.node, :max_send_buffer, @max_send_buffer)
-
-  defp start_writer(st) do
-    peer = self()
-    sock = st.socket
-    send_fun = Map.get(st.node, :socket_send, &:gen_tcp.send/2)
-
-    pid =
-      spawn_link(fn ->
-        ref = Process.monitor(peer)
-        writer_loop(sock, send_fun, peer, ref)
-      end)
-
-    %{st | writer: pid}
-  end
-
-  defp writer_loop(sock, send_fun, peer, ref) do
-    receive do
-      {:write, data} ->
-        {data, n} = writer_collect([data], IO.iodata_length(data))
-
-        case send_fun.(sock, data) do
-          :ok ->
-            send(peer, {:sent, n})
-            writer_loop(sock, send_fun, peer, ref)
-
-          {:error, reason} ->
-            send(peer, {:send_failed, reason})
-        end
-
-      {:flush, from} ->
-        send(from, :flushed)
-        writer_loop(sock, send_fun, peer, ref)
-
-      {:DOWN, ^ref, :process, _, _} ->
-        :ok
-    end
-  end
-
-  defp writer_collect(acc, n) when n >= @writer_batch, do: {Enum.reverse(acc), n}
-
-  defp writer_collect(acc, n) do
-    receive do
-      {:write, data} -> writer_collect([data | acc], n + IO.iodata_length(data))
-    after
-      0 -> {Enum.reverse(acc), n}
-    end
   end
 
   defp trace(st, ev), do: Map.put(st, :trace, Enum.take([ev | Map.get(st, :trace, [])], 12))

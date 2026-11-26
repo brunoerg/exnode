@@ -58,7 +58,7 @@ defmodule Exnode.P2P.InactivityTest do
     # That tick pinged (2 min passed): we keep receiving pings, so only the
     # receive side times out. Wait for the writer's report of the send.
     {:ping, _} = read_until(sock, &match?({:ping, _}, &1))
-    wait_until(fn -> :sys.get_state(pid).last_send == Clock.now(clock) end)
+    wait_until(fn -> :sys.get_state(pid).conn.last_send == Clock.now(clock) end)
     # Past 20 minutes since the last bytes from the peer.
     Clock.advance(clock, 60 + 5)
     :ok = Clock.tick(pid)
