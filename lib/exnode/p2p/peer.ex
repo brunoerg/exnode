@@ -503,6 +503,11 @@ defmodule Exnode.P2P.Peer do
 
   defp blocked?(data), do: getdata_pending?(data) or paused?(data)
 
+  defp process_message({:ready, _} = state, data, "block", payload) do
+    data = Data.trace(data, {:in, "block"})
+    wrap_ready(state, BlockSync.received_block_payload(data, payload))
+  end
+
   defp process_message(state, data, cmd, payload) do
     case DecodeBudget.with_budget(data.node[:decode_budget], byte_size(payload), fn ->
            decode_and_handle(state, data, cmd, payload)
