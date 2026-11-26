@@ -151,16 +151,18 @@ defmodule Exnode.Store.KV do
     end
   end
 
-  # Point and batched lookups dominate (`txindex` and `spends`: mostly misses;
-  # `blockhash`, `headers`, `filters`, `poisoned`), so those families get
-  # whole-key bloom filters and interpolation-capable index search in the
-  # shared block cache. Hit-mostly families (`blockhash`, `headers`, `filters`)
-  # set `optimize_filters_for_hits` to skip bottommost-level filters (~90% of
-  # filter size). Dense/hit-only families (`blocks`, `locs`, `pending`) and
-  # prefix-scanned `scripthash` (whole-key bloom is ignored on `Seek` without
-  # a prefix extractor) omit bloom filters to keep filter memory for `txindex`
-  # and `spends`. Settings only affect new SST files, so existing stores open
-  # as is.
+  # Point and batched lookups dominate (`spends`, `poisoned`: mostly misses;
+  # `txindex`, `blockhash`, `headers`, `filters`: mostly hits), so those
+  # families get whole-key bloom filters and interpolation-capable index search
+  # in the shared block cache. Hit-mostly families (`txindex`, `blockhash`,
+  # `headers`, `filters`) set `optimize_filters_for_hits` to skip
+  # bottommost-level filters (~90% of filter size) while keeping filters on
+  # upper levels; past BIP34 on a linear chain, `txindex` skips history-miss
+  # reads on append so IBD lookups are hits for spent prevouts. Dense/hit-only
+  # families (`blocks`, `locs`, `pending`) and prefix-scanned `scripthash`
+  # (whole-key bloom is ignored on `Seek` without a prefix extractor) omit
+  # bloom filters to keep filter memory for `spends` and upper-level `txindex`.
+  # Settings only affect new SST files, so existing stores open as is.
   defp cf_options(cf, cache) do
     bloom =
       if cf in [:blocks, :locs, :pending, :scripthash],
@@ -184,7 +186,7 @@ defmodule Exnode.Store.KV do
       end
 
     hit_opts =
-      if cf in [:blockhash, :headers, :filters],
+      if cf in [:txindex, :blockhash, :headers, :filters],
         do: [optimize_filters_for_hits: true],
         else: []
 
