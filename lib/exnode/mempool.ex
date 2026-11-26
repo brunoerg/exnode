@@ -73,11 +73,28 @@ defmodule Exnode.Mempool do
   def accept(server, %Tx{} = tx, args \\ []),
     do: GenServer.call(server, {:accept, tx, args}, :infinity)
 
+  @doc """
+  Non-blocking `accept/3` for P2P callers (`TxRelay`). Runs context-free checks
+  synchronously and returns `:ok` (or `{:error, error}` immediately if rejected
+  context-free or the verification queue is full). When verification completes,
+  sends `{tag, {:ok, result} | {:error, error}}` to `reply_to`.
+  """
+  def accept_async(server, %Tx{} = tx, reply_to, tag, args \\ []),
+    do: GenServer.call(server, {:accept_async, tx, reply_to, tag, args}, :infinity)
+
   @doc "Core `testmempoolaccept`: one tx or a package; results per tx, nothing added."
   def test_accept(server, txs), do: GenServer.call(server, {:test_accept, txs}, :infinity)
 
   @doc "Core `submitpackage` (child with parents). Returns the package result."
   def submit_package(server, txs), do: GenServer.call(server, {:submit_package, txs}, :infinity)
+
+  @doc """
+  Non-blocking `submit_package/2` for P2P callers (`TxRelay` 1p1c). Runs
+  `submit_package` on `verify_sup` / asynchronously and delivers `{tag, reply}`
+  to `reply_to`.
+  """
+  def submit_package_async(server, txs, reply_to, tag),
+    do: GenServer.cast(server, {:submit_package_async, txs, reply_to, tag})
 
   @doc "Core `submitpackage` with RPC options (`:unbroadcast`, `:max_feerate`)."
   def submit_package(server, txs, opts),
@@ -215,6 +232,8 @@ defmodule Exnode.Mempool do
       pending_txids: MapSet.new(),
       # accepts waiting for a pending one they depend on, oldest first
       deferred: :queue.new(),
+      # [{tip_hash, from, timer_ref}] waiting on sync_to/2
+      tip_waiters: [],
       # a :refresh_lin message is in the mailbox
       refresh_queued: false,
       # {computed_at_ms, backlog/1's fee figures}
@@ -250,7 +269,6 @@ defmodule Exnode.Mempool do
 
   @impl true
   def handle_call({:accept, tx, args}, {origin, _} = from, st) do
-    st = sync(st)
     {unbroadcast, args} = Keyword.pop(args, :unbroadcast, false)
 
     cond do
@@ -262,13 +280,42 @@ defmodule Exnode.Mempool do
         {:reply, {:error, Accept.err(:reconsiderable, "mempool busy")}, st}
 
       true ->
-        job = %{from: from, origin: origin, tx: tx, args: args, unbroadcast: unbroadcast}
+        job = %{
+          reply: {:call, from},
+          origin: origin,
+          tx: tx,
+          args: args,
+          unbroadcast: unbroadcast
+        }
+
         {:noreply, start_accept(st, job)}
     end
   end
 
+  def handle_call({:accept_async, tx, reply_to, tag, args}, _from, st) do
+    {unbroadcast, args} = Keyword.pop(args, :unbroadcast, false)
+
+    cond do
+      (e = Accept.precheck_context_free(st.state, tx)) != :ok ->
+        {:reply, e, st}
+
+      map_size(st.jobs) + :queue.len(st.deferred) >= @max_pending_verifications ->
+        {:reply, {:error, Accept.err(:reconsiderable, "mempool busy")}, st}
+
+      true ->
+        job = %{
+          reply: {:send, reply_to, tag},
+          origin: reply_to,
+          tx: tx,
+          args: args,
+          unbroadcast: unbroadcast
+        }
+
+        {:reply, :ok, start_accept(st, job)}
+    end
+  end
+
   def handle_call({:test_accept, txs}, _from, st) do
-    st = sync(st)
     chain = chain_context(st, txs)
 
     reply =
@@ -281,18 +328,11 @@ defmodule Exnode.Mempool do
   end
 
   def handle_call({:submit_package, txs}, {origin, _}, st) do
-    st = sync(st)
-    chain = chain_context(st, txs)
-    {reply, s} = Package.accept(st.state, txs, chain)
-
-    for {:ok, tx, res} <- Package.accepted(reply, txs),
-        do: notify(st, {:mempool_accepted, tx, res, origin})
-
-    {:reply, reply, %{st | state: s} |> prune_unbroadcast() |> refresh_soon()}
+    {reply, st} = run_submit_package(st, txs, origin)
+    {:reply, reply, st}
   end
 
   def handle_call({:submit_package, txs, opts}, {origin, _}, st) do
-    st = sync(st)
     chain = chain_context(st, txs)
 
     {reply, s} =
@@ -317,7 +357,6 @@ defmodule Exnode.Mempool do
   def handle_call(:txids, _from, st), do: {:reply, Map.keys(st.state.pool.entries), st}
 
   def handle_call({:script_txs, sh, limit}, _from, st) do
-    st = sync(st)
     pool = st.state.pool
 
     ids = if Pool.indexes_scripts?(pool), do: Pool.script_txids(pool, sh)
@@ -341,7 +380,6 @@ defmodule Exnode.Mempool do
   end
 
   def handle_call({:spenders, outpoints}, _from, st) do
-    st = sync(st)
     pool = st.state.pool
 
     reply =
@@ -354,13 +392,11 @@ defmodule Exnode.Mempool do
   end
 
   def handle_call(:fee_rates, _from, st) do
-    st = sync(st)
     pool = st.state.pool
     {:reply, {for({_, e} <- pool.entries, do: {e.fee, e.vsize}), pool.total_vsize}, st}
   end
 
   def handle_call(:backlog, _from, st) do
-    st = sync(st)
     pool = st.state.pool
     now = System.monotonic_time(:millisecond)
 
@@ -399,7 +435,6 @@ defmodule Exnode.Mempool do
   end
 
   def handle_call(:stats, _from, st) do
-    st = sync(st)
     pool = st.state.pool
     {min_fee, fees} = Accept.min_fee(st.state, st.clock.())
     total_fee = Enum.reduce(pool.entries, 0, fn {_, e}, acc -> acc + e.fee end)
@@ -419,7 +454,6 @@ defmodule Exnode.Mempool do
   end
 
   def handle_call({:entry_details, txid}, _from, st) do
-    st = sync(st)
     pool = st.state.pool
 
     reply =
@@ -432,7 +466,6 @@ defmodule Exnode.Mempool do
   end
 
   def handle_call({:raw_mempool, true}, _from, st) do
-    st = sync(st)
     {pool, _} = Pool.cluster_chunks(st.state.pool)
 
     reply =
@@ -444,7 +477,6 @@ defmodule Exnode.Mempool do
   end
 
   def handle_call({:raw_mempool, false}, _from, st) do
-    st = sync(st)
     {pool, cluster_chunks} = Pool.cluster_chunks(st.state.pool)
 
     ordered =
@@ -518,8 +550,13 @@ defmodule Exnode.Mempool do
 
   def handle_call(:sequence, _from, st), do: {:reply, st.state.pool.sequence, st}
 
-  def handle_call({:sync_to, tip_hash}, _from, st) do
-    {:reply, :ok, sync_until(st, tip_hash)}
+  def handle_call({:sync_to, tip_hash}, from, st) do
+    if st.tip_hash == tip_hash do
+      {:reply, :ok, st}
+    else
+      tref = Process.send_after(self(), {:sync_to_timeout, from}, 30_000)
+      {:noreply, %{st | tip_waiters: [{tip_hash, from, tref} | st.tip_waiters]}}
+    end
   end
 
   defp pool_tx(st, h, kind) do
@@ -535,9 +572,34 @@ defmodule Exnode.Mempool do
     do:
       {:noreply, %{st | unbroadcast: Enum.reduce(txids, st.unbroadcast, &MapSet.delete(&2, &1))}}
 
+  def handle_cast({:submit_package_async, txs, reply_to, tag}, st) do
+    {reply, st} = run_submit_package(st, txs, reply_to)
+    send(reply_to, {tag, reply})
+    {:noreply, st}
+  end
+
   @impl true
-  def handle_info({:mempool_update, tip_hash, events}, st),
-    do: {:noreply, st |> apply_update(tip_hash, events) |> prune_unbroadcast() |> refresh_soon()}
+  def handle_info({:mempool_update, tip_hash, events}, st) do
+    st =
+      st
+      |> apply_update(tip_hash, events)
+      |> wake_tip_waiters()
+      |> prune_unbroadcast()
+      |> refresh_soon()
+
+    {:noreply, st}
+  end
+
+  def handle_info({:sync_to_timeout, from}, st) do
+    case Enum.split_with(st.tip_waiters, fn {_, f, _} -> f == from end) do
+      {[], _} ->
+        {:noreply, st}
+
+      {matched, rest} ->
+        for {_, f, _} <- matched, do: GenServer.reply(f, :ok)
+        {:noreply, %{st | tip_waiters: rest}}
+    end
+  end
 
   # A script verification ended.
   def handle_info({ref, kernel_result}, st) when is_map_key(st.jobs, ref) do
@@ -585,27 +647,32 @@ defmodule Exnode.Mempool do
   defp single_result(tx, {:ok, res, _}), do: {:ok, tx, res}
   defp single_result(tx, {:error, e, _}), do: {:error, tx, e}
 
-  # Apply every update already in the mailbox, so the pool matches the view
-  # the chain state will answer with (Core holds cs_main across both).
-  defp sync(st) do
-    receive do
-      {:mempool_update, tip_hash, events} -> st |> apply_update(tip_hash, events) |> sync()
-    after
-      0 -> st
+  defp wake_tip_waiters(%{tip_waiters: []} = st), do: st
+
+  defp wake_tip_waiters(st) do
+    {ready, waiting} =
+      Enum.split_with(st.tip_waiters, fn {tip_hash, _from, _tref} -> tip_hash == st.tip_hash end)
+
+    for {_h, from, tref} <- ready do
+      Process.cancel_timer(tref)
+      GenServer.reply(from, :ok)
     end
+
+    %{st | tip_waiters: waiting}
   end
 
-  defp sync_until(st, tip_hash) do
-    if st.tip_hash == tip_hash do
-      st
-    else
-      receive do
-        {:mempool_update, h, events} -> st |> apply_update(h, events) |> sync_until(tip_hash)
-      after
-        30_000 -> st
-      end
-    end
+  defp run_submit_package(st, txs, origin) do
+    chain = chain_context(st, txs)
+    {reply, s} = Package.accept(st.state, txs, chain)
+
+    for {:ok, tx, res} <- Package.accepted(reply, txs),
+        do: notify(st, {:mempool_accepted, tx, res, origin})
+
+    {reply, %{st | state: s} |> prune_unbroadcast() |> refresh_soon()}
   end
+
+  defp reply_job(%{reply: {:call, from}}, value), do: GenServer.reply(from, value)
+  defp reply_job(%{reply: {:send, pid, tag}}, value), do: send(pid, {tag, value})
 
   # --- single-tx accept with background script checks ----------------------------
 
@@ -620,7 +687,7 @@ defmodule Exnode.Mempool do
 
       case Accept.prepare(st.state, job.tx, chain, args) do
         {:error, e} ->
-          GenServer.reply(job.from, {:error, e})
+          reply_job(job, {:error, e})
           st
 
         {:ok, ws} ->
@@ -664,7 +731,7 @@ defmodule Exnode.Mempool do
     {job, jobs} = Map.pop(st.jobs, ref)
 
     st = %{
-      sync(st)
+      st
       | jobs: jobs,
         pending_spends: Map.drop(st.pending_spends, inputs(job.tx)),
         pending_txids: MapSet.delete(st.pending_txids, job.tx.txid)
@@ -726,7 +793,7 @@ defmodule Exnode.Mempool do
     case reply do
       {:ok, res, s} ->
         notify(st, {:mempool_accepted, job.tx, res, job.origin})
-        GenServer.reply(job.from, {:ok, res})
+        reply_job(job, {:ok, res})
 
         unbroadcast =
           if job.unbroadcast, do: MapSet.put(st.unbroadcast, job.tx.txid), else: st.unbroadcast
@@ -734,11 +801,11 @@ defmodule Exnode.Mempool do
         %{st | state: s, unbroadcast: unbroadcast}
 
       {:error, e, s} ->
-        GenServer.reply(job.from, {:error, e})
+        reply_job(job, {:error, e})
         %{st | state: s}
 
       {:error, e} ->
-        GenServer.reply(job.from, {:error, e})
+        reply_job(job, {:error, e})
         st
     end
   end
