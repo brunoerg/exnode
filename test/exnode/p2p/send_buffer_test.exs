@@ -86,7 +86,7 @@ defmodule Exnode.P2P.SendBufferTest do
     {pid, sock}
   end
 
-  defp peer_state(pid), do: :sys.get_state(pid)
+  defp peer_state(pid), do: elem(:sys.get_state(pid), 1)
 
   # Reads invs until every tx of `txs` was announced (by txid or wtxid,
   # whichever the peer negotiated).
@@ -113,12 +113,12 @@ defmodule Exnode.P2P.SendBufferTest do
     wait_until(fn -> peer_state(pid).conn.paused_since != nil end)
     st = peer_state(pid)
     assert st.conn.send_queued > @limit
-    left = :queue.len(st.getdata_queue)
+    left = :queue.len(st.proto.getdata_queue)
     assert left > 0 and left < 10
 
     # No progress while paused, through a full pass of the peer.
     :ok = Clock.tick(pid)
-    assert :queue.len(peer_state(pid).getdata_queue) == left
+    assert :queue.len(peer_state(pid).proto.getdata_queue) == left
     # The peer process is not blocked in a socket send: calls are answered.
     assert %{conn_type: :outbound_full_relay} =
              Task.await(Task.async(fn -> Peer.info(pid) end), 1_000)
@@ -131,7 +131,7 @@ defmodule Exnode.P2P.SendBufferTest do
     wait_until(fn -> peer_state(pid).conn.send_queued == 0 end)
     st = peer_state(pid)
     assert st.conn.paused_since == nil
-    assert :queue.is_empty(st.getdata_queue)
+    assert :queue.is_empty(st.proto.getdata_queue)
   end
 
   test "paused with nothing queued: the next message waits until the buffer drains",
@@ -151,7 +151,7 @@ defmodule Exnode.P2P.SendBufferTest do
 
     wait_until(fn -> peer_state(pid).conn.paused_since != nil end)
     st = peer_state(pid)
-    assert :queue.is_empty(st.getdata_queue)
+    assert :queue.is_empty(st.proto.getdata_queue)
     # Only the blocks are queued: the ping was not processed (no pong).
     assert st.conn.send_queued == Enum.at(sizes, k - 1)
     # A periodic pass still runs while paused (Core SendMessages: it may
@@ -206,7 +206,7 @@ defmodule Exnode.P2P.SendBufferTest do
     st = peer_state(pid)
     # Core breaks out of the tx loop at the pause: only a few were pushed, the
     # rest are back in the queue, in order.
-    left = :queue.to_list(st.getdata_queue)
+    left = :queue.to_list(st.proto.getdata_queue)
     assert length(left) > 0 and length(left) < 20
     assert left == Enum.take(items, -length(left))
 
@@ -238,15 +238,16 @@ defmodule Exnode.P2P.SendBufferTest do
 
     Clock.advance(clock, 1)
 
-    :sys.replace_state(pid, fn st ->
-      %{
-        st
-        | conn: %{
-            st.conn
-            | last_send: st.conn.paused_since + 20 * 60,
-              last_recv: st.conn.paused_since + 20 * 60
-          }
-      }
+    :sys.replace_state(pid, fn {s, st} ->
+      {s,
+       %{
+         st
+         | conn: %{
+             st.conn
+             | last_send: st.conn.paused_since + 20 * 60,
+               last_recv: st.conn.paused_since + 20 * 60
+           }
+       }}
     end)
 
     :ok = Clock.tick(pid)

@@ -233,7 +233,7 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
     # Every peer holds its partial frame.
     for %{pid: p} <- peers do
       wait_until(
-        fn -> FrameBuffer.size(:sys.get_state(p).conn.buf) == byte_size(head) end,
+        fn -> FrameBuffer.size(elem(:sys.get_state(p), 1).conn.buf) == byte_size(head) end,
         30_000
       )
     end

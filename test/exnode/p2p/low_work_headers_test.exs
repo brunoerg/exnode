@@ -39,7 +39,7 @@ defmodule Exnode.P2P.LowWorkHeadersTest do
   # so the only getheaders it sends are answers to our headers).
   defp connect(n, params) do
     {pid, sock} = FakePeer.connect_from(n, params: params, node: %{tick_ms: nil})
-    wait_until(fn -> :sys.get_state(pid).verack_received end)
+    wait_until(fn -> match?({{:ready, _}, _}, :sys.get_state(pid)) end)
     {pid, sock}
   end
 
@@ -68,13 +68,13 @@ defmodule Exnode.P2P.LowWorkHeadersTest do
     [{"getheaders", payload}] = FakePeer.recv(sock, ["getheaders"], 1)
     {:ok, {:getheaders, %{locator: [top | _]}}} = Message.decode("getheaders", payload)
     assert top == List.last(first).hash
-    assert :sys.get_state(pid).headers_sync != nil
+    assert elem(:sys.get_state(pid), 1).proto.headers_sync != nil
     assert best_height(n) == 0
 
     # 10 more, not a full message: the chain ends below the threshold.
     :ok = FakePeer.send_msgs(sock, {:headers, rest})
     barrier(sock)
-    assert :sys.get_state(pid).headers_sync == nil
+    assert elem(:sys.get_state(pid), 1).proto.headers_sync == nil
     assert best_height(n) == 0
     assert Process.alive?(pid)
   end
@@ -83,7 +83,7 @@ defmodule Exnode.P2P.LowWorkHeadersTest do
     {pid, sock} = connect(n, low_work_params())
     :ok = FakePeer.send_msgs(sock, {:headers, Enum.take(headers, 100)})
     barrier(sock)
-    assert :sys.get_state(pid).headers_sync == nil
+    assert elem(:sys.get_state(pid), 1).proto.headers_sync == nil
     assert best_height(n) == 0
     assert Process.alive?(pid)
   end

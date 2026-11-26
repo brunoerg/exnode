@@ -72,7 +72,7 @@ defmodule Exnode.P2P.GetdataTxAnnouncedTest do
       )
 
     FakePeer.recv(sock, ["verack"], 1)
-    wait_until(fn -> :sys.get_state(pid).verack_received end)
+    wait_until(fn -> match?({{:ready, _}, _}, :sys.get_state(pid)) end)
     {pid, sock}
   end
 

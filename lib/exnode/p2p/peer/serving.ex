@@ -10,6 +10,8 @@ defmodule Exnode.P2P.Peer.Serving do
   alias Exnode.Chain.State, as: ChainState
   alias Exnode.Codec.{Block, Header, Tx}
   alias Exnode.P2P.{BlockServing, CompactBlock, Message, Peer, TxRelay}
+  alias Exnode.P2P.Peer.Data
+  alias Exnode.P2P.Peer.Data.Proto
 
   @max_cmpctblock_depth 5
   @max_blocktxn_depth 10
@@ -18,12 +20,12 @@ defmodule Exnode.P2P.Peer.Serving do
   @getdata_tx_per_pass 1_000
 
   @doc "Core `ProcessMessage` `GETHEADERS`."
-  def serve_getheaders(st, %{locator: loc, hash_stop: stop}) do
+  def serve_getheaders(%Data{} = data, %{locator: loc, hash_stop: stop}) do
     if length(loc) > Message.max_locator_sz() do
-      {:stop, {:shutdown, :locator_too_large}, st}
+      {:stop, {:shutdown, :locator_too_large}, data}
     else
-      idx = Headers.index(st.node.headers)
-      tip = active_tip_entry(st, idx)
+      idx = Headers.index(data.node.headers)
+      tip = active_tip_entry(data, idx)
 
       on_active = fn e ->
         e.height <= tip.height and HeaderIndex.ancestor(idx, tip, e.height).hash == e.hash
@@ -50,35 +52,37 @@ defmodule Exnode.P2P.Peer.Serving do
           |> Enum.reverse()
         end
 
-      {:ok, Peer.push(st, {:headers, headers})}
+      {:ok, Peer.push(data, {:headers, headers})}
     end
   end
 
   @doc "Core `ProcessGetData`: serves leading tx items, then at most one block item."
-  def process_getdata(st) do
-    {tx_items, q} = take_tx_items(st.getdata_queue, [], 0)
-    st = serve_txs(%{st | getdata_queue: q}, tx_items)
+  def process_getdata(%Data{proto: %Proto{} = proto} = data) do
+    {tx_items, q} = take_tx_items(proto.getdata_queue, [], 0)
+    data = serve_txs(%{data | proto: %{proto | getdata_queue: q}}, tx_items)
 
     result =
-      if Peer.paused?(st) do
-        {:ok, st}
+      if Peer.paused?(data) do
+        {:ok, data}
       else
-        case :queue.out(st.getdata_queue) do
+        case :queue.out(data.proto.getdata_queue) do
           {{:value, %{type: t} = item}, q} when t in [:block, :cmpct_block] ->
-            serve_block(%{st | getdata_queue: q}, item)
+            serve_block(Data.update_proto(data, &%{&1 | getdata_queue: q}), item)
 
           {{:value, %{type: t}}, q} when t not in [:tx, :wtx, :block, :cmpct_block] ->
-            {:ok, %{st | getdata_queue: q}}
+            {:ok, Data.update_proto(data, &%{&1 | getdata_queue: q})}
 
           _ ->
-            {:ok, st}
+            {:ok, data}
         end
       end
 
     case result do
-      {:ok, st} ->
-        if Peer.getdata_pending?(st) and not Peer.paused?(st), do: send(self(), :continue_getdata)
-        {:ok, st}
+      {:ok, data} ->
+        if Peer.getdata_pending?(data) and not Peer.paused?(data),
+          do: send(self(), :continue_getdata)
+
+        {:ok, data}
 
       stop ->
         stop
@@ -86,32 +90,32 @@ defmodule Exnode.P2P.Peer.Serving do
   end
 
   @doc "Core `ProcessGetBlockTxn`."
-  def serve_getblocktxn(st, payload) do
+  def serve_getblocktxn(%Data{} = data, payload) do
     case CompactBlock.decode_getblocktxn(payload) do
       {:error, why} ->
-        Peer.dropped(st, "getblocktxn", why)
+        Peer.dropped(data, "getblocktxn", why)
 
       {:ok, _hash, []} ->
-        {:stop, {:shutdown, :empty_getblocktxn}, st}
+        {:stop, {:shutdown, :empty_getblocktxn}, data}
 
       {:ok, hash, indexes} ->
-        tip_h = ChainState.view_tip(ChainState.view(st.node.chain_state)).height
+        tip_h = ChainState.view_tip(ChainState.view(data.node.chain_state)).height
 
-        case active_block(st, hash) do
+        case active_block(data, hash) do
           :notfound ->
-            {:ok, st}
+            {:ok, data}
 
           {:ok, h, raw} when tip_h - h >= @max_blocktxn_depth ->
-            {:ok, Peer.push(st, {:block, raw})}
+            {:ok, Peer.push(data, {:block, raw})}
 
           {:ok, _h, raw} ->
             {:ok, ranges} = Block.tx_ranges(raw)
 
             if List.last(indexes) >= tuple_size(ranges) do
-              Peer.misbehaving(st, "getblocktxn with out-of-bounds tx indices")
+              Peer.misbehaving(data, "getblocktxn with out-of-bounds tx indices")
             else
               txs = select_txs(raw, ranges, indexes)
-              {:ok, Peer.push(st, {:blocktxn, CompactBlock.encode_blocktxn_raw(hash, txs)})}
+              {:ok, Peer.push(data, {:blocktxn, CompactBlock.encode_blocktxn_raw(hash, txs)})}
             end
         end
     end
@@ -126,70 +130,70 @@ defmodule Exnode.P2P.Peer.Serving do
   end
 
   @doc "Core `SendMessages` block announcements."
-  def maybe_announce_blocks(st) do
-    view = st.node[:chain_state] && ChainState.view(st.node.chain_state)
+  def maybe_announce_blocks(%Data{proto: %Proto{} = proto} = data) do
+    view = data.node[:chain_state] && ChainState.view(data.node.chain_state)
     tip = view && ChainState.view_tip(view)
 
     cond do
-      not st.verack_received or tip == nil or tip.hash == st.announced ->
-        st
+      tip == nil or tip.hash == proto.announced ->
+        data
 
-      st.announced == nil ->
-        %{st | announced: tip.hash}
+      proto.announced == nil ->
+        Data.update_proto(data, &%{&1 | announced: tip.hash})
 
-      Peer.initial_block_download?(st) ->
-        %{st | announced: tip.hash}
+      Peer.initial_block_download?(data) ->
+        Data.update_proto(data, &%{&1 | announced: tip.hash})
 
       true ->
-        announce_new_blocks(st, tip)
+        announce_new_blocks(data, tip)
     end
   end
 
   # --- internal helpers -------------------------------------------------------
 
-  defp active_tip_entry(st, idx) do
-    tip = ChainState.view_tip(ChainState.view(st.node.chain_state))
+  defp active_tip_entry(data, idx) do
+    tip = ChainState.view_tip(ChainState.view(data.node.chain_state))
     HeaderIndex.lookup(idx, tip.hash)
   end
 
-  defp active_block_ref(st, hash) do
-    reader = ChainState.view_reader(ChainState.view(st.node.chain_state))
+  defp active_block_ref(data, hash) do
+    reader = ChainState.view_reader(ChainState.view(data.node.chain_state))
 
     with id when id != nil <- Archive.block_id(reader, hash),
          true <- Archive.on_chain?(reader, id),
          true <- Archive.witness_pruned(reader) < 0 or not Archive.witness_pruned?(reader, id) do
-      e = HeaderIndex.lookup(Headers.index(st.node.headers), hash)
+      e = HeaderIndex.lookup(Headers.index(data.node.headers), hash)
       {:ok, reader, id, e.height}
     else
       _ -> :notfound
     end
   end
 
-  defp active_block(st, hash) do
-    with {:ok, reader, id, height} <- active_block_ref(st, hash),
+  defp active_block(data, hash) do
+    with {:ok, reader, id, height} <- active_block_ref(data, hash),
          {:ok, {:block, raw}} <-
-           cached_block(st, reader, id, hash, :witness, near_tip?(st, height)) do
+           cached_block(data, reader, id, hash, :witness, near_tip?(data, height)) do
       {:ok, height, raw}
     else
       _ -> :notfound
     end
   end
 
-  defp cached_block(st, reader, id, hash, format, priority) do
+  defp cached_block(data, reader, id, hash, format, priority) do
     BlockServing.get(
-      st.node[:block_serving],
+      data.node[:block_serving],
       reader,
       id,
       hash,
       format,
-      Map.get(st.node, :decode_block, &Block.decode_exact/1),
+      Map.get(data.node, :decode_block, &Block.decode_exact/1),
       priority
     )
   end
 
-  defp near_tip?(st, height),
+  defp near_tip?(data, height),
     do:
-      ChainState.view_tip(ChainState.view(st.node.chain_state)).height - height <
+      ChainState.view_tip(ChainState.view(data.node.chain_state)).height - height <
         @max_blocktxn_depth
 
   defp take_tx_items(q, acc, n) when n >= @getdata_tx_per_pass, do: {Enum.reverse(acc), q}
@@ -204,30 +208,34 @@ defmodule Exnode.P2P.Peer.Serving do
     end
   end
 
-  defp serve_txs(st, []), do: st
+  defp serve_txs(data, []), do: data
 
-  defp serve_txs(st, tx_items) do
-    if st.node[:tx_relay] != nil and st.conn_type != :block_relay and st.version.relay do
-      {txs, missing} = TxRelay.lookup(st.node.tx_relay, tx_items)
-      {st, rest, notfound} = push_txs(st, tx_items, txs, MapSet.new(missing), [])
-      st = if notfound != [], do: Peer.push(st, {:notfound, notfound}), else: st
-      %{st | getdata_queue: :queue.join(:queue.from_list(rest), st.getdata_queue)}
+  defp serve_txs(data, tx_items) do
+    if data.node[:tx_relay] != nil and data.conn_type != :block_relay and
+         data.handshake.version.relay do
+      {txs, missing} = TxRelay.lookup(data.node.tx_relay, tx_items)
+      {data, rest, notfound} = push_txs(data, tx_items, txs, MapSet.new(missing), [])
+      data = if notfound != [], do: Peer.push(data, {:notfound, notfound}), else: data
+
+      Data.update_proto(data, fn proto ->
+        %{proto | getdata_queue: :queue.join(:queue.from_list(rest), proto.getdata_queue)}
+      end)
     else
-      st
+      data
     end
   end
 
-  defp push_txs(st, [], _txs, _missing, nf), do: {st, [], Enum.reverse(nf)}
+  defp push_txs(data, [], _txs, _missing, nf), do: {data, [], Enum.reverse(nf)}
 
-  defp push_txs(st, [i | rest] = items, txs, missing, nf) do
-    if Peer.paused?(st) do
-      {st, items, Enum.reverse(nf)}
+  defp push_txs(data, [i | rest] = items, txs, missing, nf) do
+    if Peer.paused?(data) do
+      {data, items, Enum.reverse(nf)}
     else
       if MapSet.member?(missing, i) do
-        push_txs(st, rest, txs, missing, [i | nf])
+        push_txs(data, rest, txs, missing, [i | nf])
       else
         [tx | txs] = txs
-        push_txs(Peer.push(st, {:tx, tx_bytes(tx, i)}), rest, txs, missing, nf)
+        push_txs(Peer.push(data, {:tx, tx_bytes(tx, i)}), rest, txs, missing, nf)
       end
     end
   end
@@ -237,16 +245,16 @@ defmodule Exnode.P2P.Peer.Serving do
 
   defp tx_bytes(tx, _item), do: tx.raw
 
-  defp serve_block(st, item) do
-    tip_h = ChainState.view_tip(ChainState.view(st.node.chain_state)).height
-    limited = Bitwise.band(st.node.services, Message.service(:network)) == 0
+  defp serve_block(data, item) do
+    tip_h = ChainState.view_tip(ChainState.view(data.node.chain_state)).height
+    limited = Bitwise.band(data.node.services, Message.service(:network)) == 0
 
-    case active_block_ref(st, item.hash) do
+    case active_block_ref(data, item.hash) do
       :notfound ->
-        {:ok, Peer.push(st, {:notfound, [item]})}
+        {:ok, Peer.push(data, {:notfound, [item]})}
 
       {:ok, _, _, h} when limited and tip_h - h > @node_network_limited_min_blocks + 2 ->
-        {:stop, {:shutdown, :request_below_network_limited_threshold}, st}
+        {:stop, {:shutdown, :request_below_network_limited_threshold}, data}
 
       {:ok, reader, id, h} ->
         format =
@@ -256,20 +264,20 @@ defmodule Exnode.P2P.Peer.Serving do
             true -> :stripped
           end
 
-        case cached_block(st, reader, id, item.hash, format, tip_h - h < @max_blocktxn_depth) do
-          {:ok, msg} -> {:ok, Peer.push(st, msg)}
-          :notfound -> {:ok, Peer.push(st, {:notfound, [item]})}
+        case cached_block(data, reader, id, item.hash, format, tip_h - h < @max_blocktxn_depth) do
+          {:ok, msg} -> {:ok, Peer.push(data, msg)}
+          :notfound -> {:ok, Peer.push(data, {:notfound, [item]})}
         end
     end
   end
 
-  defp announce_new_blocks(st, tip) do
-    idx = Headers.index(st.node.headers)
+  defp announce_new_blocks(%Data{proto: %Proto{} = proto} = data, tip) do
+    idx = Headers.index(data.node.headers)
     tip_e = HeaderIndex.lookup(idx, tip.hash)
-    prev = HeaderIndex.lookup(idx, st.announced)
+    prev = HeaderIndex.lookup(idx, proto.announced)
 
     known =
-      [st.best_known, prev]
+      [proto.best_known, prev]
       |> Enum.filter(
         &(&1 != nil and &1.height <= tip_e.height and
             HeaderIndex.ancestor(idx, tip_e, &1.height).hash == &1.hash)
@@ -283,25 +291,25 @@ defmodule Exnode.P2P.Peer.Serving do
         k -> for h <- (k.height + 1)..tip_e.height, do: HeaderIndex.ancestor(idx, tip_e, h)
       end
 
-    st = %{st | announced: tip.hash}
+    data = Data.update_proto(data, &%{&1 | announced: tip.hash})
 
     cond do
       new == [] ->
-        st
+        data
 
-      st.hb_requested and new != nil and length(new) == 1 ->
-        with {:ok, reader, id, _} <- active_block_ref(st, tip.hash),
-             {:ok, msg} <- cached_block(st, reader, id, tip.hash, :compact, true) do
-          Peer.push(st, msg)
+      proto.hb_requested and new != nil and length(new) == 1 ->
+        with {:ok, reader, id, _} <- active_block_ref(data, tip.hash),
+             {:ok, msg} <- cached_block(data, reader, id, tip.hash, :compact, true) do
+          Peer.push(data, msg)
         else
-          _ -> Peer.push(st, {:inv, [%{type: :block, hash: tip.hash}]})
+          _ -> Peer.push(data, {:inv, [%{type: :block, hash: tip.hash}]})
         end
 
-      st.prefers_headers and new != nil and length(new) <= @max_blocks_to_announce ->
-        Peer.push(st, {:headers, Enum.map(new, &decode_header(&1.raw))})
+      proto.prefers_headers and new != nil and length(new) <= @max_blocks_to_announce ->
+        Peer.push(data, {:headers, Enum.map(new, &decode_header(&1.raw))})
 
       true ->
-        Peer.push(st, {:inv, [%{type: :block, hash: tip.hash}]})
+        Peer.push(data, {:inv, [%{type: :block, hash: tip.hash}]})
     end
   end
 
