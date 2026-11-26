@@ -567,6 +567,7 @@ defmodule Exnode.Node do
             {Exnode.P2P.TxRelay,
              name: n.tx_relay,
              mempool: n.mempool,
+             mempool_policies: true,
              peer_sup: n.peer_sup,
              clock: fn -> Exnode.Clock.now_ms(clock) end}
           ]),

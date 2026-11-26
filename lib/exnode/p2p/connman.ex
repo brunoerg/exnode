@@ -160,6 +160,7 @@ defmodule Exnode.P2P.Connman do
         ),
       evict_grace_ms: Keyword.get(opts, :evict_grace_ms, @evict_grace_ms),
       peers: %{},
+      monitors: %{},
       # Discouraged IPs (no port) with their insertion times, 24 h TTL, saved
       # to discouraged.dat, by unix time.
       discouraged:
@@ -299,8 +300,17 @@ defmodule Exnode.P2P.Connman do
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{dns: {:running, ref}} = st),
     do: {:noreply, %{st | dns: :idle}}
 
-  def handle_info({:DOWN, _ref, :process, pid, reason}, st) do
+  def handle_info({:DOWN, ref, :process, pid, reason}, st) do
+    if Map.get(st.monitors, pid) == ref do
+      handle_peer_down(st, pid, reason)
+    else
+      {:noreply, st}
+    end
+  end
+
+  defp handle_peer_down(st, pid, reason) do
     {peer, peers} = Map.pop(st.peers, pid)
+    monitors = Map.delete(st.monitors, pid)
 
     if peer do
       level = if match?({:shutdown, {:connect_failed, _}}, reason), do: :debug, else: :info
@@ -311,7 +321,7 @@ defmodule Exnode.P2P.Connman do
       )
     end
 
-    st = %{st | peers: peers}
+    st = %{st | peers: peers, monitors: monitors}
 
     # Core FinalizeNode: AddrMan::Connected for full outbound peers that
     # completed the handshake (not block-relay, inbound or feeler).
@@ -763,7 +773,13 @@ defmodule Exnode.P2P.Connman do
   end
 
   defp track(st, pid, type, target, v2 \\ false) do
-    Process.monitor(pid)
+    st =
+      if Map.has_key?(st.monitors, pid) do
+        st
+      else
+        %{st | monitors: Map.put(st.monitors, pid, Process.monitor(pid))}
+      end
+
     group = if target, do: AddrMan.group(addr_key(target)), else: nil
 
     put_in(st.peers[pid], %{

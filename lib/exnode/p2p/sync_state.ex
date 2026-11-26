@@ -40,36 +40,55 @@ defmodule Exnode.P2P.SyncState do
   @max_protected 4
 
   @impl true
-  def init(:ok), do: {:ok, %{started: %{}, protected: %{}}}
+  def init(:ok), do: {:ok, %{started: MapSet.new(), protected: MapSet.new(), monitors: %{}}}
 
   @impl true
   def handle_call({:try_start, peer, preferred, recent}, _from, st) do
-    if Map.has_key?(st.started, peer) do
+    if MapSet.member?(st.started, peer) do
       {:reply, false, st}
     else
-      if (map_size(st.started) == 0 and preferred) or recent do
-        ref = Process.monitor(peer)
-        {:reply, true, put_in(st.started[peer], ref)}
+      if (MapSet.size(st.started) == 0 and preferred) or recent do
+        st = ensure_monitored(st, peer)
+        {:reply, true, %{st | started: MapSet.put(st.started, peer)}}
       else
         {:reply, false, st}
       end
     end
   end
 
-  def handle_call(:count, _from, st), do: {:reply, map_size(st.started), st}
+  def handle_call(:count, _from, st), do: {:reply, MapSet.size(st.started), st}
 
   def handle_call({:try_protect, peer}, _from, st) do
-    if Map.has_key?(st.protected, peer) or map_size(st.protected) >= @max_protected do
+    if MapSet.member?(st.protected, peer) or MapSet.size(st.protected) >= @max_protected do
       {:reply, false, st}
     else
-      ref = Process.monitor(peer)
-      {:reply, true, put_in(st.protected[peer], ref)}
+      st = ensure_monitored(st, peer)
+      {:reply, true, %{st | protected: MapSet.put(st.protected, peer)}}
     end
   end
 
   @impl true
-  def handle_info({:DOWN, _ref, :process, peer, _}, st) do
-    {:noreply,
-     %{st | started: Map.delete(st.started, peer), protected: Map.delete(st.protected, peer)}}
+  def handle_info({:DOWN, ref, :process, peer, _}, st) do
+    case Map.get(st.monitors, peer) do
+      ^ref ->
+        {:noreply,
+         %{
+           st
+           | started: MapSet.delete(st.started, peer),
+             protected: MapSet.delete(st.protected, peer),
+             monitors: Map.delete(st.monitors, peer)
+         }}
+
+      _ ->
+        {:noreply, st}
+    end
+  end
+
+  defp ensure_monitored(st, peer) do
+    if Map.has_key?(st.monitors, peer) do
+      st
+    else
+      %{st | monitors: Map.put(st.monitors, peer, Process.monitor(peer))}
+    end
   end
 end

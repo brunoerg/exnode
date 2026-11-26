@@ -136,7 +136,9 @@ defmodule Exnode.P2P.TxRelay do
 
     base = %{
       mempool: Keyword.fetch!(opts, :mempool),
+      mempool_policies: Keyword.get(opts, :mempool_policies, false),
       peers: %{},
+      monitors: %{},
       ann: %{},
       ann_peers: %{},
       ann_seq: 0,
@@ -238,30 +240,38 @@ defmodule Exnode.P2P.TxRelay do
 
   @impl true
   def handle_cast({:connected, peer, info}, st) do
-    Process.monitor(peer)
-    now = st.now.()
-    st = refresh_our_feefilter(st, now)
-    relay_txs = Map.get(info, :relay_txs, false)
-    sent_rate = if relay_txs, do: st.our_feefilter, else: 0
+    if Map.has_key?(st.peers, peer) do
+      {:noreply, update_in(st.peers[peer], &Map.merge(&1, info))}
+    else
+      st =
+        if Map.has_key?(st.monitors, peer),
+          do: st,
+          else: %{st | monitors: Map.put(st.monitors, peer, Process.monitor(peer))}
 
-    p =
-      Map.merge(
-        %{
-          known: nil,
-          known_in: nil,
-          to_send: [],
-          feefilter: 0,
-          sent_feefilter: sent_rate,
-          next_feefilter_at: now + exp_delay(@feefilter_interval_ms),
-          next_inv_at: now + inv_delay(info),
-          last_inv_seq: 0
-        },
-        info
-      )
+      now = st.now.()
+      st = refresh_our_feefilter(st, now)
+      relay_txs = Map.get(info, :relay_txs, false)
+      sent_rate = if relay_txs, do: st.our_feefilter, else: 0
 
-    # Core SendMessages: send feefilter only to peers that relay transactions.
-    if relay_txs, do: send(peer, {:send, {:feefilter, sent_rate}})
-    {:noreply, %{st | peers: Map.put(st.peers, peer, p)}}
+      p =
+        Map.merge(
+          %{
+            known: nil,
+            known_in: nil,
+            to_send: [],
+            feefilter: 0,
+            sent_feefilter: sent_rate,
+            next_feefilter_at: now + exp_delay(@feefilter_interval_ms),
+            next_inv_at: now + inv_delay(info),
+            last_inv_seq: 0
+          },
+          info
+        )
+
+      # Core SendMessages: send feefilter only to peers that relay transactions.
+      if relay_txs, do: send(peer, {:send, {:feefilter, sent_rate}})
+      {:noreply, %{st | peers: Map.put(st.peers, peer, p)}}
+    end
   end
 
   def handle_cast({:announce, tx, source}, st), do: {:noreply, queue_announce(st, tx, source)}
@@ -427,19 +437,39 @@ defmodule Exnode.P2P.TxRelay do
     {:noreply, st |> orphan_work_step() |> schedule_orphan_work()}
   end
 
-  def handle_info({:DOWN, _, :process, peer, _}, st) do
+  def handle_info({:DOWN, ref, :process, peer, _}, st) do
+    case Map.get(st.monitors, peer) do
+      ^ref ->
+        drop_peer(st, peer)
+
+      nil ->
+        {:noreply, st}
+
+      other_ref ->
+        # A test may inject a synthetic {:DOWN, make_ref(), :process, peer, _}
+        # to simulate an ordered disconnect without killing the peer process.
+        if Map.has_key?(st.peers, peer) do
+          Process.demonitor(other_ref, [:flush])
+          drop_peer(st, peer)
+        else
+          {:noreply, st}
+        end
+    end
+  end
+
+  def handle_info(_msg, st), do: {:noreply, st}
+
+  defp drop_peer(st, peer) do
     orph = Orphanage.erase_for_peer(Orphanage.from_state(st), peer)
     rt = RequestTracker.drop_peer(RequestTracker.from_state(st), peer)
 
     st =
-      %{st | peers: Map.delete(st.peers, peer)}
+      %{st | peers: Map.delete(st.peers, peer), monitors: Map.delete(st.monitors, peer)}
       |> put_orphanage(orph)
       |> put_tracker(rt)
 
     {:noreply, st}
   end
-
-  def handle_info(_msg, st), do: {:noreply, st}
 
   # --- state adapters -----------------------------------------------------------
 
@@ -784,6 +814,8 @@ defmodule Exnode.P2P.TxRelay do
 
   # Core PeerManagerImpl::ReattemptInitialBroadcast: every 10..15 min on the
   # node clock, re-queue unbroadcast mempool txids for inv announcement.
+  defp maybe_rebroadcast(%{mempool_policies: false} = st, _now), do: st
+
   defp maybe_rebroadcast(st, now) do
     cond do
       # Clock moved backwards (e.g. setmocktime after node startup): rebase timer.
@@ -823,15 +855,12 @@ defmodule Exnode.P2P.TxRelay do
   end
 
   defp fetch_unbroadcast_txids(mempool) do
-    if real_mempool?(mempool) do
-      try do
-        Mempool.unbroadcast_txids(mempool)
-      catch
-        :exit, _ -> []
-      end
-    else
-      []
+    case GenServer.call(mempool, :unbroadcast_txids, 5_000) do
+      txids when is_list(txids) -> txids
+      _ -> []
     end
+  catch
+    :exit, _ -> []
   end
 
   # Core BIP133 dynamic feefilter: update `relay_txs` peers when
@@ -874,30 +903,21 @@ defmodule Exnode.P2P.TxRelay do
 
   defp material_feefilter_change?(rate, sent), do: 4 * rate < 3 * sent or 3 * rate > 4 * sent
 
+  defp refresh_our_feefilter(%{mempool_policies: false} = st, now),
+    do: %{st | last_feefilter_check: now}
+
   defp refresh_our_feefilter(st, now) do
     rate =
-      if real_mempool?(st.mempool) do
-        try do
-          {min_fee, opts} = Mempool.fee_info(st.mempool)
-          max(min_fee, opts.min_relay)
-        catch
-          :exit, _ -> st.our_feefilter
+      try do
+        case Mempool.fee_info(st.mempool) do
+          {min_fee, %{min_relay: min_relay}} -> max(min_fee, min_relay)
+          _ -> st.our_feefilter
         end
-      else
-        st.our_feefilter
+      catch
+        :exit, _ -> st.our_feefilter
       end
 
     %{st | our_feefilter: rate, last_feefilter_check: now}
-  end
-
-  defp real_mempool?(server) do
-    with pid when is_pid(pid) <- GenServer.whereis(server),
-         {:dictionary, dict} <- Process.info(pid, :dictionary),
-         {Exnode.Mempool, :init, 1} <- Keyword.get(dict, :"$initial_call") do
-      true
-    else
-      _ -> false
-    end
   end
 
   defp process_inv_backlog(st, now) do
