@@ -82,6 +82,8 @@ defmodule Exnode.Chain.State do
     :pf_wait_since,
     :perf,
     :gc_probe,
+    :durable_epoch,
+    telemetry: %Telemetry{},
     blocks: MapSet.new(),
     script_stats: %{checked: 0, skipped: 0},
     test_skip_scripts: false,
@@ -254,6 +256,9 @@ defmodule Exnode.Chain.State do
   @doc "Commits the archive batch now."
   def commit_now(server), do: GenServer.call(server, :commit, :infinity)
 
+  @doc "Waits until any queued activation / startup replay has settled."
+  def await_idle(server, timeout \\ :infinity), do: GenServer.call(server, :await_idle, timeout)
+
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
@@ -283,7 +288,6 @@ defmodule Exnode.Chain.State do
         ]
         |> Enum.reject(&is_nil(elem(&1, 1)))
       )
-      |> note_durable()
 
     {exec, private} =
       case Keyword.get(opts, :script_exec) do
@@ -320,6 +324,7 @@ defmodule Exnode.Chain.State do
       p: p,
       headers: headers,
       a: a,
+      durable_epoch: record_durable_epoch(kv, a),
       kv: kv,
       view: view,
       exec: exec,
@@ -362,18 +367,25 @@ defmodule Exnode.Chain.State do
       st
       |> load_candidates()
       |> load_pending()
-      |> drive_until_idle()
-      |> maybe_commit()
       |> publish()
 
     Process.send_after(self(), :commit_tick, @batch_ms)
-    {:ok, st, {:continue, :shadow_catch_up}}
+    {:ok, st, {:continue, :startup}}
   end
 
   @impl true
-  def handle_continue(:shadow_catch_up, %__MODULE__{monitor: nil} = st), do: {:noreply, st}
+  def handle_continue(:startup, st) do
+    # Catch the shadow validator up to the already-committed tip BEFORE replaying
+    # any uncommitted pending blocks, so rounds produced during replay never reach
+    # a behind shadow (or if shadow is ahead, set_ahead is registered first).
+    st = run_shadow_catch_up(st)
+    st = if st.retarget, do: drive(st), else: st
+    {:noreply, st}
+  end
 
-  def handle_continue(:shadow_catch_up, st) do
+  defp run_shadow_catch_up(%__MODULE__{monitor: nil} = st), do: st
+
+  defp run_shadow_catch_up(st) do
     {:ok, {sh, shash}} = Exnode.Shadow.Monitor.shadow_tip(st.monitor)
     st = commit(st)
     tip = Archive.tip(st.a)
@@ -391,7 +403,7 @@ defmodule Exnode.Chain.State do
       catch_up(st, start, tip.height)
     end
 
-    {:noreply, flush_round(%{st | round_connected: []})}
+    flush_round(%{st | round_connected: []})
   end
 
   defp catch_up(_st, from, to) when from > to, do: :ok
@@ -435,21 +447,34 @@ defmodule Exnode.Chain.State do
 
     a =
       View.with_active_mutation(st.view, fn ->
-        a = Archive.flush(st.a, for(h <- hashes, do: {:delete, :pending, h})) |> note_durable()
+        a = Archive.flush(st.a, for(h <- hashes, do: {:delete, :pending, h}))
         View.unhold_many(st.view, hashes)
         View.put_committed(st.view, a)
         a
       end)
 
-    %{st | a: a, round_connected: st.uncommitted ++ st.round_connected, uncommitted: []}
+    %{
+      st
+      | a: a,
+        durable_epoch: record_durable_epoch(st.kv, a),
+        round_connected: st.uncommitted ++ st.round_connected,
+        uncommitted: []
+    }
   end
 
-  defp note_durable(a) do
-    Process.put({__MODULE__, :durable_epoch}, Archive.epoch(a))
-    a
+  defp durable_current?(%__MODULE__{a: a, kv: kv, durable_epoch: epoch}) do
+    Archive.epoch(a) == epoch and
+      case KV.get(kv, :meta, "durable_epoch") do
+        {:ok, <<stored::64>>} -> stored == epoch
+        :not_found -> true
+      end
   end
 
-  defp durable_current?(a), do: Archive.epoch(a) == Process.get({__MODULE__, :durable_epoch})
+  defp record_durable_epoch(kv, a) do
+    epoch = Archive.epoch(a)
+    :ok = KV.write(kv, [{:put, :meta, "durable_epoch", <<epoch::64>>}], sync: false)
+    epoch
+  end
 
   defp maybe_commit(%__MODULE__{uncommitted: []} = st), do: st
 
@@ -594,7 +619,15 @@ defmodule Exnode.Chain.State do
 
   @impl true
   def handle_call(msg, from, st),
-    do: Telemetry.timed_cb(msg, st.gc_probe != nil, fn -> do_handle_call(msg, from, st) end)
+    do: Telemetry.timed_cb(msg, st, st.gc_probe != nil, &do_handle_call(msg, from, &1))
+
+  defp do_handle_call(:await_idle, from, st) do
+    if st.plan == nil and not st.drive_queued and not st.retarget do
+      {:reply, :ok, st}
+    else
+      {:noreply, %{st | waiters: [{:reply, from, :ok} | st.waiters]} |> queue_drive()}
+    end
+  end
 
   defp do_handle_call(:tip, _from, st), do: {:reply, Archive.tip(st.a), st}
   defp do_handle_call({:set_monitor, m}, _from, st), do: {:reply, :ok, %{st | monitor: m}}
@@ -742,7 +775,7 @@ defmodule Exnode.Chain.State do
 
   @impl true
   def handle_info(msg, st),
-    do: Telemetry.timed_cb(msg, st.gc_probe != nil, fn -> do_handle_info(msg, st) end)
+    do: Telemetry.timed_cb(msg, st, st.gc_probe != nil, &do_handle_info(msg, &1))
 
   defp do_handle_info(:drive, st), do: {:noreply, drive(%{st | drive_queued: false})}
 
@@ -783,7 +816,7 @@ defmodule Exnode.Chain.State do
   def terminate(_reason, st) do
     st = cancel_plan(st)
 
-    if durable_current?(st.a) do
+    if durable_current?(st) do
       try do
         commit(st)
       catch
@@ -820,7 +853,7 @@ defmodule Exnode.Chain.State do
 
   @impl true
   def handle_cast(msg, st),
-    do: Telemetry.timed_cb(msg, st.gc_probe != nil, fn -> do_handle_cast(msg, st) end)
+    do: Telemetry.timed_cb(msg, st, st.gc_probe != nil, &do_handle_cast(msg, &1))
 
   defp do_handle_cast({:halt, reason}, %__MODULE__{halted: false} = st) do
     Logger.error("block connection halted: #{inspect(reason)}")
@@ -997,17 +1030,18 @@ defmodule Exnode.Chain.State do
     {st, state} = turn(%{st | turn_retired: 0})
     st = hwm(st, :turn_retired_max, st.turn_retired)
     t1 = System.monotonic_time(:microsecond)
-    Telemetry.cs_time(:turn, t1 - t0)
+    st = Telemetry.cs_time(st, :turn, t1 - t0)
 
     st = st |> maybe_commit() |> publish() |> flush_round() |> flush_mempool()
 
-    Telemetry.cs_time(:epilogue, System.monotonic_time(:microsecond) - t1)
+    st = Telemetry.cs_time(st, :epilogue, System.monotonic_time(:microsecond) - t1)
 
-    case state do
-      :waiting -> Telemetry.mark_wait(wait_reason(st))
-      :idle -> Telemetry.mark_wait(:no_work)
-      :more -> :ok
-    end
+    st =
+      case state do
+        :waiting -> Telemetry.mark_wait(st, wait_reason(st))
+        :idle -> Telemetry.mark_wait(st, :no_work)
+        :more -> st
+      end
 
     st = note_turn(st, System.monotonic_time(:microsecond) - t0)
 
@@ -1015,30 +1049,6 @@ defmodule Exnode.Chain.State do
       :more -> queue_drive(st)
       :idle -> answer_waiters(st)
       :waiting -> st
-    end
-  end
-
-  defp drive_until_idle(st) do
-    {st, state} = turn(st)
-    st = maybe_commit(st)
-
-    case state do
-      :idle ->
-        st
-
-      :more ->
-        drive_until_idle(st)
-
-      :waiting ->
-        st =
-          receive do
-            {:script_exec, tag, outcome, wstats} -> script_result(st, tag, outcome, wstats)
-            {:prefetch_done, tag, result} -> prefetch_result(st, tag, result)
-            {:archive_prep_done, tag, result} -> archive_prep_result(st, tag, result)
-            {:DOWN, mref, :process, _, reason} = down -> any_down(st, mref, reason, down)
-          end
-
-        drive_until_idle(st)
     end
   end
 
@@ -1143,13 +1153,18 @@ defmodule Exnode.Chain.State do
   defp step(st) do
     t0 = System.monotonic_time(:microsecond)
     st = dispatch_archive_preps(st)
-    Telemetry.cs_time(:dispatch, System.monotonic_time(:microsecond) - t0)
+    st = Telemetry.cs_time(st, :dispatch, System.monotonic_time(:microsecond) - t0)
 
     case peek_head(st.plan) do
       {:ok, %{state: s} = head} when s in [:ready, :failed] ->
         case await_archive_prep(st, head) do
-          {:ok, st, head} -> Telemetry.cs_timed(:retire, fn -> retire(st, head) end)
-          :pending -> advance(st)
+          {:ok, st, head} ->
+            t1 = System.monotonic_time(:microsecond)
+            {status, st} = retire(st, head)
+            {status, Telemetry.cs_time(st, :retire, System.monotonic_time(:microsecond) - t1)}
+
+          :pending ->
+            advance(st)
         end
 
       _ ->
@@ -1162,9 +1177,13 @@ defmodule Exnode.Chain.State do
 
     cond do
       plan.todo != [] and not plan.final and admitted?(st) ->
-        case Telemetry.cs_timed(:prepare, fn -> prepare_next(st) end) do
-          {:wait, st} -> {:waiting, st}
-          {:ok, st} -> {:prepared, st}
+        t0 = System.monotonic_time(:microsecond)
+        {status, st} = prepare_next(st)
+        st = Telemetry.cs_time(st, :prepare, System.monotonic_time(:microsecond) - t0)
+
+        case status do
+          :wait -> {:waiting, st}
+          :ok -> {:prepared, st}
         end
 
       plan.n == 0 and (plan.todo == [] or plan.final) ->
@@ -1290,19 +1309,21 @@ defmodule Exnode.Chain.State do
       %{gen: ^gen, items: %{^ref => %{apre: {:pending, ^tag, _pid, mref}} = item} = items} ->
         Process.demonitor(mref, [:flush])
 
-        {item, us} =
+        {st, item, us} =
           case result do
             {:ok, p} ->
-              Telemetry.cs_time(
-                :apre_latency,
-                System.monotonic_time(:microsecond) - p.launched_at
-              )
+              st =
+                st
+                |> Telemetry.cs_time(
+                  :apre_latency,
+                  System.monotonic_time(:microsecond) - p.launched_at
+                )
+                |> Telemetry.cs_time(:apre_worker, p.worker_us)
 
-              Telemetry.cs_time(:apre_worker, p.worker_us)
-              {%{item | apre: {:done, p}}, p.prepare_us}
+              {st, %{item | apre: {:done, p}}, p.prepare_us}
 
             {:error, _} ->
-              {%{item | apre: :none}, 0}
+              {st, %{item | apre: :none}, 0}
           end
 
         st = put_in(st.plan.items, %{items | ref => item})
@@ -1467,9 +1488,7 @@ defmodule Exnode.Chain.State do
       {block, answers, history, st} ->
         since = st.pf_wait_since
         st = %{st | pf_wait_since: nil}
-
-        if since,
-          do: Process.put(:perf_pfwait_us, (Process.get(:perf_pfwait_us) || 0) + now - since)
+        st = if since, do: Telemetry.add_pfwait(st, now - since), else: st
 
         t0 = System.monotonic_time(:microsecond)
 
@@ -1488,55 +1507,59 @@ defmodule Exnode.Chain.State do
         spec_out = Archive.next_ids(st.a).out + st.plan.new_outputs
         archived = Archive.block_id(st.a, entry.hash) != nil
 
-        result =
+        {result, checkblock, rules_us, connect_us} =
           try do
             tc = System.monotonic_time(:microsecond)
 
-            with :ok <- unchecked_check_block(st, entry, block),
-                 _ <- add_us(:perf_checkblock_us, tc),
-                 :ok <-
-                   BlockRules.contextual_check_block(
-                     block,
-                     HeaderIndex.prev(idx, entry),
-                     st.p,
-                     idx
-                   ),
-                 :ok <- override(st, block, entry),
-                 _ <-
-                   Process.put(
-                     :perf_rules_us,
-                     (Process.get(:perf_rules_us) || 0) + System.monotonic_time(:microsecond) - tc
-                   ) do
-              scripts =
-                not st.test_skip_scripts and
-                  AssumeValid.decide(st.assume_valid, idx, entry, st.p) != :skip
+            case unchecked_check_block(st, entry, block) do
+              :ok ->
+                cb_us = System.monotonic_time(:microsecond) - tc
 
-              opts =
-                [scripts: if(scripts, do: :defer, else: false), view: view, committed: answers] ++
-                  if(archived, do: [], else: [base_out: spec_out])
+                with :ok <-
+                       BlockRules.contextual_check_block(
+                         block,
+                         HeaderIndex.prev(idx, entry),
+                         st.p,
+                         idx
+                       ),
+                     :ok <- override(st, block, entry) do
+                  r_us = System.monotonic_time(:microsecond) - tc
 
-              tconn = System.monotonic_time(:microsecond)
-              r = Connect.connect_block(st.a, block, entry, st.p, idx, opts)
+                  scripts =
+                    not st.test_skip_scripts and
+                      AssumeValid.decide(st.assume_valid, idx, entry, st.p) != :skip
 
-              Process.put(
-                :perf_connect_us,
-                (Process.get(:perf_connect_us) || 0) + System.monotonic_time(:microsecond) - tconn
-              )
+                  opts =
+                    [
+                      scripts: if(scripts, do: :defer, else: false),
+                      view: view,
+                      committed: answers
+                    ] ++
+                      if(archived, do: [], else: [base_out: spec_out])
 
-              r
+                  tconn = System.monotonic_time(:microsecond)
+                  r = Connect.connect_block(st.a, block, entry, st.p, idx, opts)
+                  c_us = System.monotonic_time(:microsecond) - tconn
+                  {r, cb_us, r_us, c_us}
+                else
+                  err -> {err, cb_us, System.monotonic_time(:microsecond) - tc, 0}
+                end
+
+              err ->
+                {err, System.monotonic_time(:microsecond) - tc, 0, 0}
             end
           rescue
-            e -> {:crash, e, __STACKTRACE__}
+            e -> {{:crash, e, __STACKTRACE__}, 0, 0, 0}
           catch
-            kind, reason -> {:crash, {kind, reason}, __STACKTRACE__}
+            kind, reason -> {{:crash, {kind, reason}, __STACKTRACE__}, 0, 0, 0}
           end
 
         validate_us = System.monotonic_time(:microsecond) - t0
-        rules_us = Process.delete(:perf_rules_us) || 0
-        connect_us = Process.delete(:perf_connect_us) || 0
-        checkblock = Process.delete(:perf_checkblock_us) || 0
-        Telemetry.record_validation_window(checkblock, rules_us, connect_us)
-        st = update_pstats(st, %{prep_rules_us: rules_us, prep_connect_us: connect_us})
+
+        st =
+          st
+          |> Telemetry.record_validation_window(checkblock, rules_us, connect_us)
+          |> update_pstats(%{prep_rules_us: rules_us, prep_connect_us: connect_us})
 
         case result do
           {:ok, res} ->
@@ -1551,26 +1574,23 @@ defmodule Exnode.Chain.State do
   defp wait_reason(%__MODULE__{plan: %{} = plan} = st) do
     head =
       case peek_head(plan) do
-        {:ok, %{state: :ready, apre: {:pending, _, _, _}}} -> "apre"
-        {:ok, %{state: s}} -> Atom.to_string(s)
-        :empty -> "empty"
+        {:ok, %{state: :ready, apre: {:pending, _, _, _}}} -> :apre
+        {:ok, %{state: s}} -> s
+        :empty -> :empty
       end
 
     why =
       cond do
-        st.pf_wait_since != nil -> "prefetch"
-        plan.todo == [] or plan.final -> "no_blocks"
-        not admitted?(st) -> "full"
-        true -> "other"
+        st.pf_wait_since != nil -> :prefetch
+        plan.todo == [] or plan.final -> :no_blocks
+        not admitted?(st) -> :full
+        true -> :other
       end
 
-    String.to_atom(head <> "/" <> why)
+    {head, why}
   end
 
   defp wait_reason(_st), do: :no_plan
-
-  defp add_us(key, t0),
-    do: Process.put(key, (Process.get(key) || 0) + System.monotonic_time(:microsecond) - t0)
 
   defp unchecked_check_block(st, entry, block) do
     if MapSet.member?(st.checked, entry.hash) do
@@ -1761,11 +1781,6 @@ defmodule Exnode.Chain.State do
       :unknown -> {:unknown, st}
     end
   end
-
-  defp any_down(%__MODULE__{exec_private: {_, mref}}, mref, reason, _down),
-    do: exit({:script_exec_down, reason})
-
-  defp any_down(st, mref, _reason, down), do: elem(handle_down(st, mref, down), 1)
 
   defp retire(st, item) do
     {{:value, head_ref}, order} = :queue.out(st.plan.order)
@@ -2004,13 +2019,21 @@ defmodule Exnode.Chain.State do
       a =
         View.with_active_mutation(st.view, fn ->
           {a, _id} = Archive.disconnect_tip(st.a)
-          note_durable(a)
           View.publish(st.view, a)
           a
         end)
 
       notify(st, {:block_disconnected, old})
-      disconnect_to(%{st | a: a, disconnected: MapSet.put(st.disconnected, old)}, fork)
+
+      disconnect_to(
+        %{
+          st
+          | a: a,
+            durable_epoch: record_durable_epoch(st.kv, a),
+            disconnected: MapSet.put(st.disconnected, old)
+        },
+        fork
+      )
     else
       st
     end
@@ -2080,8 +2103,11 @@ defmodule Exnode.Chain.State do
          archive_us,
          scripts_us
        ) do
-    Process.put(:perf_scripts_us, (Process.get(:perf_scripts_us) || 0) + scripts_us)
-    st = Telemetry.perf(st, block, item.validate_us, archive_us)
+    st =
+      st
+      |> Telemetry.add_scripts(scripts_us)
+      |> Telemetry.perf(block, item.validate_us, archive_us)
+
     key = if res.scripts_checked, do: :checked, else: :skipped
     st = %{st | script_stats: Map.update!(st.script_stats, key, &(&1 + 1))}
     notify(st, {:block_connected, entry.hash, entry.height})

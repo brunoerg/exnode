@@ -367,9 +367,10 @@ defmodule Exnode.Chain.ActivationPlanTest do
     assert Task.await(stopper, 5_000) == :ok
 
     # Restart with nothing held: b1 was retired (committed at shutdown), b2
-    # and b3 replay from pending.
+    # and b3 replay from pending asynchronously after init.
     :ets.delete_all_objects(ctl)
     cs2 = start_cs(dir, "f", n.kv, n.hs, ctl, [])
+    :ok = State.await_idle(cs2)
     assert State.tip(cs2).hash == b3.header.hash
   end
 end

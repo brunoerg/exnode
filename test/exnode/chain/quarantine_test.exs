@@ -158,10 +158,11 @@ defmodule Exnode.Chain.QuarantineTest do
     assert State.tip(cs).hash == hash
   end
 
-  # Regression: during startup replay, init waits in a
-  # selective receive that ignored the private script executor's DOWN: if
-  # the executor died there, init waited forever for its job results.
-  test "the private script executor dying during startup replay fails the start instead of hanging",
+  # Regression: if the private script executor dies during startup replay
+  # (now driven asynchronously in handle_continue rather than blocking init),
+  # Chain.State exits promptly with {:script_exec_down, :killed} instead of
+  # hanging waiting for job results.
+  test "the private script executor dying during startup replay exits instead of hanging",
        %{tmp_dir: dir} do
     %{bs: bs, kv: kv, hs: hs, b151: b} = setup_chain(dir)
     cs = start_cs(dir, kv, hs, batch_blocks: 1000, commit_at_tip: false)
@@ -178,10 +179,9 @@ defmodule Exnode.Chain.QuarantineTest do
     end
 
     opts = [params: @p, headers: hs, kv: kv, hot: Path.join(dir, "hot"), script_run: killer]
-    task = Task.async(fn -> GenServer.start(State, opts) end)
-
-    assert {:ok, {:error, {:script_exec_down, :killed}}} =
-             Task.yield(task, 10_000) || Task.shutdown(task, :brutal_kill)
+    {:ok, cs2} = GenServer.start(State, opts)
+    ref = Process.monitor(cs2)
+    assert_receive {:DOWN, ^ref, :process, ^cs2, {:script_exec_down, :killed}}, 10_000
   end
 
   # Regression: BlockDownload selects blocks the chain
