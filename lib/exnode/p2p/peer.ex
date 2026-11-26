@@ -81,6 +81,8 @@ defmodule Exnode.P2P.Peer do
   @wtxid_relay_version 70016
   # Core: node::MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER.
   @max_notfound_items 5_000 + 16
+  # Max concurrent unvalidated txs per peer before Peer pauses socket reads.
+  @default_max_tx_in_flight 4
 
   # --- Supervision & API -----------------------------------------------------
 
@@ -396,9 +398,22 @@ defmodule Exnode.P2P.Peer do
     transition(state, flow_state(state, data), data, [])
   end
 
-  def handle_event(:info, :tx_relay_resync, {:ready, _}, %Data{} = data) do
+  def handle_event(
+        :info,
+        :tx_relay_resync,
+        {:ready, _} = state,
+        %Data{proto: %Proto{} = proto} = data
+      ) do
+    was_paused = paused?(data)
+    data = %{data | proto: %{proto | tx_in_flight: 0}}
     tx_relay_connected(data)
-    :keep_state_and_data
+    next = flow_state(state, data)
+
+    if was_paused and not paused?(data) do
+      send(self(), :continue_getdata)
+    end
+
+    transition(state, next, data, [])
   end
 
   # Plan 02 hook: TxRelay notifies Peer when an in-flight tx finishes validation.
@@ -634,7 +649,7 @@ defmodule Exnode.P2P.Peer do
       addr_rate: AddrRate.new(Clock.mono(data.node[:clock])),
       announced: announced,
       hb_selected: data.handshake.pending_hb_selected,
-      max_tx_in_flight: Map.get(data.node, :max_tx_in_flight, :infinity)
+      max_tx_in_flight: Map.get(data.node, :max_tx_in_flight, @default_max_tx_in_flight)
     }
 
     data = %{data | proto: proto}
@@ -759,7 +774,7 @@ defmodule Exnode.P2P.Peer do
       else: {:ok, state, data}
   end
 
-  defp handle_msg({:ready, _} = state, {:tx, payload}, data) do
+  defp handle_msg({:ready, _} = state, {:tx, payload}, %Data{proto: %Proto{} = proto} = data) do
     cond do
       data.conn_type == :block_relay ->
         {:stop, {:shutdown, :tx_from_block_relay_peer}, data}
@@ -769,11 +784,15 @@ defmodule Exnode.P2P.Peer do
 
       true ->
         case Tx.decode_exact(payload) do
-          {:ok, tx} -> TxRelay.received_tx(data.node.tx_relay, self(), tx)
-          {:error, _} -> :ok
-        end
+          {:ok, tx} ->
+            ref = make_ref()
+            data = %{data | proto: %{proto | tx_in_flight: proto.tx_in_flight + 1}}
+            TxRelay.submit_tx(data.node.tx_relay, self(), ref, tx)
+            {:ok, flow_state(state, data), data}
 
-        {:ok, state, data}
+          {:error, _} ->
+            {:ok, state, data}
+        end
     end
   end
 
