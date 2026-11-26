@@ -18,12 +18,14 @@ defmodule Exnode.Chain.View do
   """
 
   alias Exnode.Archive
+  alias Exnode.Archive.Overlay
   alias Exnode.Chain.HeaderIndex
   alias Exnode.Node.Runtime
 
   @handle_ns Exnode.Chain.State
   @ibd_done_slot 1
   @active_gen_slot 2
+  @seqlock_retries 6
 
   @doc "Creates the `:protected` `:chain_view` ETS table and publishes it if `name` is given."
   def new(kv, name \\ nil) do
@@ -39,6 +41,7 @@ defmodule Exnode.Chain.View do
   or `nil` if none is published.
   """
   def view(server) when is_atom(server), do: Runtime.get_handle({@handle_ns, server}, nil)
+  def view(_server), do: nil
 
   @doc "The 2-slot `:atomics` ref backing `ibd_done` (slot 1) and `active_gen` (slot 2)."
   def view_atomics(view), do: :ets.lookup_element(view, :atomics, 2)
@@ -72,6 +75,83 @@ defmodule Exnode.Chain.View do
 
   @doc "Active tip from the view (no call into the chain-state process)."
   def view_tip(view), do: :ets.lookup_element(view, :tip, 2)
+
+  @doc """
+  Lock-free active-chain coin lookup (Plan 02 seqlock): reads the active tip
+  and resolves `outpoints` against the published overlay and committed reader
+  without calling `Chain.State`.
+
+  Returns `{:ok, {tip, %{outpoint => {:ok, coin} | :missing}}}` on a clean
+  seqlock read, or `:retry` if `Chain.State` mutated the active state during
+  the read (or the view has no published overlay yet).
+  """
+  def resolve_active(view, outpoints) do
+    do_resolve_active(view, Enum.uniq(outpoints), @seqlock_retries)
+  end
+
+  defp do_resolve_active(_view, _ops, 0), do: :retry
+
+  defp do_resolve_active(view, ops, retries) do
+    try do
+      atomics = view_atomics(view)
+      g1 = :atomics.get(atomics, @active_gen_slot)
+
+      if rem(g1, 2) == 1 do
+        :erlang.yield()
+        do_resolve_active(view, ops, retries - 1)
+      else
+        case lookup_active_snapshot(view) do
+          {:ok, tip, reader, overlay, batch_txids} ->
+            resolved = resolve_with_overlay(reader, overlay, batch_txids, ops)
+            g2 = :atomics.get(atomics, @active_gen_slot)
+
+            if g1 == g2 do
+              {:ok, {tip, resolved}}
+            else
+              do_resolve_active(view, ops, retries - 1)
+            end
+
+          :unavailable ->
+            :retry
+        end
+      end
+    rescue
+      # View or reader ETS tables (:chain_view / :archive_chain / :archive_onchain)
+      # can vanish mid-read if Archive.Writer restarts; fall back cleanly.
+      ArgumentError -> :retry
+    end
+  end
+
+  defp lookup_active_snapshot(view) do
+    with [{:tip, tip}] <- :ets.lookup(view, :tip),
+         [{:reader, reader}] <- :ets.lookup(view, :reader),
+         [{:overlay, overlay}] when overlay != nil <- :ets.lookup(view, :overlay),
+         [{:batch_txids, batch_txids}] <- :ets.lookup(view, :batch_txids) do
+      {:ok, tip, reader, overlay, batch_txids}
+    else
+      _ -> :unavailable
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  defp resolve_with_overlay(_reader, _overlay, _batch_txids, []), do: %{}
+
+  defp resolve_with_overlay(reader, overlay, batch_txids, ops) do
+    {known, rest} =
+      Enum.reduce(ops, {%{}, []}, fn {txid, _} = op, {known, rest} ->
+        case Overlay.lookup(overlay, op) do
+          {:ok, coin} -> {Map.put(known, op, {:ok, coin}), rest}
+          :spent -> {Map.put(known, op, :missing), rest}
+          :unknown when is_map_key(batch_txids, txid) -> {Map.put(known, op, :missing), rest}
+          :unknown -> {known, [op | rest]}
+        end
+      end)
+
+    if rest == [],
+      do: known,
+      else: Map.merge(known, Archive.committed_answers(reader, rest))
+  end
 
   @doc """
   Core `IsInitialBlockDownload`, the one answer for peers and RPC: the
@@ -128,15 +208,22 @@ defmodule Exnode.Chain.View do
     :ets.insert(view, [
       {:tip, Archive.tip(a)},
       {:committed, Archive.committed_tip(a).height},
-      {:reader, Archive.reader(a)}
+      {:reader, Archive.reader(a)},
+      {:overlay, Overlay.hint(a.overlay)},
+      {:batch_txids, a.batch.txindex}
     ])
 
     :ok
   end
 
   @doc false
-  def put_tip(view, tip) do
-    :ets.insert(view, {:tip, tip})
+  def put_tip(view, tip, batch_txids \\ nil) do
+    if batch_txids == nil do
+      :ets.insert(view, {:tip, tip})
+    else
+      :ets.insert(view, [{:tip, tip}, {:batch_txids, batch_txids}])
+    end
+
     :ok
   end
 
@@ -144,10 +231,23 @@ defmodule Exnode.Chain.View do
   def put_committed(view, %Archive{} = a) do
     :ets.insert(view, [
       {:committed, Archive.committed_tip(a).height},
-      {:reader, Archive.reader(a)}
+      {:reader, Archive.reader(a)},
+      {:overlay, Overlay.hint(a.overlay)},
+      {:batch_txids, a.batch.txindex}
     ])
 
     :ok
+  end
+
+  @doc false
+  def with_active_mutation(view, fun) do
+    bump_active_gen(view)
+
+    try do
+      fun.()
+    after
+      bump_active_gen(view)
+    end
   end
 
   @doc false

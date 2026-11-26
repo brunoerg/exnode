@@ -215,12 +215,26 @@ defmodule Exnode.Chain.State do
 
   @doc """
   The mempool's view of the chain (Core `CCoinsViewCache` at the tip):
-  `{tip, %{outpoint => {:ok, coin} | :missing}}`. Reads through the batch and
-  overlay, without committing.
+  `{tip, %{outpoint => {:ok, coin} | :missing}}`. Reads lock-free through the
+  published `Chain.View` seqlock (overlay + committed reader) when `server` is
+  a registered name, falling back to a `GenServer.call` on contention or for
+  unnamed test PIDs.
   """
   def mempool_view(server, outpoints) do
     {ok, bad} = Enum.split_with(outpoints, fn {_, v} -> is_integer(v) and v in 0..0xFFFFFFFF end)
-    {tip, found} = GenServer.call(server, {:mempool_view, ok}, :infinity)
+
+    {tip, found} =
+      case View.view(server) do
+        nil ->
+          GenServer.call(server, {:mempool_view, ok}, :infinity)
+
+        view ->
+          case View.resolve_active(view, ok) do
+            {:ok, res} -> res
+            :retry -> GenServer.call(server, {:mempool_view, ok}, :infinity)
+          end
+      end
+
     {tip, Enum.reduce(bad, found, &Map.put(&2, &1, :missing))}
   end
 
@@ -479,15 +493,19 @@ defmodule Exnode.Chain.State do
         {for(h <- hashes, do: {:delete, :pending, h}), st.canonical_headers_count}
       end
 
-    a = Archive.flush(st.a, extra_ops) |> note_durable()
+    a =
+      View.with_active_mutation(st.view, fn ->
+        a = Archive.flush(st.a, extra_ops) |> note_durable()
+        View.unhold_many(st.view, hashes)
+        View.put_committed(st.view, a)
+        a
+      end)
+
     st = maybe_snapshot_after_commit(st, a)
 
     if split_store?(st) and hashes != [] do
       :ok = KV.write(st.staging_kv, for(h <- hashes, do: {:delete, :pending, h}), sync: false)
     end
-
-    View.unhold_many(st.view, hashes)
-    View.put_committed(st.view, st.a)
 
     %{
       st
@@ -2144,10 +2162,16 @@ defmodule Exnode.Chain.State do
         end
 
       old = Archive.tip(st.a).hash
-      {a, _id} = Archive.disconnect_tip(st.a)
+
+      a =
+        View.with_active_mutation(st.view, fn ->
+          {a, _id} = Archive.disconnect_tip(st.a)
+          note_durable(a)
+          View.publish(st.view, a)
+          a
+        end)
+
       st = take_snapshot_and_prune(st, a)
-      note_durable(st.a)
-      View.publish(st.view, st.a)
       notify(st, {:block_disconnected, old})
       disconnect_to(%{st | disconnected: MapSet.put(st.disconnected, old)}, fork)
     else
@@ -2165,13 +2189,19 @@ defmodule Exnode.Chain.State do
       end
 
     a =
-      Archive.connect(st.a, block, entry.height, res.spent,
-        delta: res.delta,
-        commit: false,
-        history: item.history,
-        prepared: prepared,
-        unique_txids: unique_txids?(st, entry)
-      )
+      View.with_active_mutation(st.view, fn ->
+        a =
+          Archive.connect(st.a, block, entry.height, res.spent,
+            delta: res.delta,
+            commit: false,
+            history: item.history,
+            prepared: prepared,
+            unique_txids: unique_txids?(st, entry)
+          )
+
+        View.put_tip(st.view, Archive.tip(a), a.batch.txindex)
+        a
+      end)
 
     if hook = st.test_archive_hook, do: hook.(block)
     {:ok, a, System.monotonic_time(:microsecond) - t1}
