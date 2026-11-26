@@ -15,9 +15,11 @@ defmodule Exnode.Chain.Quarantine do
   alias Exnode.Chain.View
   alias Exnode.Codec.Block
   alias Exnode.Crypto.Hash
+  alias Exnode.StorageError
   alias Exnode.Store.KV
 
   @halt_key "halt"
+  @poisoned_count_key "poisoned_count"
   @out_of_memory [:enomem, :kernel_alloc, :kernel_txdata]
 
   # --- durable halt mark -------------------------------------------------------
@@ -25,8 +27,21 @@ defmodule Exnode.Chain.Quarantine do
   @doc "The durable halt mark in `kv`: `%{reason, time, height, hash}` or `nil`."
   def halt_mark(kv) do
     case KV.get(kv, :meta, @halt_key) do
-      {:ok, bin} -> :erlang.binary_to_term(bin)
-      :not_found -> nil
+      {:ok, bin} ->
+        try do
+          :erlang.binary_to_term(bin)
+        rescue
+          e in ArgumentError ->
+            StorageError.raise_and_latch!(
+              kv.guard,
+              :quarantine,
+              {:corrupt_halt_mark, e},
+              "corrupt halt mark in store metadata"
+            )
+        end
+
+      :not_found ->
+        nil
     end
   end
 
@@ -70,6 +85,19 @@ defmodule Exnode.Chain.Quarantine do
   def load_poisoned(kv, view) do
     hashes = KV.fold_prefix(kv, :poisoned, <<>>, [], fn {k, _v}, acc -> [k | acc] end)
 
+    case KV.get(kv, :meta, @poisoned_count_key) do
+      {:ok, <<expected::32>>} when expected != length(hashes) ->
+        StorageError.raise_and_latch!(
+          kv.guard,
+          :quarantine,
+          {:poisoned_count_mismatch, length(hashes), expected},
+          "poisoned scan returned #{length(hashes)} row(s), expected #{expected}"
+        )
+
+      _ ->
+        :ok
+    end
+
     if hashes != [] do
       Logger.warning(
         "#{length(hashes)} block(s) quarantined after a validation crash; not connecting them: " <>
@@ -83,7 +111,7 @@ defmodule Exnode.Chain.Quarantine do
   end
 
   @doc false
-  def mark_poisoned(kv, crash_dir, view, entry, block, error, msg) do
+  def mark_poisoned(kv, crash_dir, view, entry, block, error, msg, new_count \\ nil) do
     hash = entry.hash
 
     mark =
@@ -93,7 +121,11 @@ defmodule Exnode.Chain.Quarantine do
         error: inspect(error, limit: 50)
       })
 
-    :ok = KV.write(kv, [{:put, :poisoned, hash, mark}], sync: true)
+    ops =
+      [{:put, :poisoned, hash, mark}] ++
+        if(is_integer(new_count), do: [{:put, :meta, @poisoned_count_key, <<new_count::32>>}], else: [])
+
+    :ok = KV.write(kv, ops, sync: true)
     write_crash_report(kv, crash_dir, entry, block, msg)
     View.quarantine(view, hash)
     :ok
@@ -106,10 +138,16 @@ defmodule Exnode.Chain.Quarantine do
         do: MapSet.to_list(poisoned),
         else: Enum.filter([which], &MapSet.member?(poisoned, &1))
 
-    :ok = KV.write(kv, for(h <- hashes, do: {:delete, :poisoned, h}), sync: true)
+    remaining = MapSet.difference(poisoned, MapSet.new(hashes))
+
+    ops =
+      for(h <- hashes, do: {:delete, :poisoned, h}) ++
+        [{:put, :meta, @poisoned_count_key, <<MapSet.size(remaining)::32>>}]
+
+    :ok = KV.write(kv, ops, sync: true)
     View.unquarantine_many(view, hashes)
     for h <- hashes, do: Logger.warning("quarantine cleared for block #{Hash.to_hex(h)}")
-    {hashes, MapSet.difference(poisoned, MapSet.new(hashes))}
+    {hashes, remaining}
   end
 
   @doc false

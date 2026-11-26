@@ -37,8 +37,9 @@ defmodule Exnode.Archive.SegmentsTest do
   end
 
   defp reopen(root, committed, opts \\ []) do
+    min_seg = Keyword.get(opts, :min_seg, 0)
     s = Segments.open(root, :outputs, opts)
-    Segments.truncate_to(s, committed)
+    Segments.truncate_to(s, committed, min_seg)
   end
 
   test "a torn tail after the committed end is discarded; committed records are intact", %{
@@ -133,7 +134,7 @@ defmodule Exnode.Archive.SegmentsTest do
     :ok = Segments.remove(s, 0)
     refute File.exists?(Path.join([root, "outputs", "00000.seg"]))
     :ok = Segments.close(s)
-    _ = reopen(root, committed, max: 400)
+    _ = reopen(root, committed, max: 400, min_seg: 1)
     # Records in later segments are still there.
     later = Enum.filter(locs, fn {{seg, _}, _} -> seg > 0 end)
     assert for({p, i} <- read_all(root, later), do: p == payload(i)) |> Enum.all?()
@@ -205,6 +206,80 @@ defmodule Exnode.Archive.SegmentsTest do
 
       # Failing before any file is opened: nothing was recreated.
       refute File.exists?(Path.join([dir, "hot", "outputs", "00000.seg"]))
+    end
+
+    test "a missing intermediate segment raises and latches the guard", %{tmp_dir: dir} do
+      import ExUnit.CaptureLog
+
+      g = Exnode.Store.Guard.acquire!(dir, name: "canonical", require_clean_mark: false)
+      s = Segments.open(dir, :outputs, max: 400, guard: g)
+      {s, _} = write(s, 0, 60)
+      :ok = Segments.sync(s)
+      {seg, _} = committed = Segments.position(s)
+      assert seg >= 3
+      :ok = Segments.close(s)
+
+      # Delete an intermediate segment (00001.seg), leaving the final segment intact.
+      File.rm!(Path.join([dir, "outputs", "00001.seg"]))
+
+      capture_log(fn ->
+        assert_raise Exnode.StorageError, ~r/outputs segment 1 missing/, fn ->
+          Segments.open(dir, :outputs, committed: committed, guard: g)
+        end
+      end)
+
+      assert Exnode.Store.Guard.faulted?(g)
+      Exnode.Store.Guard.abandon(g)
+    end
+
+    test "strict_clean open refuses unexpected trailing bytes past committed end", %{tmp_dir: dir} do
+      s = Segments.open(dir, :outputs)
+      {s, _} = write(s, 0, 10)
+      :ok = Segments.sync(s)
+      committed = Segments.position(s)
+      {s, _} = write(s, 10, 2)
+      :ok = Segments.sync(s)
+      :ok = Segments.close(s)
+
+      assert_raise Exnode.StorageError, ~r/unexpected trailing bytes on clean open/, fn ->
+        Segments.open(dir, :outputs, committed: committed, strict_clean: true)
+      end
+
+      # Offline truncate_dir! restores exact committed end so strict_clean succeeds.
+      :ok = Segments.truncate_dir!(dir, :outputs, committed)
+      s2 = Segments.open(dir, :outputs, committed: committed, strict_clean: true)
+      assert Segments.position(s2) == committed
+      :ok = Segments.close(s2)
+    end
+
+    test "reconstruct integrity failure latches guard and raises StorageError", %{tmp_dir: dir} do
+      import ExUnit.CaptureLog
+
+      g = Exnode.Store.Guard.acquire!(dir, name: "canonical", require_clean_mark: false)
+      p = Exnode.ChainParams.get(:regtest)
+      {:ok, kv} = KV.open(Path.join(dir, "kv"), mode: :canonical, guard: g)
+      a = Exnode.Archive.open(kv, Path.join(dir, "hot"), nil, p.genesis)
+      [raw1 | _] = BB.read_chain(@chain)
+      {:ok, b1} = Exnode.Codec.Block.decode_exact(raw1)
+      a = Exnode.Archive.connect(a, b1, 1, [])
+      a = Exnode.Archive.flush(a)
+
+      # Corrupt a byte in the outputs segment so merkle root fails on read_block.
+      seg0 = Path.join([dir, "hot", "outputs", "00000.seg"])
+      bin = File.read!(seg0)
+      flipped = Bitwise.bxor(:binary.last(bin), 0xFF)
+      File.write!(seg0, binary_part(bin, 0, byte_size(bin) - 1) <> <<flipped>>)
+
+      capture_log(fn ->
+        assert_raise Exnode.StorageError, ~r/failed merkle check/, fn ->
+          Exnode.Archive.read_block(a, Exnode.Archive.id_at(a, 1))
+        end
+      end)
+
+      assert Exnode.Store.Guard.faulted?(g)
+      Exnode.Archive.close(a)
+      KV.close(kv)
+      Exnode.Store.Guard.abandon(g)
     end
   end
 end

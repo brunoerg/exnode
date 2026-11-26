@@ -28,10 +28,13 @@ defmodule Exnode.Archive do
 
   alias Exnode.Archive.{Codec, Overlay, Query, Segments}
   alias Exnode.Codec.{Block, Header}
-  alias Exnode.Script
+  alias Exnode.{Script, StorageError}
   alias Exnode.Store.KV
 
   @sparse 64
+  @format_version 2
+
+  def format_version, do: @format_version
 
   # Witness pruning: `prune_keep` (blocks to keep, nil = off), `wpruned` (the
   # highest deleted witness segment) and `wseg_max` (segment => highest block
@@ -60,7 +63,9 @@ defmodule Exnode.Archive do
     :overlay,
     batch: nil,
     prune_keep: nil,
+    defer_prune: false,
     wpruned: -1,
+    wpruned_deleted: -1,
     wpruned_live: nil,
     committed_live: nil,
     visible: nil,
@@ -132,7 +137,10 @@ defmodule Exnode.Archive do
   """
   def open(kv, hot, cold \\ nil, %Block{} = genesis, opts \\ []) do
     cold = cold || hot
-    seg_opts = Keyword.take(opts, [:max])
+    guard = kv.guard
+    strict_clean? = Keyword.get(opts, :strict_clean, false)
+    defer_prune? = Keyword.get(opts, :defer_prune, false)
+    seg_opts = Keyword.take(opts, [:max]) ++ [guard: guard, strict_clean: strict_clean?]
     cache_bytes = Keyword.get(opts, :cache_bytes, 450 * 1024 * 1024)
 
     # An existing archive's committed segment ends are checked before any
@@ -140,12 +148,37 @@ defmodule Exnode.Archive do
     # segment is corruption, and fails here.
     meta =
       case KV.get(kv, :meta, "archive") do
-        {:ok, bin} -> :erlang.binary_to_term(bin)
-        :not_found -> nil
+        {:ok, bin} ->
+          decode_meta!(bin, guard)
+
+        :not_found ->
+          nil
       end
 
+    if meta != nil and kv.mode == :canonical do
+      case Map.get(meta, :format_version) do
+        @format_version ->
+          :ok
+
+        other ->
+          StorageError.raise_and_latch!(
+            guard,
+            :archive,
+            {:unsupported_format_version, other},
+            "unsupported canonical store format version #{inspect(other)} (expected #{@format_version}); " <>
+              "a fresh resync is required"
+          )
+      end
+    end
+
+    wpruned = if meta, do: Map.get(meta, :wpruned, -1), else: -1
+
     seg_opts_for = fn k ->
-      if meta, do: [{:committed, Map.fetch!(meta.ends, k)} | seg_opts], else: seg_opts
+      min_seg = if k == :witness, do: wpruned + 1, else: 0
+
+      if meta,
+        do: [{:committed, Map.fetch!(meta.ends, k)}, {:min_seg, min_seg} | seg_opts],
+        else: seg_opts
     end
 
     segs = %{
@@ -154,13 +187,18 @@ defmodule Exnode.Archive do
       witness: Segments.open(cold, :witness, seg_opts_for.(:witness))
     }
 
+    wpruned_live = :atomics.new(1, signed: true)
+    committed_live = :atomics.new(1, signed: true)
+    :atomics.put(wpruned_live, 1, -1)
+    :atomics.put(committed_live, 1, -1)
+
     a = %__MODULE__{
       kv: kv,
       segs: segs,
       readers: %{
-        outputs: Segments.open_reader(hot, :outputs),
-        inputs: Segments.open_reader(cold, :inputs),
-        witness: Segments.open_reader(cold, :witness)
+        outputs: Segments.open_reader(hot, :outputs, guard),
+        inputs: Segments.open_reader(cold, :inputs, guard),
+        witness: Segments.open_reader(cold, :witness, guard, wpruned_live)
       },
       chain: :ets.new(:archive_chain, [:set, :protected, read_concurrency: true]),
       onchain: :ets.new(:archive_onchain, [:set, :protected, read_concurrency: true]),
@@ -168,13 +206,11 @@ defmodule Exnode.Archive do
       overlay: Overlay.new(cache_bytes),
       batch: empty_batch(),
       prune_keep: Keyword.get(opts, :prune_keep),
-      wpruned_live: :atomics.new(1, signed: true),
-      committed_live: :atomics.new(1, signed: true),
+      defer_prune: defer_prune?,
+      wpruned_live: wpruned_live,
+      committed_live: committed_live,
       segwit_height: Keyword.get(opts, :segwit_height, 0)
     }
-
-    :atomics.put(a.wpruned_live, 1, -1)
-    :atomics.put(a.committed_live, 1, -1)
 
     case meta do
       nil ->
@@ -182,22 +218,58 @@ defmodule Exnode.Archive do
         archive_genesis(a, genesis)
 
       %{next: next, ends: ends, tip: tip_id} ->
-        segs = Map.new(a.segs, fn {k, s} -> {k, Segments.truncate_to(s, Map.fetch!(ends, k))} end)
+        segs =
+          if strict_clean? do
+            a.segs
+          else
+            Map.new(a.segs, fn {k, s} ->
+              min_seg = if k == :witness, do: wpruned + 1, else: 0
+              {k, Segments.truncate_to(s, Map.fetch!(ends, k), min_seg)}
+            end)
+          end
 
         a = %{
           a
           | segs: segs,
             next: next,
-            wpruned: Map.get(meta, :wpruned, -1),
+            wpruned: wpruned,
+            wpruned_deleted: wpruned,
             wseg_max: Map.get(meta, :wseg_max, %{}),
             overwritten: MapSet.new(Map.get(meta, :overwritten, []))
         }
 
         :atomics.put(a.wpruned_live, 1, a.wpruned)
-        # A crash between recording a prune and deleting the files leaves them behind.
-        for seg <- 0..a.wpruned//1, do: Segments.remove(a.segs.witness, seg)
+
+        unless defer_prune? do
+          # Standalone (no snapshots): clean up any leftover witness files <= wpruned.
+          for seg <- 0..a.wpruned//1, do: Segments.remove(a.segs.witness, seg)
+        end
+
         rebuild_chain(a, tip_id)
     end
+  end
+
+  defp decode_meta!(bin, guard) do
+    case :erlang.binary_to_term(bin) do
+      %{next: _, ends: _, tip: _} = meta ->
+        meta
+
+      other ->
+        StorageError.raise_and_latch!(
+          guard,
+          :archive,
+          {:corrupt_meta, other},
+          "corrupt archive metadata record"
+        )
+    end
+  rescue
+    e in ArgumentError ->
+      StorageError.raise_and_latch!(
+        guard,
+        :archive,
+        {:corrupt_meta, e},
+        "corrupt archive metadata term"
+      )
   end
 
   defp rebuild_chain(a, tip_id) do
@@ -310,17 +382,21 @@ defmodule Exnode.Archive do
               :erlang.binary_to_term(bin)
             rescue
               e in ArgumentError ->
-                raise Exnode.StorageError,
-                  source: :archive,
-                  reason: {:corrupt_block_record, id, e},
-                  message: "corrupt block record #{id}"
+                StorageError.raise_and_latch!(
+                  kv.guard,
+                  :archive,
+                  {:corrupt_block_record, id, e},
+                  "corrupt block record #{id}"
+                )
             end
 
           :not_found ->
-            raise Exnode.StorageError,
-              source: :archive,
-              reason: {:missing_block_record, id},
-              message: "missing block record #{id}"
+            StorageError.raise_and_latch!(
+              kv.guard,
+              :archive,
+              {:missing_block_record, id},
+              "missing block record #{id}"
+            )
         end
     end
   end
@@ -819,7 +895,18 @@ defmodule Exnode.Archive do
     located =
       bases
       |> Enum.zip(KV.multi_get(a.kv, :locs, Enum.map(bases, &Codec.loc_key(:outputs, &1))))
-      |> Enum.map(fn {base, {:ok, bin}} -> {Codec.unpack_loc(bin), base} end)
+      |> Enum.map(fn
+        {base, {:ok, bin}} ->
+          {unpack_loc!(a.kv.guard, bin), base}
+
+        {base, :not_found} ->
+          StorageError.raise_and_latch!(
+            a.kv.guard,
+            :archive,
+            {:missing_loc, :outputs, base},
+            "missing sparse output location for base #{base}"
+          )
+      end)
       |> Enum.sort()
 
     Enum.reduce(located, %{}, fn {loc, base}, acc ->
@@ -878,8 +965,8 @@ defmodule Exnode.Archive do
   def read_output(a, id), do: read_record(a, :outputs, id, &Codec.decode_output/1)
 
   defp read_record(a, kind, id, decode) do
-    {:ok, bin} = KV.get(a.kv, :locs, Codec.loc_key(kind, div(id, @sparse)))
-    Segments.read_nth(a.readers[kind], Codec.unpack_loc(bin), rem(id, @sparse), decode)
+    loc = fetch_loc!(a, kind, div(id, @sparse))
+    Segments.read_nth(a.readers[kind], loc, rem(id, @sparse), decode)
   end
 
   @doc false
@@ -887,16 +974,39 @@ defmodule Exnode.Archive do
     if count == 0 do
       []
     else
-      {:ok, bin} = KV.get(a.kv, :locs, Codec.loc_key(kind, div(first, @sparse)))
+      loc = fetch_loc!(a, kind, div(first, @sparse))
 
       Segments.read_run(
         a.readers[kind],
-        Codec.unpack_loc(bin),
+        loc,
         rem(first, @sparse),
         count,
         decode
       )
     end
+  end
+
+  defp fetch_loc!(a, kind, base) do
+    case KV.get(a.kv, :locs, Codec.loc_key(kind, base)) do
+      {:ok, bin} ->
+        unpack_loc!(a.kv.guard, bin)
+
+      :not_found ->
+        StorageError.raise_and_latch!(
+          a.kv.guard,
+          :archive,
+          {:missing_loc, kind, base},
+          "missing sparse #{kind} location for base #{base}"
+        )
+    end
+  end
+
+  defp unpack_loc!(guard, bin) do
+    Codec.unpack_loc(bin)
+  rescue
+    e in StorageError ->
+      Exnode.Store.Guard.latch_fault(guard, e.source || :archive, e.reason, Exception.message(e))
+      reraise e, __STACKTRACE__
   end
 
   # --- connect / disconnect ----------------------------------------------------
@@ -1015,6 +1125,14 @@ defmodule Exnode.Archive do
     t0 = System.monotonic_time(:microsecond)
     Enum.each(a.segs, fn {_, s} -> :ok = Segments.sync(s) end)
     t1 = System.monotonic_time(:microsecond)
+
+    # When `defer_prune: true` (snapshot-managed mode), raise `wpruned` inside
+    # the SAME synced commit batch so the snapshot records it atomically, and
+    # physically delete the segment files only after snapshot rotation via
+    # `finalize_pruned_witness/2`.
+    {a, deferred_segs} =
+      if a.defer_prune, do: advance_wpruned(a), else: {a, []}
+
     ops = a.batch.ops |> Enum.reverse() |> Enum.concat()
     ops = with_meta(a, ops ++ extra_ops)
     tm = System.monotonic_time(:microsecond)
@@ -1022,6 +1140,7 @@ defmodule Exnode.Archive do
     # rows insert into the memtable several times faster (Store.PackedSort).
     :ok = KV.write(a.kv, ops, sync: true, stats: true, sort_packed: true)
     :atomics.put(a.committed_live, 1, a.tip.height)
+    if deferred_segs != [], do: :atomics.put(a.wpruned_live, 1, a.wpruned)
     t2 = System.monotonic_time(:microsecond)
     count(:commit_blocks, a.batch.n)
     count(:commit_materialize_us, tm - t1)
@@ -1051,7 +1170,7 @@ defmodule Exnode.Archive do
     }
 
     t3 = System.monotonic_time(:microsecond)
-    a = prune_witness(a)
+    a = if a.defer_prune, do: a, else: prune_witness(a)
     count(:commit_overlay_us, t3 - t2)
     count(:commit_prune_us, System.monotonic_time(:microsecond) - t3)
     count(:commits, 1)
@@ -1072,6 +1191,7 @@ defmodule Exnode.Archive do
 
     meta =
       :erlang.term_to_binary(%{
+        format_version: @format_version,
         next: a.next,
         ends: ends,
         tip: a.tip.id,
@@ -1500,9 +1620,9 @@ defmodule Exnode.Archive do
 
   # --- witness pruning ---------------------------------------------------------
 
-  defp prune_witness(%{prune_keep: nil} = a), do: a
+  defp advance_wpruned(%{prune_keep: nil} = a), do: {a, []}
 
-  defp prune_witness(a) do
+  defp advance_wpruned(a) do
     {current, _} = Segments.position(a.segs.witness)
     limit = a.tip.height - a.prune_keep
 
@@ -1514,15 +1634,44 @@ defmodule Exnode.Archive do
 
     case segs do
       [] ->
-        a
+        {a, []}
 
       _ ->
-        a = %{a | wpruned: List.last(segs), wseg_max: Map.drop(a.wseg_max, segs)}
+        {%{a | wpruned: List.last(segs), wseg_max: Map.drop(a.wseg_max, segs)}, segs}
+    end
+  end
+
+  @doc """
+  Physically deletes pruned witness segments up to `safe_wpruned` (inclusive),
+  called ONLY after every retained snapshot records `wpruned >= safe_wpruned`.
+  """
+  def finalize_pruned_witness(%__MODULE__{wpruned_deleted: del} = a, safe_wpruned)
+      when is_integer(safe_wpruned) and safe_wpruned > del do
+    target = min(safe_wpruned, a.wpruned)
+
+    if target > del do
+      for seg <- (del + 1)..target//1, do: Segments.remove(a.segs.witness, seg)
+      %{a | wpruned_deleted: target}
+    else
+      a
+    end
+  end
+
+  def finalize_pruned_witness(%__MODULE__{} = a, _safe_wpruned), do: a
+
+  defp prune_witness(%{prune_keep: nil} = a), do: a
+
+  defp prune_witness(a) do
+    case advance_wpruned(a) do
+      {a, []} ->
+        a
+
+      {a, segs} ->
         write_with_meta(a, [])
         # Readers see the prune before the files go.
         :atomics.put(a.wpruned_live, 1, a.wpruned)
         Enum.each(segs, &Segments.remove(a.segs.witness, &1))
-        a
+        %{a | wpruned_deleted: a.wpruned}
     end
   end
 

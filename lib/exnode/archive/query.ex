@@ -8,7 +8,8 @@ defmodule Exnode.Archive.Query do
   alias Exnode.Archive.{Codec, Segments}
   alias Exnode.Codec.{Block, CompactSize, Header, Tx}
   alias Exnode.Crypto.Hash
-  alias Exnode.Store.KV
+  alias Exnode.StorageError
+  alias Exnode.Store.{Guard, KV}
   alias Exnode.Validation.Block, as: BlockRules
   alias Exnode.Validation.Merkle
 
@@ -435,13 +436,36 @@ defmodule Exnode.Archive.Query do
       Archive.bump_stat(:facts_merkle_us, System.monotonic_time(:microsecond) - t2)
 
       cond do
-        ins_left != [] or outs_left != [] -> {:error, {:archive_integrity, :leftover_records}}
-        root != header.merkle_root -> {:error, {:archive_integrity, "bad-txnmrklroot"}}
-        mutated -> {:error, {:archive_integrity, "bad-txns-duplicate"}}
-        not coinbase_prevouts?(hd(txs)) -> {:error, {:archive_integrity, :first_tx_not_coinbase}}
-        true -> {:ok, %{hash: header.hash, header: header, txs: txs}}
+        ins_left != [] or outs_left != [] ->
+          integrity_error(a, id, :leftover_records)
+
+        root != header.merkle_root ->
+          integrity_error(a, id, "bad-txnmrklroot")
+
+        mutated ->
+          integrity_error(a, id, "bad-txns-duplicate")
+
+        not coinbase_prevouts?(hd(txs)) ->
+          integrity_error(a, id, :first_tx_not_coinbase)
+
+        true ->
+          {:ok, %{hash: header.hash, header: header, txs: txs}}
       end
+    else
+      {:error, {:archive_integrity, reason}} ->
+        integrity_error(a, id, reason)
     end
+  end
+
+  defp integrity_error(a, id, reason) do
+    Guard.latch_fault(
+      a.kv.guard,
+      :archive,
+      {:archive_integrity, id, reason},
+      "archive integrity mismatch on block #{id}: #{inspect(reason)}"
+    )
+
+    {:error, {:archive_integrity, reason}}
   end
 
   defp facts_header(a, id, rec) do
@@ -623,13 +647,49 @@ defmodule Exnode.Archive.Query do
       end)
 
     raw = IO.iodata_to_binary(Block.encode(%Block{header: header, txs: txs}))
-    {:ok, block} = Block.decode_exact(raw)
-    :ok = BlockRules.check_merkle_root(block)
+
+    block =
+      case Block.decode_exact(raw) do
+        {:ok, b} ->
+          b
+
+        other ->
+          StorageError.raise_and_latch!(
+            a.kv.guard,
+            :archive,
+            {:reconstruct_decode, rec.height, other},
+            "reconstructed block at height #{rec.height} failed decode: #{inspect(other)}"
+          )
+      end
+
+    case BlockRules.check_merkle_root(block) do
+      :ok ->
+        :ok
+
+      other ->
+        StorageError.raise_and_latch!(
+          a.kv.guard,
+          :archive,
+          {:reconstruct_merkle, rec.height, other},
+          "reconstructed block at height #{rec.height} failed merkle check: #{inspect(other)}"
+        )
+    end
 
     # Core ContextualCheckBlock: a commitment is expected once segwit is
     # active, whatever the coinbase looks like. A pre-segwit block may carry
     # a commitment-shaped output without a coinbase witness.
-    :ok = BlockRules.check_witness_malleation(block, rec.height >= a.segwit_height)
+    case BlockRules.check_witness_malleation(block, rec.height >= a.segwit_height) do
+      :ok ->
+        :ok
+
+      other ->
+        StorageError.raise_and_latch!(
+          a.kv.guard,
+          :archive,
+          {:reconstruct_witness, rec.height, other},
+          "reconstructed block at height #{rec.height} failed witness check: #{inspect(other)}"
+        )
+    end
 
     {:ok, raw, block}
   end
