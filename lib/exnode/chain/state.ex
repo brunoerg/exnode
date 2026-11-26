@@ -34,6 +34,7 @@ defmodule Exnode.Chain.State do
   require Logger
 
   alias Exnode.Archive
+  alias Exnode.Archive.Segments
   alias Exnode.Chain.{GcProbe, HeaderIndex, Headers, Prefetch, Quarantine, Telemetry, View}
   alias Exnode.Codec.Block
   alias Exnode.Consensus.Pow
@@ -64,6 +65,8 @@ defmodule Exnode.Chain.State do
     :view,
     :exec,
     :exec_private,
+    :worker_sup,
+    :worker_sup_private,
     :assume_valid,
     :rule_override,
     :test_script_hook,
@@ -301,6 +304,16 @@ defmodule Exnode.Chain.State do
           {exec, nil}
       end
 
+    {worker_sup, worker_sup_private} =
+      case Keyword.get(opts, :worker_sup) do
+        nil ->
+          {:ok, sup} = Task.Supervisor.start_link()
+          {sup, sup}
+
+        sup ->
+          {sup, nil}
+      end
+
     view = View.new(kv, opts[:name])
 
     st = %__MODULE__{
@@ -311,6 +324,8 @@ defmodule Exnode.Chain.State do
       view: view,
       exec: exec,
       exec_private: private && {exec, private},
+      worker_sup: worker_sup,
+      worker_sup_private: worker_sup_private,
       assume_valid: AssumeValid.resolve(Keyword.get(opts, :assume_valid), p),
       rule_override: Keyword.get(opts, :rule_override),
       test_skip_scripts: Keyword.get(opts, :test_skip_scripts, false),
@@ -796,6 +811,10 @@ defmodule Exnode.Chain.State do
         :ok
     end
 
+    if is_pid(st.worker_sup_private) and Process.alive?(st.worker_sup_private) do
+      catch_exit(fn -> Supervisor.stop(st.worker_sup_private, :shutdown, 5_000) end)
+    end
+
     :ok
   end
 
@@ -1109,7 +1128,7 @@ defmodule Exnode.Chain.State do
         }
 
         st = %{st | plan: plan}
-        pf = Prefetch.start(path, depth, Archive.reader(st.a), ctx, admit_fun(st))
+        pf = Prefetch.start(path, depth, Archive.reader(st.a), ctx, admit_fun(st), st.worker_sup)
         {:ok, put_in(st.plan.pf, pf)}
     end
   end
@@ -1223,8 +1242,8 @@ defmodule Exnode.Chain.State do
     hook = st.test_archive_prep_hook
     launched = System.monotonic_time(:microsecond)
 
-    {_pid, mref} =
-      spawn_monitor(fn ->
+    {:ok, pid} =
+      Task.Supervisor.start_child(st.worker_sup, fn ->
         result =
           try do
             block =
@@ -1243,15 +1262,18 @@ defmodule Exnode.Chain.State do
              })}
           catch
             kind, reason -> {:error, {kind, reason}}
+          after
+            Segments.close_all_readers()
           end
 
         send(owner, {:archive_prep_done, tag, result})
       end)
 
-    %{item | apre: {:pending, tag, mref}, apre_next: next}
+    mref = Process.monitor(pid)
+    %{item | apre: {:pending, tag, pid, mref}, apre_next: next}
   end
 
-  defp await_archive_prep(st, %{ref: ref, state: :ready, apre: {:pending, tag, _}}) do
+  defp await_archive_prep(st, %{ref: ref, state: :ready, apre: {:pending, tag, _, _}}) do
     receive do
       {:archive_prep_done, ^tag, result} ->
         st = archive_prep_result(st, tag, result)
@@ -1265,7 +1287,7 @@ defmodule Exnode.Chain.State do
 
   defp archive_prep_result(st, {:apre, gen, ref} = tag, result) do
     case st.plan do
-      %{gen: ^gen, items: %{^ref => %{apre: {:pending, ^tag, mref}} = item} = items} ->
+      %{gen: ^gen, items: %{^ref => %{apre: {:pending, ^tag, _pid, mref}} = item} = items} ->
         Process.demonitor(mref, [:flush])
 
         {item, us} =
@@ -1297,7 +1319,7 @@ defmodule Exnode.Chain.State do
   defp archive_prep_down(%__MODULE__{plan: %{items: items}} = st, mref, reason)
        when reason != :normal do
     case Enum.find_value(items, fn {ref, i} ->
-           if match?(%{apre: {:pending, _, ^mref}}, i), do: {ref, i}
+           if match?(%{apre: {:pending, _, _, ^mref}}, i), do: {ref, i}
          end) do
       {ref, item} ->
         st = put_in(st.plan.items, %{items | ref => %{item | apre: :none}})
@@ -1369,6 +1391,12 @@ defmodule Exnode.Chain.State do
     refs = Map.keys(plan.items)
     if refs != [], do: ScriptExec.cancel(st.exec, refs)
     if plan.pf, do: Prefetch.stop(plan.pf)
+
+    for {_ref, %{apre: {:pending, _tag, pid, mref}}} <- plan.items do
+      catch_exit(fn -> Task.Supervisor.terminate_child(st.worker_sup, pid) end)
+      Process.demonitor(mref, [:flush])
+    end
+
     %{st | plan: nil}
   end
 
@@ -1523,7 +1551,7 @@ defmodule Exnode.Chain.State do
   defp wait_reason(%__MODULE__{plan: %{} = plan} = st) do
     head =
       case peek_head(plan) do
-        {:ok, %{state: :ready, apre: {:pending, _, _}}} -> "apre"
+        {:ok, %{state: :ready, apre: {:pending, _, _, _}}} -> "apre"
         {:ok, %{state: s}} -> Atom.to_string(s)
         :empty -> "empty"
       end

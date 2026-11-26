@@ -51,6 +51,7 @@ defmodule Exnode.Chain.Prefetch do
   """
 
   alias Exnode.Archive
+  alias Exnode.Archive.Segments
   alias Exnode.Chain.HeaderIndex
   alias Exnode.Codec.Block
   alias Exnode.Store.KV
@@ -63,7 +64,8 @@ defmodule Exnode.Chain.Prefetch do
             results: %{},
             retained: 0,
             depth: 0,
-            ctx: nil
+            ctx: nil,
+            task_sup: nil
 
   @doc """
   Starts prefetching `path` (header entries, in order), keeping up to
@@ -71,12 +73,14 @@ defmodule Exnode.Chain.Prefetch do
   where `current` is a decoded block already in hand (or nil) and `hint`
   is `Archive.overlay_hint/1` of the chain state's archive (or nil).
   `admit?.(pf)` gates each new worker (the owner's byte budget).
+  When `task_sup` is given, workers are started under that `Task.Supervisor`
+  and terminated through `Task.Supervisor.terminate_child/2` on `stop/1`.
   """
-  def start(path, depth, reader, ctx, admit? \\ fn _ -> true end)
-  def start(_path, depth, _reader, _ctx, _admit?) when depth <= 0, do: %__MODULE__{}
+  def start(path, depth, reader, ctx, admit? \\ fn _ -> true end, task_sup \\ nil)
+  def start(_path, depth, _reader, _ctx, _admit?, _task_sup) when depth <= 0, do: %__MODULE__{}
 
-  def start(path, depth, reader, ctx, admit?) do
-    fill(%__MODULE__{todo: path, depth: depth, ctx: ctx}, reader, admit?)
+  def start(path, depth, reader, ctx, admit?, task_sup) do
+    fill(%__MODULE__{todo: path, depth: depth, ctx: ctx, task_sup: task_sup}, reader, admit?)
   end
 
   @doc "Appends entries to the path (an extension on the same branch); `ctx.idx` is updated."
@@ -91,8 +95,19 @@ defmodule Exnode.Chain.Prefetch do
       ctx = pf.ctx
       owner = self()
       tag = make_ref()
-      pid = spawn_link(fn -> send(owner, {:prefetch_done, tag, prepare(reader, entry, ctx)}) end)
-      mref = Process.monitor(pid)
+
+      fun = fn ->
+        res =
+          try do
+            prepare(reader, entry, ctx)
+          after
+            Segments.close_all_readers()
+          end
+
+        send(owner, {:prefetch_done, tag, res})
+      end
+
+      {pid, mref} = start_worker(pf.task_sup, fun)
 
       fill(
         %{
@@ -110,6 +125,16 @@ defmodule Exnode.Chain.Prefetch do
   end
 
   def fill(pf, _reader, _admit?), do: pf
+
+  defp start_worker(nil, fun) do
+    pid = spawn_link(fun)
+    {pid, Process.monitor(pid)}
+  end
+
+  defp start_worker(sup, fun) do
+    {:ok, pid} = Task.Supervisor.start_child(sup, fun)
+    {pid, Process.monitor(pid)}
+  end
 
   @doc "Records a worker's result. `:unknown` if `tag` is not one of this prefetch's workers."
   def reply(%__MODULE__{} = pf, tag, result) do
@@ -181,15 +206,27 @@ defmodule Exnode.Chain.Prefetch do
   @doc "Workers started and not yet taken (running or ready)."
   def in_flight(%__MODULE__{tasks: t}), do: :queue.len(t)
 
-  @doc "Kills the workers still running (unlinked first: the owner sees no exit)."
-  def stop(%__MODULE__{workers: workers}) do
+  @doc "Terminates every worker still running and flushes its monitor."
+  def stop(%__MODULE__{workers: workers, task_sup: sup}) do
     for {_tag, {pid, mref}} <- workers do
-      Process.unlink(pid)
-      Process.exit(pid, :kill)
+      terminate_worker(sup, pid)
       Process.demonitor(mref, [:flush])
     end
 
     :ok
+  end
+
+  defp terminate_worker(nil, pid) do
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+  end
+
+  defp terminate_worker(sup, pid) do
+    try do
+      Task.Supervisor.terminate_child(sup, pid)
+    catch
+      :exit, _ -> :ok
+    end
   end
 
   # Retained bytes of a ready result: the raw block plus its decoded form

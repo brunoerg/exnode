@@ -112,10 +112,12 @@ defmodule Exnode.Node do
       sync: Module.concat(prefix, SyncState),
       peer_sup: Module.concat(prefix, PeerSup),
       local_nonces: Module.concat(prefix, LocalNonces),
+      chain_workers: Module.concat(prefix, ChainWorkers),
       chain_state: Module.concat(prefix, ChainState),
       script_exec: Module.concat(prefix, ScriptExec),
       block_download: Module.concat(prefix, BlockDownload),
       block_serving: Module.concat(prefix, BlockServing),
+      block_serving_workers: Module.concat(prefix, BlockServingWorkers),
       shadow_monitor: Module.concat(prefix, ShadowMonitor),
       mempool: Module.concat(prefix, Mempool),
       mempool_verify: Module.concat(prefix, MempoolVerify),
@@ -412,10 +414,12 @@ defmodule Exnode.Node do
           # calls before taking new work (ScriptExec moduledoc).
           {Exnode.Validation.ScriptExec,
            name: n.script_exec, workers: Keyword.get(opts, :script_workers)},
+          {Task.Supervisor, name: n.chain_workers},
           {
             ChainState,
             # BlockDownload wakes waiting peers when the tip advances.
             script_exec: n.script_exec,
+            worker_sup: n.chain_workers,
             min_heap_size:
               Keyword.get(opts, :chain_state_min_heap, ChainState.default_min_heap_size()),
             min_bin_vheap_size:
@@ -497,7 +501,8 @@ defmodule Exnode.Node do
                params: params,
                clock: clock},
               {Exnode.P2P.HighBandwidth, name: n.high_bandwidth},
-              {Exnode.P2P.BlockServing, name: n.block_serving},
+              {Task.Supervisor, name: n.block_serving_workers},
+              {Exnode.P2P.BlockServing, name: n.block_serving, task_sup: n.block_serving_workers},
               {Task.Supervisor, name: n.decode_sup},
               {Exnode.P2P.DecodeBudget,
                name: n.decode_budget,
