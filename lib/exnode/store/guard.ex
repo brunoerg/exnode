@@ -125,7 +125,12 @@ defmodule Exnode.Store.Guard do
 
     state = :atomics.new(2, signed: false)
     :atomics.put(state, @slot_fault, 0)
-    :atomics.put(state, @slot_clean, if(Keyword.get(opts, :require_clean_mark, true), do: 0, else: 1))
+
+    :atomics.put(
+      state,
+      @slot_clean,
+      if(Keyword.get(opts, :require_clean_mark, true), do: 0, else: 1)
+    )
 
     tab = :ets.new(:store_guard_info, [:set, :public, read_concurrency: true])
 
@@ -177,7 +182,10 @@ defmodule Exnode.Store.Guard do
         latched: true,
         message:
           "#{guard.name} store is halted after latched storage fault: " <>
-            if(info, do: "#{inspect(info.source)} #{inspect(info.reason)} (#{info.message})", else: "unknown")
+            if(info,
+              do: "#{inspect(info.source)} #{inspect(info.reason)} (#{info.message})",
+              else: "unknown"
+            )
     end
 
     :ok
@@ -311,8 +319,12 @@ defmodule Exnode.Store.Guard do
     path = lock_path(dir)
 
     case File.rm(path) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
+      :ok ->
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
       {:error, reason} ->
         raise Exnode.StorageError,
           source: :store_guard,
@@ -336,7 +348,9 @@ defmodule Exnode.Store.Guard do
       :ok
     else
       err ->
-        msg = "cannot fsync directory #{dir} (#{inspect(err)}): store durability contract violated"
+        msg =
+          "cannot fsync directory #{dir} (#{inspect(err)}): store durability contract violated"
+
         latch_fault(guard, :fsync_dir, {:fsync_dir, dir, err}, msg)
 
         raise Exnode.StorageError,

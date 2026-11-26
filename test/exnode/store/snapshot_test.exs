@@ -70,7 +70,10 @@ defmodule Exnode.Store.SnapshotTest do
 
     a =
       Enum.reduce(first5, a, fn b, a ->
-        Archive.connect(a, b, a.tip.height + 1, [], commit: false, delta: %{created: %{}, spent: []})
+        Archive.connect(a, b, a.tip.height + 1, [],
+          commit: false,
+          delta: %{created: %{}, spent: []}
+        )
       end)
       |> Archive.flush()
 
@@ -94,7 +97,10 @@ defmodule Exnode.Store.SnapshotTest do
 
     a =
       Enum.reduce(next5, a, fn b, a ->
-        Archive.connect(a, b, a.tip.height + 1, [], commit: false, delta: %{created: %{}, spent: []})
+        Archive.connect(a, b, a.tip.height + 1, [],
+          commit: false,
+          delta: %{created: %{}, spent: []}
+        )
       end)
 
     # Append torn garbage directly to hot outputs and cold inputs/witness segments.
@@ -212,7 +218,10 @@ defmodule Exnode.Store.SnapshotTest do
     # First batch: blocks 1..20, snapshot 1 (primary only)
     a =
       Enum.reduce(Enum.take(bs, 20), a, fn b, a ->
-        Archive.connect(a, b, a.tip.height + 1, [], commit: false, delta: %{created: %{}, spent: []})
+        Archive.connect(a, b, a.tip.height + 1, [],
+          commit: false,
+          delta: %{created: %{}, spent: []}
+        )
       end)
       |> Archive.flush()
 
@@ -224,7 +233,10 @@ defmodule Exnode.Store.SnapshotTest do
     # Second batch: blocks 21..40, snapshot 2 -> primary has wp2, secondary still has wp1.
     a =
       Enum.reduce(Enum.drop(bs, 20), a, fn b, a ->
-        Archive.connect(a, b, a.tip.height + 1, [], commit: false, delta: %{created: %{}, spent: []})
+        Archive.connect(a, b, a.tip.height + 1, [],
+          commit: false,
+          delta: %{created: %{}, spent: []}
+        )
       end)
       |> Archive.flush()
 
@@ -249,7 +261,9 @@ defmodule Exnode.Store.SnapshotTest do
     assert restored.slot == :secondary
     assert restored.wpruned == wp1
 
-    {g2, kv2, a2} = open_canonical(chain_dir, strict_clean: true, defer_prune: true, prune_keep: 10, max: 200)
+    {g2, kv2, a2} =
+      open_canonical(chain_dir, strict_clean: true, defer_prune: true, prune_keep: 10, max: 200)
+
     assert Archive.tip(a2).height == 20
     close_clean(g2, kv2, a2)
   end

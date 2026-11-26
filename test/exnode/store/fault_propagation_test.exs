@@ -74,7 +74,9 @@ defmodule Exnode.Store.FaultPropagationTest do
     for b <- [b1, b2], do: assert({:ok, :connected} = State.submit_block(n1.chain_state, b))
     :ok = stop_supervised(name1)
     assert Guard.inspect_lock(chain_dir) == :clean
-    assert {:ok, :primary, _, %{tip: %{height: 2}}} = Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
+
+    assert {:ok, :primary, _, %{tip: %{height: 2}}} =
+             Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
 
     # 2. Reopen cleanly, connect b3 & b4 WITHOUT committing, then kill node root.
     {root, _name2, n2} = start_unlinked_node(dir, batch_blocks: 100, commit_at_tip: false)
@@ -110,7 +112,8 @@ defmodule Exnode.Store.FaultPropagationTest do
       end)
 
       assert_receive {:start_res,
-                      {:error, {%Exnode.StorageError{reason: {:dirty_store, "canonical", _, _}}, _}}},
+                      {:error,
+                       {%Exnode.StorageError{reason: {:dirty_store, "canonical", _, _}}, _}}},
                      5_000
     end)
 
@@ -154,7 +157,8 @@ defmodule Exnode.Store.FaultPropagationTest do
 
     File.write!(
       seg0,
-      binary_part(bin, 0, idx) <> <<flipped>> <> binary_part(bin, idx + 1, byte_size(bin) - idx - 1)
+      binary_part(bin, 0, idx) <>
+        <<flipped>> <> binary_part(bin, idx + 1, byte_size(bin) - idx - 1)
     )
 
     # Requesting b1 via BlockServing triggers Archive.read_block -> merkle failure ->

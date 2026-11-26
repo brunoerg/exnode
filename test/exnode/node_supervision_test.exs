@@ -161,10 +161,11 @@ defmodule Exnode.NodeSupervisionTest do
   # Regression: the owner closed the store only on shutdown;
   # after the root was killed, the index handles kept in persistent_term
   # held the database and its LOCK, and a new node on the datadir failed.
-  test "a killed node has closed its store too: it reopens at once (and leaves flush.lock dirty)", %{
-    tmp_dir: dir,
-    name: name
-  } do
+  test "a killed node has closed its store too: it reopens at once (and leaves flush.lock dirty)",
+       %{
+         tmp_dir: dir,
+         name: name
+       } do
     root = GenServer.whereis(name)
     ref = Process.monitor(root)
     Process.exit(root, :kill)

@@ -60,6 +60,9 @@ defmodule Exnode.Archive.ReconstructCommitmentTest do
     b = BB.build(@p.genesis.header, [cb])
     a = a |> Archive.connect(b, 1, []) |> Archive.flush()
     %{id: id} = Archive.tip(a)
-    assert_raise Exnode.StorageError, ~r/failed witness check/, fn -> Archive.read_block(a, id) end
+
+    assert_raise Exnode.StorageError, ~r/failed witness check/, fn ->
+      Archive.read_block(a, id)
+    end
   end
 end

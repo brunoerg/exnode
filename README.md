@@ -154,15 +154,31 @@ threshold, not preallocated RAM or a physical-memory cap.
 | Committed (`committed`) | Segment sync and the synced atomic KV publication completed. |
 | Index-ready | A particular optional index has caught up to the committed target. |
 
-The commit order makes the KV metadata the authority for segment ends and the
-durable tip. New segment directory entries are synced before committed metadata
-can reference them. Recovery truncates later tails; missing/short committed
-segments are an error, not an invitation to recreate them with empty data.
+The commit order makes the canonical KV metadata the authority for segment ends
+and the durable tip. New segment directory entries are synced before committed
+metadata can reference them. Canonical consensus state (`index/`, single-writer,
+`sync: true` only with `use_fsync`, `atomic_flush`, `paranoid_checks`, and
+`absolute_consistency` WAL recovery) is separated from ephemeral download/header
+staging (`staging/`) and optional query indexes (`derived/`).
 
-Pending admission uses unsynced writes, so a `:stored` reply is not a promise
-that every accepted body survives power loss. Available pending bodies support
-replay; missing bodies can be downloaded again. Batching amortizes sync costs
-while allowing the active tip to lead the committed tip.
+`flush.lock` enforces a strict clean-close gate: the lock is created and fsynced
+before opening the store and removed only after a clean, fault-free shutdown.
+After every canonical commit, `exnode` takes a quiescent RocksDB checkpoint
+(flushing memtables and hard-linking immutable SSTs) and rotates
+`snapshots/primary` and `snapshots/secondary` via atomic directory renames.
+After a crash or power loss, the node refuses to open the dirty store directly;
+`mix exnode.restore` (or `bin/exnode-restore`) replaces `index/` whole from the
+latest complete snapshot, truncates hot/cold append-only segments to the
+snapshot's exact `ends`, wipes ephemeral `staging/`, and clears `flush.lock`.
+Any storage I/O error, checksum mismatch, missing/short segment, or archive
+integrity failure permanently latches a store fault, halts the node immediately,
+and retains `flush.lock` with the fault record (requiring investigation and
+`--force-from-snapshot` or a full resync).
+
+Pending admission uses unsynced writes into `staging/`, so a `:stored` reply is
+not a promise that every accepted body survives power loss. Missing bodies are
+downloaded again after restore. Batching amortizes sync costs while allowing the
+active tip to lead the committed tip.
 
 ### Prefetch is advisory, with an explicit validity window
 
@@ -292,10 +308,12 @@ in. Unpack it anywhere and run:
 ```sh
 exnode-<version>-<arch>-linux-gnu/bin/exnoded --chain testnet4 --datadir ~/exnode-testnet4
 exnode-<version>-<arch>-linux-gnu/bin/exnode-reconsider --chain testnet4 --datadir ~/exnode-testnet4
+exnode-<version>-<arch>-linux-gnu/bin/exnode-restore --chain testnet4 --datadir ~/exnode-testnet4
 ```
 
-They take the options of `mix exnode.node` and `mix exnode.reconsider`. The
-node runs without Erlang distribution, and no cookie ships with the release.
+They take the options of `mix exnode.node`, `mix exnode.reconsider`, and
+`mix exnode.restore`. The node runs without Erlang distribution, and no cookie
+ships with the release.
 
 ## Running
 

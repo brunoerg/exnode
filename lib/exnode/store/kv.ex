@@ -463,7 +463,9 @@ defmodule Exnode.Store.KV do
 
   def multi_get(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf, keys) do
     Guard.check!(guard)
-    found = :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, async_io: true, verify_checksums: true)
+
+    found =
+      :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, async_io: true, verify_checksums: true)
 
     case Enum.find(found, &match?({:error, _}, &1)) do
       {:error, reason} -> fail!(guard, :multi_get, cf, reason)
@@ -657,7 +659,10 @@ defmodule Exnode.Store.KV do
   def iterator(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf) do
     Guard.check!(guard)
 
-    case :rocksdb.iterator(db, Map.fetch!(cfs, cf), total_order_seek: true, verify_checksums: true) do
+    case :rocksdb.iterator(db, Map.fetch!(cfs, cf),
+           total_order_seek: true,
+           verify_checksums: true
+         ) do
       {:ok, it} -> it
       {:error, reason} -> fail!(guard, :iterator, cf, reason)
     end

@@ -304,7 +304,8 @@ defmodule Exnode.Archive.Segments do
     removed = remove_trailing_segments!(dir, seg, nil)
     if removed > 0, do: Guard.sync_dir!(dir)
 
-    fd = io_ok!(nil, {:open, kind, seg}, :file.open(path(dir, seg), [:raw, :binary, :read, :write]))
+    fd =
+      io_ok!(nil, {:open, kind, seg}, :file.open(path(dir, seg), [:raw, :binary, :read, :write]))
 
     try do
       _ = io_ok!(nil, {:position, kind, seg}, :file.position(fd, offset))

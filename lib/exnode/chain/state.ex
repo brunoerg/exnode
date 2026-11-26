@@ -304,7 +304,10 @@ defmodule Exnode.Chain.State do
     # Ensure a fresh datadir immediately has a valid genesis snapshot on disk
     # so even a crash at height 0 can be restored cleanly.
     if chain_dir != nil and
-         match?({:error, :no_valid_snapshot}, Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))) do
+         match?(
+           {:error, :no_valid_snapshot},
+           Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
+         ) do
       {:ok, _safe} = take_canonical_snapshot!(a, chain_dir)
     end
 
@@ -593,7 +596,8 @@ defmodule Exnode.Chain.State do
       )
 
     if dropped != [],
-      do: :ok = KV.write(st.staging_kv, for(h <- dropped, do: {:delete, :pending, h}), sync: false)
+      do:
+        :ok = KV.write(st.staging_kv, for(h <- dropped, do: {:delete, :pending, h}), sync: false)
 
     View.hold_many(st.view, held)
     st = %{st | blocks: MapSet.new(held)}
@@ -611,7 +615,7 @@ defmodule Exnode.Chain.State do
   defp load_candidates(st) do
     {disconnected, count} =
       KV.fold_prefix(st.kv, :blockhash, <<>>, {MapSet.new(), 0}, fn {hash, <<id::32>>},
-                                                                   {acc, n} ->
+                                                                    {acc, n} ->
         active = Archive.on_chain?(st.a, id)
         :ets.insert(st.availability, {hash, if(active, do: 0, else: 1)})
         acc = if active, do: acc, else: MapSet.put(acc, hash)
