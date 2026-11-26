@@ -175,7 +175,7 @@ defmodule Exnode.Chain.Telemetry do
           "archive: prepared #{g.(c, :append_prepared)} mismatched #{g.(c, :append_prepared_mismatch)}, " <>
           "encode #{ms(g.(c, :append_encode_us))}ms segments #{ms(g.(c, :append_segments_us))}ms " <>
           "txindex #{ms(g.(c, :append_txindex_us))}ms (reads #{g.(c, :txindex_reads)}, read #{ms(g.(c, :txindex_read_us))}ms, " <>
-          "hint stale #{g.(c, :txindex_hint_stale)}) overwritten #{ms(g.(c, :append_overwritten_us))}ms " <>
+          "skipped #{g.(c, :txindex_skipped)}, hint stale #{g.(c, :txindex_hint_stale)}) overwritten #{ms(g.(c, :append_overwritten_us))}ms " <>
           "record #{ms(g.(c, :append_record_us))}ms overlay #{ms(g.(c, :connect_overlay_us))}ms " <>
           "(spent #{ms(g.(c, :ov_spent_us))}ms created #{ms(g.(c, :ov_created_us))}ms) chain #{ms(g.(c, :connect_chain_us))}ms; " <>
           "validation: check_block #{ms(g.(v, :checkblock))}ms contextual #{ms(g.(v, :contextual))}ms " <>

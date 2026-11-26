@@ -187,4 +187,87 @@ defmodule Exnode.Archive.TxindexHistoryTest do
     Archive.close(a)
     KV.close(kv)
   end
+
+  test "unique_txids skips txindex reads on a linear archive and falls back after any disconnect",
+       %{tmp_dir: dir} do
+    {:ok, kv} = KV.open(Path.join(dir, "kv"))
+    a = Archive.open(kv, Path.join(dir, "a"), nil, @p.genesis)
+    assert Archive.linear?(a)
+    assert Archive.linear?(Archive.reader(a))
+
+    t = BB.tx([{:binary.copy(<<9>>, 32), 0}], [{@coin, @op_true}])
+    b1 = BB.build(@p.genesis.header, [cb(1, 1)])
+    b2 = BB.build(b1.header, [cb(2, 2), t])
+    f2 = BB.build(b1.header, [cb(2, 20), t])
+
+    # Linear archive: unique_txids skips RocksDB reads in prefetch, prepare_append, and connect.
+    Archive.take_stats()
+    {_, pf_stats, hist} = Archive.prefetch_block(Archive.reader(a), [], nil, :unique)
+    assert hist == :unique
+    assert pf_stats.history_rows == 0 and pf_stats.history_extra == 0
+
+    e = Archive.epoch(a)
+    a = Archive.connect(a, b1, 1, [], delta: @no_delta, commit: false, unique_txids: true)
+    assert Archive.linear?(a)
+    a = Archive.flush(a)
+    assert {:ok, %{}, :unique, 0} = Archive.revalidate(a, e, %{}, :unique)
+
+    p2 =
+      Archive.prepare_append(
+        b2,
+        2,
+        [1],
+        Archive.next_ids(a),
+        @no_delta,
+        Archive.kv_reader(a),
+        :unique
+      )
+
+    assert p2.history == :unique
+
+    a =
+      Archive.connect(a, b2, 2, [1],
+        delta: @no_delta,
+        commit: false,
+        history: :unique,
+        prepared: p2,
+        unique_txids: true
+      )
+
+    a = Archive.flush(a)
+    s1 = Archive.take_stats()
+    assert s1.txindex_reads == 0
+    assert s1.txindex_skipped == 3
+    assert Archive.linear?(a)
+
+    # Disconnect b2: archive is no longer linear (even though b2 is still stored).
+    {a, _} = Archive.disconnect_tip(a)
+    refute Archive.linear?(a)
+    refute Archive.linear?(Archive.reader(a))
+
+    # Even if a caller passes unique_txids: true / history: :unique, append refuses to
+    # skip because a.next.block != height, preserving both b2 and f2 occurrences of t.
+    Archive.take_stats()
+
+    a =
+      Archive.connect(a, f2, 2, [1],
+        delta: @no_delta,
+        commit: false,
+        history: :unique,
+        unique_txids: true
+      )
+
+    a = Archive.flush(a)
+    s2 = Archive.take_stats()
+    assert s2.txindex_skipped == 0
+    assert s2.txindex_reads == 2
+    refute Archive.linear?(a)
+    refute Archive.linear?(Archive.reader(a))
+
+    {:ok, bin} = KV.get(kv, :txindex, t.txid)
+    assert [{2, 1, _, 1, _}, {3, 1, _, 1, _}] = Archive.decode_txindex(bin)
+
+    Archive.close(a)
+    KV.close(kv)
+  end
 end

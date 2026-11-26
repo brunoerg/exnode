@@ -195,8 +195,10 @@ defmodule Exnode.Chain.Prefetch do
   # Retained bytes of a ready result: the raw block plus its decoded form
   # (about twice the raw size) and the answer map. An approximation.
   defp result_bytes({:ok, %Block{raw: raw}, _epoch, answers, history, _stats})
-       when is_binary(raw),
-       do: 3 * byte_size(raw) + 160 * map_size(answers) + 64 * map_size(history.rows)
+       when is_binary(raw) do
+    h_bytes = if is_map(history), do: 64 * map_size(history.rows), else: 0
+    3 * byte_size(raw) + 160 * map_size(answers) + h_bytes
+  end
 
   defp result_bytes(_), do: 0
 
@@ -208,8 +210,15 @@ defmodule Exnode.Chain.Prefetch do
       prev = HeaderIndex.prev(ctx.idx, entry)
       ops = Connect.lookup_ops(b, entry, prev, ctx.params, ctx.idx)
       # The committed txindex rows of the block's own txids serve its append
-      # (where Core enforces BIP30 the BIP30 outpoints read them anyway).
-      txids = for tx <- b.txs, do: tx.txid
+      # (where Core enforces BIP30 the BIP30 outpoints read them anyway). On a
+      # linear archive below the BIP34-implies-BIP30 limit, no txid in a valid
+      # block can already exist in `:txindex`, so skip reading them.
+      txids =
+        if Archive.linear?(reader) and
+             Connect.bip34_unique_txids?(entry, prev, ctx.params, ctx.idx),
+           do: :unique,
+           else: for(tx <- b.txs, do: tx.txid)
+
       {answers, filter, history} = Archive.prefetch_block(reader, ops, Map.get(ctx, :hint), txids)
 
       stats =
