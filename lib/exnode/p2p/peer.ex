@@ -343,11 +343,18 @@ defmodule Exnode.P2P.Peer do
   def handle_event(
         :info,
         {:block_checked, hash, {:error, {result, reason}}},
-        {:ready, _} = state,
-        %Data{proto: %Proto{} = proto} = data
+        state,
+        %Data{} = data
       ) do
-    via_compact = hash in proto.rebuilt_deferred
-    data = %{data | proto: %{proto | rebuilt_deferred: List.delete(proto.rebuilt_deferred, hash)}}
+    {via_compact, data} =
+      case data.proto do
+        %Proto{} = proto ->
+          {hash in proto.rebuilt_deferred,
+           %{data | proto: %{proto | rebuilt_deferred: List.delete(proto.rebuilt_deferred, hash)}}}
+
+        nil ->
+          {false, data}
+      end
 
     case BlockSync.maybe_punish_for_block(data, result, "invalid block: #{reason}", via_compact) do
       {:ok, data} -> transition(state, flow_state(state, data), data, [])
