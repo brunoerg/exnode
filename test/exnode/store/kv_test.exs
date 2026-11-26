@@ -155,6 +155,7 @@ defmodule Exnode.Store.KVTest do
 
     :ok =
       KV.write(kv, [
+        {:put, :txindex, <<1::256>>, <<1::32, 0::24, 1::24, 0::48, 0::48>>},
         {:put, :blockhash, <<1::256>>, <<1::32>>},
         {:put, :headers, <<1::256>>, <<1::32, 0, 0::640>>},
         {:put, :filters, <<"f", 1::256>>, <<0::256, 1, 2, 3>>},
@@ -162,8 +163,11 @@ defmodule Exnode.Store.KVTest do
         {:put, :pending, <<3::256>>, :binary.copy(<<7>>, 8192)}
       ])
 
-    for cf <- [:blockhash, :headers, :filters, :scripthash, :pending], do: :ok = KV.flush(kv, cf)
+    for cf <- [:txindex, :blockhash, :headers, :filters, :scripthash, :pending],
+        do: :ok = KV.flush(kv, cf)
 
+    assert KV.get(kv, :txindex, <<1::256>>) == {:ok, <<1::32, 0::24, 1::24, 0::48, 0::48>>}
+    assert KV.get(kv, :txindex, <<9::256>>) == :not_found
     assert KV.get(kv, :blockhash, <<1::256>>) == {:ok, <<1::32>>}
     assert KV.get(kv, :blockhash, <<9::256>>) == :not_found
     assert KV.get(kv, :headers, <<1::256>>) == {:ok, <<1::32, 0, 0::640>>}
