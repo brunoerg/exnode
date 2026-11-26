@@ -142,6 +142,41 @@ defmodule Exnode.Store.KVTest do
     assert KV.get(kv, :txindex, <<9::32>>) == {:ok, big_val}
     KV.close(kv)
   end
+
+  test "pending blob GC options and hit-optimized / bloom-less CFs flush and read cleanly", %{
+    tmp_dir: dir
+  } do
+    opts = KV.pending_blob_options()
+    assert opts[:enable_blob_garbage_collection] == true
+    assert opts[:blob_garbage_collection_age_cutoff] == 0.1
+    assert opts[:blob_garbage_collection_force_threshold] == 0.85
+
+    {:ok, kv} = KV.open(dir)
+
+    :ok =
+      KV.write(kv, [
+        {:put, :blockhash, <<1::256>>, <<1::32>>},
+        {:put, :headers, <<1::256>>, <<1::32, 0, 0::640>>},
+        {:put, :filters, <<"f", 1::256>>, <<0::256, 1, 2, 3>>},
+        {:put, :scripthash, <<2::256, 1::32>>, "row"},
+        {:put, :pending, <<3::256>>, :binary.copy(<<7>>, 8192)}
+      ])
+
+    for cf <- [:blockhash, :headers, :filters, :scripthash, :pending], do: :ok = KV.flush(kv, cf)
+
+    assert KV.get(kv, :blockhash, <<1::256>>) == {:ok, <<1::32>>}
+    assert KV.get(kv, :blockhash, <<9::256>>) == :not_found
+    assert KV.get(kv, :headers, <<1::256>>) == {:ok, <<1::32, 0, 0::640>>}
+    assert KV.get(kv, :filters, <<"f", 1::256>>) == {:ok, <<0::256, 1, 2, 3>>}
+
+    assert KV.fold_prefix(kv, :scripthash, <<2::256>>, [], &[&1 | &2]) == [
+             {<<2::256, 1::32>>, "row"}
+           ]
+
+    assert KV.get(kv, :pending, <<3::256>>) == {:ok, :binary.copy(<<7>>, 8192)}
+
+    KV.close(kv)
+  end
 end
 
 defmodule Exnode.Store.KVPackedTest do

@@ -152,14 +152,18 @@ defmodule Exnode.Store.KV do
   end
 
   # Point and batched lookups dominate (`txindex` and `spends`: mostly misses;
-  # `blockhash`, `headers`, `poisoned`), so those families get whole-key bloom
-  # filters and interpolation-capable index search in the shared block cache.
-  # Dense/hit-only families (`blocks`, `locs`, `pending`) omit bloom filters to
-  # keep filter memory for `txindex` and `spends`. Settings only affect new SST
-  # files, so existing stores open as is.
+  # `blockhash`, `headers`, `filters`, `poisoned`), so those families get
+  # whole-key bloom filters and interpolation-capable index search in the
+  # shared block cache. Hit-mostly families (`blockhash`, `headers`, `filters`)
+  # set `optimize_filters_for_hits` to skip bottommost-level filters (~90% of
+  # filter size). Dense/hit-only families (`blocks`, `locs`, `pending`) and
+  # prefix-scanned `scripthash` (whole-key bloom is ignored on `Seek` without
+  # a prefix extractor) omit bloom filters to keep filter memory for `txindex`
+  # and `spends`. Settings only affect new SST files, so existing stores open
+  # as is.
   defp cf_options(cf, cache) do
     bloom =
-      if cf in [:blocks, :locs, :pending],
+      if cf in [:blocks, :locs, :pending, :scripthash],
         do: [],
         else: [bloom_filter_policy: 10]
 
@@ -179,17 +183,24 @@ defmodule Exnode.Store.KV do
         true -> {16 * 1024 * 1024, 2}
       end
 
+    hit_opts =
+      if cf in [:blockhash, :headers, :filters],
+        do: [optimize_filters_for_hits: true],
+        else: []
+
     # LZ4 when the RocksDB build has it (liblz4-dev present at build time).
     # Compression is recorded per SST block, so stores written uncompressed
     # stay readable and are compressed as they compact.
-    base = [
-      block_based_table_options: table,
-      write_buffer_size: wb_size,
-      max_write_buffer_number: max_wb,
-      memtable_batch_lookup_optimization: true,
-      level_compaction_dynamic_level_bytes: true,
-      compression: compression()
-    ]
+    base =
+      hit_opts ++
+        [
+          block_based_table_options: table,
+          write_buffer_size: wb_size,
+          max_write_buffer_number: max_wb,
+          memtable_batch_lookup_optimization: true,
+          level_compaction_dynamic_level_bytes: true,
+          compression: compression()
+        ]
 
     case cf do
       :pending -> pending_blob_options() ++ base
@@ -209,6 +220,15 @@ defmodule Exnode.Store.KV do
   # roughly arrival order, so whole blob files become garbage and are
   # dropped; garbage collection relocates the few long-lived blocks
   # (quarantined, or held through a halt) so they don't pin a file.
+  #
+  # RocksDB selects the oldest `floor(age_cutoff * n_blob_files)` files for
+  # both passive relocation during compaction and forced GC. An `age_cutoff`
+  # of `0.5` relocated live blocks in the older half of the download queue
+  # on every compaction (~2.3 TB of blob writes and ~1.6 TB of reads over a
+  # full mainnet IBD), while `0.0` would disable GC entirely (`cutoff == 0`).
+  # At `0.1` with `force_threshold: 0.85`, normal in-flight queues (< 10
+  # blob files) never rewrite live blocks and drop dead files for free,
+  # while old files pinned past that window are compacted once >= 85% dead.
   # Values under `min_blob_size` (tiny early blocks) stay inline. No
   # compression: block data compresses poorly and each block is read once.
   # Like every column-family option this applies to new files only; an
@@ -221,7 +241,8 @@ defmodule Exnode.Store.KV do
       blob_file_size: 64 * 1024 * 1024,
       blob_compression_type: :none,
       enable_blob_garbage_collection: true,
-      blob_garbage_collection_age_cutoff: 0.5
+      blob_garbage_collection_age_cutoff: 0.1,
+      blob_garbage_collection_force_threshold: 0.85
     ]
   end
 
