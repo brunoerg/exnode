@@ -147,23 +147,37 @@ defmodule Exnode.NodeSupervisionTest do
 
   test "a stopped node has closed its store: it reopens at once", %{tmp_dir: dir, name: name} do
     :ok = stop_supervised(name)
-    {:ok, kv} = Exnode.Store.KV.open(Path.join([dir, "regtest", "index"]), lock_wait_ms: 0)
+    assert Exnode.Store.Guard.inspect_lock(Path.join(dir, "regtest")) == :clean
+
+    {:ok, kv} =
+      Exnode.Store.KV.open(Path.join([dir, "regtest", "index"]),
+        mode: :canonical,
+        lock_wait_ms: 0
+      )
+
     Exnode.Store.KV.close(kv)
   end
 
   # Regression: the owner closed the store only on shutdown;
   # after the root was killed, the index handles kept in persistent_term
   # held the database and its LOCK, and a new node on the datadir failed.
-  test "a killed node has closed its store too: it reopens at once", %{tmp_dir: dir, name: name} do
+  test "a killed node has closed its store too: it reopens at once (and leaves flush.lock dirty)", %{
+    tmp_dir: dir,
+    name: name
+  } do
     root = GenServer.whereis(name)
     ref = Process.monitor(root)
     Process.exit(root, :kill)
     assert_receive {:DOWN, ^ref, :process, _, :killed}
     wait_until(fn -> match?({:ok, _}, try_open(dir)) end, 2_000)
+    assert {:dirty, _} = Exnode.Store.Guard.inspect_lock(Path.join(dir, "regtest"))
   end
 
   defp try_open(dir) do
-    case Exnode.Store.KV.open(Path.join([dir, "regtest", "index"]), lock_wait_ms: 0) do
+    case Exnode.Store.KV.open(Path.join([dir, "regtest", "index"]),
+           mode: :canonical,
+           lock_wait_ms: 0
+         ) do
       {:ok, kv} -> Exnode.Store.KV.close(kv) && {:ok, kv}
       other -> other
     end

@@ -292,7 +292,13 @@ defmodule Exnode.Index.Scripthash do
       try do
         backfill_totals(st.kv)
         Follower.sync(st.kv, @cf, st.chain_state, &connect/3, &disconnect/3)
+      rescue
+        e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+          reraise e, __STACKTRACE__
       catch
+        :exit, {:noproc, _} ->
+          :done
+
         kind, reason ->
           if ChainState.view(st.chain_state) != nil,
             do: Logger.warning("scripthash index: #{inspect(kind)} #{inspect(reason, limit: 5)}")
@@ -490,7 +496,12 @@ defmodule Exnode.Index.Scripthash do
           txs
 
         {:error, why} ->
-          raise ArgumentError, "block #{id} at #{height}: archive index facts: #{inspect(why)}"
+          Exnode.StorageError.raise_and_latch!(
+            reader.kv.guard,
+            :archive,
+            {:archive_integrity, id, why},
+            "block #{id} at #{height}: archive index facts: #{inspect(why)}"
+          )
       end
 
     t1 = System.monotonic_time(:microsecond)

@@ -57,14 +57,31 @@ defmodule Exnode.REST.Esplora do
   def call(conn, opts) do
     super(conn, opts)
   rescue
+    e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+      storage_fault(conn, e)
+
     e in Plug.Conn.WrapperError ->
       case e do
+        %{reason: %Exnode.StorageError{} = se} -> storage_fault(conn, se)
+        %{reason: %Exnode.Store.KV.Error{} = ke} -> storage_fault(conn, ke)
         %{kind: :exit, reason: reason} -> service_unavailable(conn, reason)
         _ -> reraise(e, __STACKTRACE__)
       end
   catch
     :exit, reason ->
       service_unavailable(conn, reason)
+  end
+
+  defp storage_fault(conn, e) do
+    require Logger
+
+    Logger.critical(
+      "REST #{conn.method} #{conn.request_path}: fatal storage fault: #{Exception.message(e)}"
+    )
+
+    if conn.state in [:unset, :set],
+      do: err(conn, 503, "Fatal storage fault"),
+      else: conn
   end
 
   defp service_unavailable(conn, reason) do

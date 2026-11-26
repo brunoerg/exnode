@@ -231,7 +231,11 @@ defmodule Exnode.Chain.Prefetch do
       _ -> :none
     end
   rescue
-    _ -> :none
+    e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+      reraise e, __STACKTRACE__
+
+    _ ->
+      :none
   catch
     _, _ -> :none
   end

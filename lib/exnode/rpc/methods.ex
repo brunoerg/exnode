@@ -61,6 +61,11 @@ defmodule Exnode.RPC.Methods do
       nil -> {:error, -32601, "Method not found"}
     end
   rescue
+    e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+      require Logger
+      Logger.critical("RPC #{method}: fatal storage fault: " <> Exception.message(e))
+      {:error, -32603, "fatal storage fault: " <> Exception.message(e)}
+
     e in [ArgumentError, FunctionClauseError] ->
       {:error, @rpc_type_error, Exception.message(e)}
 

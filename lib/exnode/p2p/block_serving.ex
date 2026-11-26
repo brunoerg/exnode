@@ -192,6 +192,10 @@ defmodule Exnode.P2P.BlockServing do
       _ -> :notfound
     end
   rescue
-    _ -> :notfound
+    e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+      reraise e, __STACKTRACE__
+
+    _ ->
+      :notfound
   end
 end

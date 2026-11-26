@@ -1373,6 +1373,9 @@ defmodule Exnode.Chain.State do
                launched_at: launched,
                worker_us: System.monotonic_time(:microsecond) - launched
              })}
+          rescue
+            e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+              reraise e, __STACKTRACE__
           catch
             kind, reason -> {:error, {kind, reason}}
           end

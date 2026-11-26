@@ -118,7 +118,13 @@ defmodule Exnode.Index.BlockFilter do
         Follower.sync(st.kv, @cf, st.chain_state, &connect(st.kv, &1, &2, &3), fn _, _, _ ->
           []
         end)
+      rescue
+        e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+          reraise e, __STACKTRACE__
       catch
+        :exit, {:noproc, _} ->
+          :done
+
         kind, reason ->
           # The chain view may not exist yet at startup; anything else is logged.
           if ChainState.view(st.chain_state) != nil,
