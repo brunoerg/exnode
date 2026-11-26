@@ -8,5 +8,20 @@ defmodule Exnode.StorageError do
   quarantines a block for `Exnode.StorageError`.
   """
 
-  defexception [:message, :reason, :source]
+  defexception [:message, :reason, :source, latched: false]
+
+  @doc """
+  Latches the fault on `guard` (if provided) and immediately raises
+  `Exnode.StorageError`.
+  """
+  @spec raise_and_latch!(Exnode.Store.Guard.t() | nil, atom(), term(), String.t()) :: no_return()
+  def raise_and_latch!(guard, source, reason, message) do
+    Exnode.Store.Guard.latch_fault(guard, source, reason, message)
+
+    raise __MODULE__,
+      source: source,
+      reason: reason,
+      message: message,
+      latched: guard != nil
+  end
 end
