@@ -80,7 +80,12 @@ defmodule Exnode.RPC.ReaderTest do
     view = State.view(name)
     reader = State.reader(name)
     # Any attempt to reconstruct a block now fails. Metadata remains readable.
-    :ets.insert(view, {:reader, %{reader | readers: %{}, wpruned: 1_000}})
+    # Chain.View is :protected, so mutate via the owning Chain.State process.
+    :sys.replace_state(cs, fn st ->
+      :ets.insert(view, {:reader, %{reader | readers: %{}, wpruned: 1_000}})
+      st
+    end)
+
     hash = Hash.to_hex(b.header.hash)
     assert {:ok, header} = Methods.call("getblockheader", [hash], ctx)
     assert Jason.decode!(Jason.encode!(header))["nTx"] == length(b.txs)
@@ -95,6 +100,10 @@ defmodule Exnode.RPC.ReaderTest do
 
     assert {:ok, header} = Methods.call("getblockheader", [hash], ctx)
     assert Jason.decode!(Jason.encode!(header))["nTx"] == length(b.txs)
-    :ets.insert(view, {:reader, reader})
+
+    :sys.replace_state(cs, fn st ->
+      :ets.insert(view, {:reader, reader})
+      st
+    end)
   end
 end

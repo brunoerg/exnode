@@ -23,6 +23,7 @@ defmodule Exnode.Index.BlockFilter do
 
   alias Exnode.{Archive, BlockFilter}
   alias Exnode.Index.Follower
+  alias Exnode.Node.Runtime
   alias Exnode.Store.KV
 
   @cf :filters
@@ -71,7 +72,7 @@ defmodule Exnode.Index.BlockFilter do
   # The KV handle, published by init/1 under the registered name (stable
   # across restarts) or, unnamed, the pid.
   defp kv(server) when is_atom(server) do
-    case :persistent_term.get({__MODULE__, server}, nil) do
+    case Runtime.get_handle({__MODULE__, server}, nil) do
       nil -> GenServer.call(server, :kv)
       kv -> kv
     end
@@ -88,10 +89,13 @@ defmodule Exnode.Index.BlockFilter do
 
   @impl true
   def init(opts) do
-    kv = Keyword.fetch!(opts, :kv)
+    kv =
+      case Keyword.fetch(opts, :kv) do
+        {:ok, kv} -> kv
+        :error -> Runtime.kv(Keyword.fetch!(opts, :node_name))
+      end
 
-    if (name = opts[:name]) && :persistent_term.get({__MODULE__, name}, nil) != kv,
-      do: :persistent_term.put({__MODULE__, name}, kv)
+    if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, kv)
 
     send(self(), :tick)
     {:ok, %{kv: kv, chain_state: Keyword.fetch!(opts, :chain_state), waiters: []}}

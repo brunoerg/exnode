@@ -26,6 +26,7 @@ defmodule Exnode.Index.Scripthash do
   alias Exnode.Archive
   alias Exnode.Chain.State, as: ChainState
   alias Exnode.Index.Follower
+  alias Exnode.Node.Runtime
   alias Exnode.Store.KV
 
   @cf :scripthash
@@ -163,7 +164,13 @@ defmodule Exnode.Index.Scripthash do
   end
 
   # The index's KV handle, published at init (no call into the process).
-  defp kv(server) when is_atom(server), do: :persistent_term.get({__MODULE__, server})
+  defp kv(server) when is_atom(server) do
+    case Runtime.get_handle({__MODULE__, server}, nil) do
+      nil -> GenServer.call(server, :kv, 5_000)
+      kv -> kv
+    end
+  end
+
   defp kv(server), do: GenServer.call(server, :kv, 5_000)
 
   defp row(
@@ -218,12 +225,15 @@ defmodule Exnode.Index.Scripthash do
   @impl true
   def init(opts) do
     send(self(), :tick)
-    kv = Keyword.fetch!(opts, :kv)
 
-    # Readers scan in their own process (`history/2`); a restart with the
-    # same handle does not rewrite the term (a rewrite costs a global GC).
-    if (name = opts[:name]) && :persistent_term.get({__MODULE__, name}, nil) != kv,
-      do: :persistent_term.put({__MODULE__, name}, kv)
+    kv =
+      case Keyword.fetch(opts, :kv) do
+        {:ok, kv} -> kv
+        :error -> Runtime.kv(Keyword.fetch!(opts, :node_name))
+      end
+
+    # Readers scan in their own process (`history/2`).
+    if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, kv)
 
     {:ok, %{kv: kv, chain_state: Keyword.fetch!(opts, :chain_state), waiters: [], stats: %{}}}
   end

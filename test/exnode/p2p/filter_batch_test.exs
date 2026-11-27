@@ -88,7 +88,7 @@ defmodule Exnode.P2P.FilterBatchTest do
     State.commit_now(n.chain_state)
     stop = List.last(bs).header.hash
     :ok = Index.sync_to(n.filter_index, stop)
-    kv = :persistent_term.get({Index, n.filter_index})
+    kv = Exnode.Node.Runtime.get_handle({Index, n.filter_index})
 
     hashes = [
       Exnode.ChainParams.get(:regtest).genesis.header.hash | Enum.map(bs, & &1.header.hash)
@@ -135,7 +135,7 @@ defmodule Exnode.P2P.FilterBatchTest do
     State.commit_now(n.chain_state)
     stop = List.last(bs).header.hash
     :ok = Index.sync_to(n.filter_index, stop)
-    kv = :persistent_term.get({Index, n.filter_index})
+    kv = Exnode.Node.Runtime.get_handle({Index, n.filter_index})
 
     hashes = [
       Exnode.ChainParams.get(:regtest).genesis.header.hash | Enum.map(bs, & &1.header.hash)

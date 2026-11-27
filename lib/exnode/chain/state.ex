@@ -245,7 +245,12 @@ defmodule Exnode.Chain.State do
     gc_probe = if opts[:gc_probe], do: GcProbe.start()
     p = Keyword.fetch!(opts, :params)
     headers = Keyword.fetch!(opts, :headers)
-    kv = Keyword.fetch!(opts, :kv)
+
+    kv =
+      case Keyword.fetch(opts, :kv) do
+        {:ok, kv} -> kv
+        :error -> Exnode.Node.Runtime.kv(Keyword.fetch!(opts, :node_name))
+      end
 
     a =
       Archive.open(
