@@ -120,6 +120,7 @@ defmodule Exnode.NodeRuntimeTest do
     kv_before_id = :erlang.phash2(Runtime.kv(name).db)
     cs_before = GenServer.whereis(n.chain_state)
     hdr_before = GenServer.whereis(n.headers)
+    bf_before = GenServer.whereis(n.filter_index)
 
     # Clear the test process's heap so it does not pin the RocksDB NIF handle
     # across the Node.Runtime :kill -> reopen cycle.
@@ -137,7 +138,7 @@ defmodule Exnode.NodeRuntimeTest do
       bf = GenServer.whereis(n.filter_index)
 
       is_pid(rt) and rt != rt_before and is_pid(hdr) and hdr != hdr_before and is_pid(cs) and
-        cs != cs_before and is_pid(bf)
+        cs != cs_before and is_pid(bf) and bf != bf_before
     end)
 
     kv_after = Runtime.kv(name)
