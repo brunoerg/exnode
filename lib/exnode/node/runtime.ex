@@ -123,16 +123,6 @@ defmodule Exnode.Node.Runtime do
   @doc "Named `:protected` ETS table owned by `node_name`'s `Runtime` process."
   def handles_table(node_name \\ Exnode.Node), do: Module.concat(node_name, Handles)
 
-  @doc "Reads `key` from `node_name`'s per-node `Handles` ETS table."
-  def get(node_name, key, default \\ nil) do
-    case :ets.lookup(handles_table(node_name), key) do
-      [{^key, val}] -> val
-      [] -> default
-    end
-  rescue
-    ArgumentError -> default
-  end
-
   @doc "Returns the open `%KV{}` handle for `node_name`."
   def kv(node_name \\ Exnode.Node) do
     :ets.lookup_element(handles_table(node_name), :kv, 2)
