@@ -318,4 +318,60 @@ defmodule Exnode.Store.SnapshotTest do
     assert KV.get(dkv3, :filters, "k") == {:ok, "v1"}
     KV.close(dkv3)
   end
+
+  test "restore! handles clean canonical store with dirty or faulted derived store", %{
+    tmp_dir: dir
+  } do
+    chain_dir = Path.join(dir, "regtest")
+    filters_dir = Path.join([chain_dir, "derived", "filters"])
+    [b1] = blocks(1)
+
+    # Create a clean canonical store.
+    {g, kv, a} = open_canonical(chain_dir)
+    a = Archive.connect(a, b1, 1, []) |> Archive.flush()
+    {:ok, -1} = take_snap!(a, chain_dir)
+    close_clean(g, kv, a)
+    assert Guard.inspect_lock(chain_dir) == :clean
+
+    # Case 1: Clean canonical + dirty derived (with snapshot).
+    File.mkdir_p!(filters_dir)
+    gd = Guard.acquire!(filters_dir, name: "derived:filters", require_clean_mark: false)
+
+    {:ok, dkv} =
+      KV.open(Path.join(filters_dir, "index"),
+        mode: :derived,
+        column_families: [:filters],
+        guard: gd
+      )
+
+    :ok = KV.write(dkv, [{:put, :filters, "k", "v1"}], sync: true)
+    :ok = Snapshot.take_derived!(dkv, filters_dir)
+    :ok = KV.write(dkv, [{:put, :filters, "k", "v2"}], sync: true)
+    KV.close(dkv)
+    Guard.abandon(gd)
+
+    assert {:ok, %{canonical: :already_clean, derived: %{"filters" => {:restored, :primary}}}} =
+             Snapshot.restore!(chain_dir)
+
+    assert Guard.inspect_lock(filters_dir) == :clean
+    assert {:ok, :already_clean} = Snapshot.restore!(chain_dir)
+
+    # Case 2: Clean canonical + faulted derived requires --force-from-snapshot.
+    gd2 = Guard.acquire!(filters_dir, name: "derived:filters", require_clean_mark: false)
+
+    capture_log(fn ->
+      Guard.latch_fault(gd2, :kv, :eio, "derived disk fault")
+    end)
+
+    Guard.abandon(gd2)
+
+    assert_raise Exnode.StorageError, ~r/--force-from-snapshot/, fn ->
+      Snapshot.restore!(chain_dir)
+    end
+
+    assert {:ok, %{canonical: :already_clean, derived: %{"filters" => {:restored, :primary}}}} =
+             Snapshot.restore!(chain_dir, force_from_snapshot: true)
+
+    assert Guard.inspect_lock(filters_dir) == :clean
+  end
 end

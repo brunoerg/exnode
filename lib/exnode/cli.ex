@@ -326,15 +326,36 @@ defmodule Exnode.CLI do
         {:ok, :already_clean} ->
           IO.puts("store at #{chain_dir} closed cleanly; nothing to restore")
 
-        {:ok, %{slot: slot, tip: tip}} ->
+        {:ok, %{canonical: :already_clean, derived: derived}} ->
           IO.puts(
-            "restored #{name} store from #{slot} snapshot to height #{tip.height} (#{Hash.to_hex(tip.hash)})"
+            "canonical store at #{chain_dir} closed cleanly; derived indexes: #{format_derived_restore(derived)}"
+          )
+
+        {:ok, %{slot: slot, tip: tip} = res} ->
+          extra =
+            case format_derived_restore(Map.get(res, :derived, %{})) do
+              "" -> ""
+              s -> " (derived indexes: #{s})"
+            end
+
+          IO.puts(
+            "restored #{name} store from #{slot} snapshot to height #{tip.height} (#{Hash.to_hex(tip.hash)})#{extra}"
           )
       end
     rescue
       e in Exnode.StorageError ->
         fail(Exception.message(e))
     end
+  end
+
+  defp format_derived_restore(derived) when is_map(derived) do
+    derived
+    |> Enum.sort()
+    |> Enum.reject(fn {_name, status} -> status == :clean end)
+    |> Enum.map_join(", ", fn
+      {name, {:restored, slot}} -> "#{name}=restored(#{slot})"
+      {name, :wiped} -> "#{name}=wiped"
+    end)
   end
 
   @doc "`mix exnode.reconsider` and `bin/exnode-reconsider`."

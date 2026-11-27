@@ -38,10 +38,19 @@ defmodule Exnode.Store.Snapshot do
 
   @doc "Known per-index derived store directories under `chain_dir` that exist on disk."
   def derived_store_dirs(chain_dir) do
-    for name <- ["filters", "scripthash"],
-        dir = Path.join([chain_dir, "derived", name]),
-        File.dir?(dir),
-        do: {name, dir}
+    per_index =
+      for name <- ["filters", "scripthash"],
+          dir = Path.join([chain_dir, "derived", name]),
+          File.dir?(dir),
+          do: {name, dir}
+
+    legacy = Path.join(chain_dir, "derived")
+
+    if per_index == [] and Guard.inspect_lock(legacy) != :clean do
+      [{"derived", legacy}]
+    else
+      per_index
+    end
   end
 
   @doc """
@@ -126,17 +135,24 @@ defmodule Exnode.Store.Snapshot do
   end
 
   @doc """
-  Restores the canonical store at `chain_dir` from the latest complete snapshot.
+  Restores the canonical store (and any dirty derived index stores) at
+  `chain_dir` from their latest complete snapshots.
 
   Options:
   * `:hot` — hot archive directory (default `Path.join(chain_dir, "archive")`)
   * `:cold` — cold archive directory (default same as `:hot`)
   * `:force_from_snapshot` — allow restoring even if `flush.lock` records a
     latched storage fault (default `false`)
-  * `:force` — restore even if `flush.lock` is absent (default `false`)
+  * `:force` — restore canonical store even if its `flush.lock` is absent (default `false`)
 
-  Returns `{:ok, :already_clean}` if no `flush.lock` is present and `force: false`,
-  or `{:ok, %{slot, tip, ends, wpruned, taken_at}}` on restore.
+  Returns:
+  * `{:ok, :already_clean}` if canonical and all derived stores closed cleanly
+    and `force: false`
+  * `{:ok, %{canonical: :already_clean, derived: derived_map}}` if canonical
+    closed cleanly (`force: false`) and one or more derived stores were restored
+    or wiped
+  * `{:ok, %{slot, tip, ends, wpruned, taken_at, derived}}` when the canonical
+    store was restored
   """
   def restore!(chain_dir, opts \\ []) do
     hot = Keyword.get(opts, :hot, Path.join(chain_dir, "archive"))
@@ -144,23 +160,46 @@ defmodule Exnode.Store.Snapshot do
     force_fault? = Keyword.get(opts, :force_from_snapshot, false)
     force_clean? = Keyword.get(opts, :force, false)
 
-    case Guard.inspect_lock(chain_dir) do
-      :clean when not force_clean? ->
+    canonical_state = Guard.inspect_lock(chain_dir)
+
+    derived_states =
+      for {name, dir} <- derived_store_dirs(chain_dir) do
+        {name, dir, Guard.inspect_lock(dir)}
+      end
+
+    if not force_fault? do
+      check_not_faulted!(chain_dir, "canonical", canonical_state)
+
+      for {name, dir, state} <- derived_states do
+        check_not_faulted!(dir, "derived:#{name}", state)
+      end
+    end
+
+    dirty_derived? = Enum.any?(derived_states, fn {_, _, state} -> state != :clean end)
+
+    cond do
+      canonical_state == :clean and not force_clean? and not dirty_derived? ->
         {:ok, :already_clean}
 
-      {:faulted, info} when not force_fault? ->
-        raise StorageError,
-          source: :snapshot,
-          reason: {:faulted_store_requires_force, info},
-          message:
-            "store at #{chain_dir} halted after a latched storage fault " <>
-              "(#{inspect(info[:source])} #{inspect(info[:reason])}: #{info[:message]}). " <>
-              "Investigate hardware/software first, then re-run with --force-from-snapshot or resync"
+      canonical_state == :clean and not force_clean? ->
+        {:ok, %{canonical: :already_clean, derived: restore_derived!(chain_dir)}}
 
-      _ ->
+      true ->
         do_restore!(chain_dir, hot, cold)
     end
   end
+
+  defp check_not_faulted!(dir, label, {:faulted, info}) do
+    raise StorageError,
+      source: :snapshot,
+      reason: {:faulted_store_requires_force, info},
+      message:
+        "#{label} store at #{dir} halted after a latched storage fault " <>
+          "(#{inspect(info[:source])} #{inspect(info[:reason])}: #{info[:message]}). " <>
+          "Investigate hardware/software first, then re-run with --force-from-snapshot or resync"
+  end
+
+  defp check_not_faulted!(_dir, _label, _state), do: :ok
 
   @doc """
   Restores a dirty per-index derived store at `store_dir` (`derived/filters` or
@@ -308,7 +347,7 @@ defmodule Exnode.Store.Snapshot do
     end
 
     # Handle derived/ if present and dirty.
-    _ = restore_derived!(chain_dir)
+    derived = restore_derived!(chain_dir)
 
     # Clean any partial staging checkpoint left behind by a crash during rotation.
     clean_staging!(snaps)
@@ -322,7 +361,8 @@ defmodule Exnode.Store.Snapshot do
        tip: sentinel.tip,
        ends: ends,
        wpruned: wpruned,
-       taken_at: sentinel.taken_at
+       taken_at: sentinel.taken_at,
+       derived: derived
      }}
   end
 

@@ -298,9 +298,10 @@ defmodule Exnode.Store.FaultPropagationTest do
     Guard.abandon(g)
   end
 
-  test "corrupt key/hash mismatch in staging headers_cache raises StorageError and latches guard", %{
-    tmp_dir: dir
-  } do
+  test "corrupt key/hash mismatch in staging headers_cache raises StorageError and latches guard",
+       %{
+         tmp_dir: dir
+       } do
     chain_dir = Path.join(dir, "regtest")
     [b1] = blocks(1)
 
@@ -314,7 +315,10 @@ defmodule Exnode.Store.FaultPropagationTest do
     {:ok, stg} = KV.open(Path.join(chain_dir, "staging"), mode: :staging)
     wrong_key = <<0xAA::256>>
     raw = Exnode.Codec.Header.encode(b1.header)
-    :ok = KV.write(stg, [{:put, :headers_cache, wrong_key, <<1::32, 0, raw::binary>>}], sync: true)
+
+    :ok =
+      KV.write(stg, [{:put, :headers_cache, wrong_key, <<1::32, 0, raw::binary>>}], sync: true)
+
     :ok = KV.sync_wal!(stg)
     KV.close(stg)
 
@@ -331,5 +335,69 @@ defmodule Exnode.Store.FaultPropagationTest do
     KV.close(stg2)
     KV.close(kv2)
     Guard.abandon(g)
+  end
+
+  test "clean canonical store with dirty derived store refuses open, keeps canonical clean, and recovers via restore!",
+       %{tmp_dir: dir} do
+    chain_dir = Path.join(dir, "regtest")
+    filters_dir = Path.join([chain_dir, "derived", "filters"])
+    [b1, b2] = blocks(2)
+
+    # 1. Start node with block_filter_index, sync 2 blocks, stop cleanly.
+    %{name: name1, n: n1} = TestNode.start(dir, block_filter_index: true)
+    for b <- [b1, b2], do: assert({:ok, :connected} = State.submit_block(n1.chain_state, b))
+    :ok = Exnode.Index.BlockFilter.sync_to(n1.filter_index, b2.header.hash)
+    :ok = stop_supervised(name1)
+
+    assert Guard.inspect_lock(chain_dir) == :clean
+    assert Guard.inspect_lock(filters_dir) == :clean
+
+    assert {:ok, :primary, _, %{kind: :derived}} =
+             Snapshot.latest_valid(Snapshot.snapshots_dir(filters_dir))
+
+    # 2. Simulate crash between canonical unlock and derived unlock (derived dirty, canonical clean).
+    gd = Guard.acquire!(filters_dir, name: "derived:filters", require_clean_mark: false)
+    Guard.abandon(gd)
+    assert {:dirty, _} = Guard.inspect_lock(filters_dir)
+
+    # 3. Node refuses to open AND cleanly releases canonical lock (no collateral dirtying).
+    capture_log(fn ->
+      parent = self()
+
+      spawn(fn ->
+        Process.flag(:trap_exit, true)
+
+        res =
+          Exnode.Node.start_link(
+            chain: :regtest,
+            datadir: dir,
+            name: TestNode.unique_name(),
+            block_filter_index: true,
+            connect: [{"127.0.0.1", 1}],
+            chain_state_min_heap: 2_000_000,
+            gc_probe: false
+          )
+
+        send(parent, {:start_res, res})
+      end)
+
+      assert_receive {:start_res,
+                      {:error,
+                       {%Exnode.StorageError{reason: {:dirty_store, "derived:filters", _, _}}, _}}},
+                     5_000
+    end)
+
+    assert Guard.inspect_lock(chain_dir) == :clean
+
+    # 4. Snapshot.restore! handles the dirty derived store (not :already_clean!).
+    assert {:ok, %{canonical: :already_clean, derived: %{"filters" => {:restored, :primary}}}} =
+             Snapshot.restore!(chain_dir)
+
+    assert Guard.inspect_lock(filters_dir) == :clean
+
+    # 5. Node reopens cleanly and filter index serves b2.
+    %{name: name2, n: n2} = TestNode.start(dir, block_filter_index: true)
+    :ok = Exnode.Index.BlockFilter.sync_to(n2.filter_index, b2.header.hash)
+    :ok = stop_supervised(name2)
   end
 end
