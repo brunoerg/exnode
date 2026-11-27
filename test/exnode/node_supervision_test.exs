@@ -50,6 +50,8 @@ defmodule Exnode.NodeSupervisionTest do
   defp pids(n) do
     for k <- [
           :headers,
+          :chain_sup,
+          :archive_writer,
           :chain_state,
           :relay_sup,
           :mempool,
@@ -110,12 +112,12 @@ defmodule Exnode.NodeSupervisionTest do
     ids = for {id, _, _, _} <- Supervisor.which_children(name), do: id
 
     assert Enum.reverse(ids) == [
-             # Stops last: closes the store after everything using it.
-             Exnode.Store.KVOwner,
+             # Stops last: owns Handles ETS and closes the store after everything using it.
+             Exnode.Node.Runtime,
              Exnode.Chain.Headers,
              # The shared script executor, upstream of the chain state.
              Exnode.Validation.ScriptExec,
-             Exnode.Chain.State,
+             n.chain_sup,
              n.relay_sup,
              n.p2p_sup,
              n.services_sup
@@ -243,14 +245,27 @@ defmodule Exnode.NodeSupervisionTest do
     assert Process.alive?(peer)
   end
 
-  test "a ChainState crash restarts everything after it, not Headers", %{n: n} do
+  test "a ChainState crash restarts ChainSup's children (ArchiveWriter + ChainState) together while Relay/P2P/Services survive",
+       %{n: n} do
     before = pids(n)
     kill(n, :chain_state)
     got = restarted(before, n)
+    assert :chain_state in got
+    assert :archive_writer in got
     refute :headers in got
+    refute :mempool in got
+    refute :connman in got
+    refute :filter_index in got
+
+    # Killing the ChainSup (or exhausting its restart intensity) restarts
+    # every downstream subtree, not Headers.
+    before2 = pids(n)
+    kill(n, :chain_sup)
+    got2 = restarted(before2, n)
+    refute :headers in got2
 
     for k <- [:relay_sup, :mempool, :tx_relay, :p2p_sup, :connman, :services_sup, :filter_index],
-        do: assert(k in got, "#{k} not restarted")
+        do: assert(k in got2, "#{k} not restarted")
   end
 
   test "a subtree past its restart intensity is restarted once by the root; the chain is untouched",

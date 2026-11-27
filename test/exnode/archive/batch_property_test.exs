@@ -167,6 +167,7 @@ defmodule Exnode.Archive.BatchPropertyTest do
             GenServer.stop(tn.hs)
             KV.close(tn.kv)
             tn = start(run, "test", batch_blocks: batch, cache_bytes: cache)
+            :ok = State.await_idle(tn.cs)
             assert State.tip(tn.cs).hash == b.header.hash
             tn
           else

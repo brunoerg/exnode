@@ -23,7 +23,7 @@ defmodule Exnode.REST.DisabledIndexTest do
     u = System.unique_integer([:positive])
     {cs, mp} = {:"svc1_cs_#{u}", :"svc1_mp_#{u}"}
 
-    start_supervised!({Exnode.Store.KVOwner, {kv, [{State, cs}]}}, id: :"kvo_#{u}")
+    start_supervised!({Exnode.Node.Runtime, kv: kv, cleanup_keys: [{State, cs}]}, id: :"rt_#{u}")
     hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_#{u}")
 
     start_supervised!(

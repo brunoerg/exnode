@@ -34,8 +34,8 @@ defmodule Exnode.REST.EsploraTest do
     {cs_name, mp_name, idx_name} = {:"cs_#{u}", :"mp_#{u}", :"sh_#{u}"}
 
     start_supervised!(
-      {Exnode.Store.KVOwner, {kv, [{State, cs_name}, {Scripthash, idx_name}]}},
-      id: :"kvo_#{u}"
+      {Exnode.Node.Runtime, kv: kv, cleanup_keys: [{State, cs_name}, {Scripthash, idx_name}]},
+      id: :"rt_#{u}"
     )
 
     hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_#{u}")

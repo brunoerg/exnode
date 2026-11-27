@@ -23,28 +23,37 @@ defmodule Exnode.Chain.GcSettingsTest do
     d
   end
 
-  test "a node's chain state has both floors, also after a crash restart", %{tmp_dir: dir} do
-    # TestNode lowers the heap floor; the node's own default here.
-    %{n: n} = TestNode.start(dir, chain_state_min_heap: State.default_min_heap_size())
+  test "explicit GC floors reach the node's chain state and survive a crash restart",
+       %{tmp_dir: dir} do
+    heap = 2_000_000
+    bin_vheap = 4_000_000
+
+    %{n: n} =
+      TestNode.start(dir,
+        chain_state_min_heap: heap,
+        chain_state_min_bin_vheap: bin_vheap
+      )
+
     cs = GenServer.whereis(n.chain_state)
     g = gc(cs)
-    assert g[:min_heap_size] >= State.default_min_heap_size()
-    assert g[:min_bin_vheap_size] >= State.default_min_bin_vheap_size()
+    assert g[:min_heap_size] >= heap
+    assert g[:min_bin_vheap_size] >= bin_vheap
 
     ref = Process.monitor(cs)
     Process.exit(cs, :kill)
     assert_receive {:DOWN, ^ref, _, _, _}
     wait_until(fn -> (pid = GenServer.whereis(n.chain_state)) && pid != cs end)
     g = gc(GenServer.whereis(n.chain_state))
-    assert g[:min_heap_size] >= State.default_min_heap_size()
-    assert g[:min_bin_vheap_size] >= State.default_min_bin_vheap_size()
+    assert g[:min_heap_size] >= heap
+    assert g[:min_bin_vheap_size] >= bin_vheap
   end
 
-  test "chain_state_min_bin_vheap: nil keeps the VM default", %{tmp_dir: dir} do
-    %{n: n} = TestNode.start(dir, chain_state_min_bin_vheap: nil)
-
-    assert gc(GenServer.whereis(n.chain_state))[:min_bin_vheap_size] ==
-             vm_defaults()[:min_bin_vheap_size]
+  test "node defaults keep the VM GC defaults", %{tmp_dir: dir} do
+    %{n: n} = TestNode.start(dir)
+    d = vm_defaults()
+    g = gc(GenServer.whereis(n.chain_state))
+    assert g[:min_heap_size] == d[:min_heap_size]
+    assert g[:min_bin_vheap_size] == d[:min_bin_vheap_size]
   end
 
   test "a directly started chain state keeps the VM defaults", %{tmp_dir: dir} do

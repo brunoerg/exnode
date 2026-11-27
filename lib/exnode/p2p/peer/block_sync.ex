@@ -14,49 +14,130 @@ defmodule Exnode.P2P.Peer.BlockSync do
   alias Exnode.Consensus.Pow
   alias Exnode.Crypto.Hash
   alias Exnode.Mempool
-  alias Exnode.P2P.{BlockDownload, CompactBlock, HighBandwidth, Message, Peer}
-  alias Exnode.P2P.Peer.HeadersHandler
+  alias Exnode.P2P.{BlockDownload, CompactBlock, DecodeBudget, HighBandwidth, Message, Peer}
+  alias Exnode.P2P.Peer.{Data, HeadersHandler}
+  alias Exnode.P2P.Peer.Data.Proto
 
   @max_partials 16
   @max_cmpct_seen 16
   @partial_timeout_s 60
 
   @doc "Core `SendMessages` block download request pass."
-  def maybe_request_blocks(%{node: %{block_download: bd}} = st) when bd != nil do
-    serves = st.version && (st.version.services &&& Message.service(:network)) != 0
+  def maybe_request_blocks(%Data{node: %{block_download: bd}, proto: %Proto{} = proto} = data)
+      when bd != nil do
+    v = data.handshake.version
+    serves = v != nil and (v.services &&& Message.service(:network)) != 0
 
-    if Peer.handshake_done?(st) and serves do
-      best = st.best_known && st.best_known.hash
+    if serves do
+      best = proto.best_known && proto.best_known.hash
       # (IBD matters only for a non-preferred peer; skip the lookup otherwise.)
-      opts = [preferred: not st.inbound, ibd: st.inbound and Peer.initial_block_download?(st)]
+      opts = [
+        preferred: not data.inbound,
+        ibd: data.inbound and Peer.initial_block_download?(data)
+      ]
 
       case BlockDownload.request(bd, self(), best, opts) do
         [] ->
-          st
+          data
 
         hashes ->
-          Peer.push(st, {:getdata, Enum.map(hashes, &%{type: :block, witness: true, hash: &1})})
+          Peer.push(data, {:getdata, Enum.map(hashes, &%{type: :block, witness: true, hash: &1})})
       end
     else
-      st
+      data
     end
   end
 
-  def maybe_request_blocks(st), do: st
+  def maybe_request_blocks(data), do: data
+
+  @doc """
+  Core `ProcessMessage` `BLOCK`: decodes `payload`, checks mutation against
+  known parent, runs `CheckBlock`, and submits to `ChainState`.
+
+  When `decode_sup` is configured on `data.node`, block decoding, mutation
+  checks, `CheckBlock`, and submission run inside a short-lived supervised
+  worker so the peer process never allocates a 25–45 MB decoded `%Block{}` on
+  its own heap; BEAM reclaims the worker heap in O(1) on exit.
+  """
+  def received_block_payload(%Data{} = data, payload) do
+    peer = self()
+    ibd = Peer.initial_block_download?(data)
+    headers_name = data.node.headers
+    params = data.p
+    bd = data.node[:block_download]
+    cs = data.node[:chain_state]
+
+    work = fn ->
+      case Block.decode_exact(payload) do
+        {:error, _} ->
+          :decode_error
+
+        {:ok, %Block{} = b} ->
+          idx = Headers.index(headers_name)
+
+          mutated? =
+            case HeaderIndex.lookup(idx, b.header.prev_hash) do
+              nil -> false
+              prev -> CompactBlock.mutated?(b, prev.height + 1 >= params.segwit_height)
+            end
+
+          if mutated? do
+            {:mutated, b.header.hash}
+          else
+            in_flight =
+              bd != nil and
+                BlockDownload.received(bd, peer, b.header.hash, byte_size(b.raw || <<>>))
+
+            outcome = submit_decoded_block(cs, b, params, ibd, in_flight, peer)
+
+            if bd != nil,
+              do:
+                BlockDownload.checked(
+                  bd,
+                  peer,
+                  b.header.hash,
+                  outcome in [nil, {:ok, :connected}, {:ok, :stored}, {:ok, :duplicate}]
+                )
+
+            {:processed, b.header.hash, outcome}
+          end
+      end
+    end
+
+    case DecodeBudget.with_worker(
+           data.node[:decode_budget],
+           data.node[:decode_sup],
+           byte_size(payload),
+           work
+         ) do
+      :unavailable ->
+        {:stop, {:shutdown, :decode_budget_unavailable}, data}
+
+      :decode_error ->
+        {:ok, data}
+
+      {:mutated, _hash} ->
+        Peer.misbehaving(data, "mutated block")
+
+      {:processed, hash, outcome} ->
+        data = Data.update_proto(data, &%{&1 | partials: Map.delete(&1.partials, hash)})
+        finalize_block_outcome(data, hash, outcome, false)
+    end
+  end
 
   @doc "Core `ProcessMessage` `BLOCK`: checks mutation against known parent before processing."
-  def received_block(st, b) do
-    idx = Headers.index(st.node.headers)
+  def received_block(%Data{} = data, b) do
+    idx = Headers.index(data.node.headers)
 
     case HeaderIndex.lookup(idx, b.header.prev_hash) do
       nil ->
-        process_block(st, b)
+        process_block(data, b)
 
       prev ->
         # DeploymentActiveAfter(prev_block, SEGWIT)
-        if CompactBlock.mutated?(b, prev.height + 1 >= st.p.segwit_height),
-          do: Peer.misbehaving(st, "mutated block"),
-          else: process_block(st, b)
+        if CompactBlock.mutated?(b, prev.height + 1 >= data.p.segwit_height),
+          do: Peer.misbehaving(data, "mutated block"),
+          else: process_block(data, b)
     end
   end
 
@@ -64,22 +145,22 @@ defmodule Exnode.P2P.Peer.BlockSync do
   Core `ProcessBlock` + `MaybePunishNodeForBlock`. `rebuilt` marks a block
   rebuilt from a compact block (`force_processing = true`).
   """
-  def process_block(st, %Block{} = b, rebuilt \\ false) do
-    st = %{st | partials: Map.delete(st.partials, b.header.hash)}
+  def process_block(%Data{} = data, %Block{} = b, rebuilt \\ false) do
+    data = Data.update_proto(data, &%{&1 | partials: Map.delete(&1.partials, b.header.hash)})
 
     in_flight =
-      st.node[:block_download] != nil and
+      data.node[:block_download] != nil and
         if(rebuilt,
           do:
             BlockDownload.rebuilt(
-              st.node.block_download,
+              data.node.block_download,
               self(),
               b.header.hash,
               byte_size(b.raw || <<>>)
             ),
           else:
             BlockDownload.received(
-              st.node.block_download,
+              data.node.block_download,
               self(),
               b.header.hash,
               byte_size(b.raw || <<>>)
@@ -87,114 +168,131 @@ defmodule Exnode.P2P.Peer.BlockSync do
         )
 
     requested = rebuilt or in_flight
-    ibd = Peer.initial_block_download?(st)
+    ibd = Peer.initial_block_download?(data)
 
-    submit = fn cs ->
-      case ChainState.precheck_block(cs, b.header, requested) do
-        :check ->
-          ChainState.submit_block(cs, b,
-            checked: ChainState.check_block(b, st.node.params),
-            defer: ibd,
-            requested: requested,
-            source: self()
-          )
+    outcome =
+      submit_decoded_block(data.node[:chain_state], b, data.node.params, ibd, requested, self())
 
-        reply ->
-          reply
-      end
-    end
-
-    outcome = st.node[:chain_state] && submit.(st.node.chain_state)
-
-    if st.node[:block_download] != nil,
+    if data.node[:block_download] != nil,
       do:
         BlockDownload.checked(
-          st.node.block_download,
+          data.node.block_download,
           self(),
           b.header.hash,
           outcome in [nil, {:ok, :connected}, {:ok, :stored}, {:ok, :duplicate}]
         )
 
-    st =
+    finalize_block_outcome(data, b.header.hash, outcome, rebuilt)
+  end
+
+  defp submit_decoded_block(nil, _b, _params, _ibd, _requested, _peer), do: nil
+
+  defp submit_decoded_block(cs, %Block{} = b, params, ibd, requested, peer) do
+    case ChainState.precheck_block(cs, b.header, requested) do
+      :check ->
+        ChainState.submit_block(cs, b,
+          checked: ChainState.check_block(b, params),
+          defer: ibd,
+          requested: requested,
+          source: peer
+        )
+
+      reply ->
+        reply
+    end
+  end
+
+  defp finalize_block_outcome(data, hash, outcome, rebuilt) do
+    data =
       if rebuilt and outcome == {:ok, :stored},
-        do: %{
-          st
-          | rebuilt_deferred: Enum.take([b.header.hash | st.rebuilt_deferred], @max_partials)
-        },
-        else: st
+        do:
+          Data.update_proto(data, fn proto ->
+            %{
+              proto
+              | rebuilt_deferred: Enum.take([hash | proto.rebuilt_deferred], @max_partials)
+            }
+          end),
+        else: data
 
     case outcome do
       {:error, {result, reason}} ->
-        maybe_punish_for_block(st, result, "invalid block: #{reason}", rebuilt)
+        maybe_punish_for_block(data, result, "invalid block: #{reason}", rebuilt)
 
       reply ->
-        st =
+        data =
           if reply in [{:ok, :connected}, {:ok, :stored}],
-            do: Peer.report_stats(st, %{last_block_time: Peer.now(st)}),
-            else: st
+            do: Peer.report_stats(data, %{last_block_time: Peer.now(data)}),
+            else: data
 
-        idx = Headers.index(st.node.headers)
-        e = HeaderIndex.lookup(idx, b.header.hash)
+        idx = Headers.index(data.node.headers)
+        e = HeaderIndex.lookup(idx, hash)
 
-        st =
+        data =
           if e,
-            do: %{
-              st
-              | best_known: Peer.better(st.best_known, e),
-                best_known_block: max(st.best_known_block, e.height)
-            },
-            else: st
+            do:
+              Data.update_proto(data, fn proto ->
+                %{
+                  proto
+                  | best_known: Peer.better(proto.best_known, e),
+                    best_known_block: max(proto.best_known_block, e.height)
+                }
+              end),
+            else: data
 
         # BIP152: a peer that delivers a new block becomes high-bandwidth.
-        if reply == {:ok, :connected} and st.provides_cmpct and st.node[:high_bandwidth] != nil and
-             not Peer.initial_block_download?(st),
-           do: HighBandwidth.select(st.node.high_bandwidth, self(), st.inbound)
+        if reply == {:ok, :connected} and data.proto.provides_cmpct and
+             data.node[:high_bandwidth] != nil and not Peer.initial_block_download?(data),
+           do: HighBandwidth.select(data.node.high_bandwidth, self(), data.inbound)
 
-        {:ok, maybe_request_blocks(st)}
+        {:ok, maybe_request_blocks(data)}
     end
   end
 
   @doc "Core `ProcessMessage` `CMPCTBLOCK` (receive side)."
-  def compact_block(%{provides_cmpct: false} = st, _payload), do: {:ok, st}
+  def compact_block(%Data{proto: %Proto{provides_cmpct: false}} = data, _payload),
+    do: {:ok, data}
 
-  def compact_block(st, payload) do
+  def compact_block(%Data{} = data, payload) do
     case CompactBlock.decode(payload) do
-      {:error, why} -> Peer.dropped(st, "cmpctblock", why)
-      {:ok, c} -> compact_block_decoded(st, c)
+      {:error, why} -> Peer.dropped(data, "cmpctblock", why)
+      {:ok, c} -> compact_block_decoded(data, c)
     end
   end
 
   @doc "Core `ProcessMessage` `BLOCKTXN` -> `ProcessCompactBlockTxns`."
-  def block_txn(st, payload) do
+  def block_txn(%Data{proto: %Proto{} = proto} = data, payload) do
     case CompactBlock.decode_blocktxn(payload) do
       {:error, why} ->
-        Peer.dropped(st, "blocktxn", why)
+        Peer.dropped(data, "blocktxn", why)
 
       {:ok, hash, txs} ->
-        case Map.pop(st.partials, hash) do
+        case Map.pop(proto.partials, hash) do
           {nil, _} ->
-            {:ok, st}
+            {:ok, data}
 
           {%{partial: partial}, rest} ->
-            finish_rebuild(%{st | partials: rest}, hash, partial, txs)
+            finish_rebuild(%{data | proto: %{proto | partials: rest}}, hash, partial, txs)
         end
     end
   end
 
   @doc "Expires timed-out or already-received partial compact block reconstructions."
-  def expire_partials(%{partials: ps} = st, _t) when map_size(ps) == 0, do: st
+  def expire_partials(%Data{proto: %Proto{partials: ps}} = data, _t) when map_size(ps) == 0,
+    do: data
 
-  def expire_partials(st, t) do
-    have = ChainState.view_have_many(ChainState.view(st.node.chain_state), Map.keys(st.partials))
+  def expire_partials(%Data{proto: %Proto{partials: ps}} = data, t) do
+    have = ChainState.view_have_many(ChainState.view(data.node.chain_state), Map.keys(ps))
 
-    Enum.reduce(st.partials, st, fn {hash, p}, acc ->
+    Enum.reduce(ps, data, fn {hash, p}, acc ->
       cond do
         MapSet.member?(have, hash) ->
           if bd = acc.node[:block_download], do: BlockDownload.cancel(bd, self(), hash)
-          %{acc | partials: Map.delete(acc.partials, hash)}
+          Data.update_proto(acc, &%{&1 | partials: Map.delete(&1.partials, hash)})
 
         t - p.started >= @partial_timeout_s ->
-          request_full_block(%{acc | partials: Map.delete(acc.partials, hash)}, hash)
+          acc
+          |> Data.update_proto(&%{&1 | partials: Map.delete(&1.partials, hash)})
+          |> request_full_block(hash)
 
         true ->
           acc
@@ -203,114 +301,125 @@ defmodule Exnode.P2P.Peer.BlockSync do
   end
 
   @doc "Core `MaybePunishNodeForBlock`."
-  def maybe_punish_for_block(st, result, msg, via_compact \\ false) do
+  def maybe_punish_for_block(data, result, msg, via_compact \\ false) do
     case result do
       r when r in [:crash, :quarantined] ->
-        {:ok, st}
+        {:ok, data}
 
       r when r in [:consensus, :mutated] ->
-        if via_compact, do: {:ok, st}, else: Peer.misbehaving(st, msg)
+        if via_compact, do: {:ok, data}, else: Peer.misbehaving(data, msg)
 
       r when r in [:invalid_header, :invalid_prev, :missing_prev] ->
-        Peer.misbehaving(st, msg)
+        Peer.misbehaving(data, msg)
 
       :cached_invalid ->
-        if st.inbound or via_compact, do: {:ok, st}, else: Peer.misbehaving(st, msg)
+        if data.inbound or via_compact, do: {:ok, data}, else: Peer.misbehaving(data, msg)
 
       _ ->
-        {:ok, st}
+        {:ok, data}
     end
   end
 
   # --- internal helpers -------------------------------------------------------
 
-  defp compact_block_decoded(st, c) do
-    idx = Headers.index(st.node.headers)
+  defp compact_block_decoded(data, c) do
+    idx = Headers.index(data.node.headers)
     prev = HeaderIndex.lookup(idx, c.header.prev_hash)
 
     cond do
       prev == nil ->
         {:ok,
-         if(Peer.initial_block_download?(st),
-           do: st,
+         if(Peer.initial_block_download?(data),
+           do: data,
            else:
              HeadersHandler.maybe_send_getheaders(
-               st,
+               data,
                HeaderIndex.locator(idx, HeaderIndex.best(idx))
              )
          )}
 
-      prev.chain_work + Pow.bits_proof(c.header.bits) < HeadersHandler.anti_dos_work_threshold(st) ->
-        {:ok, st}
+      prev.chain_work + Pow.bits_proof(c.header.bits) <
+          HeadersHandler.anti_dos_work_threshold(data) ->
+        {:ok, data}
 
       true ->
-        case Headers.process_headers(st.node.headers, [c.header],
+        case Headers.process_headers(data.node.headers, [c.header],
                min_pow_checked: true,
-               now: Peer.now(st)
+               now: Peer.now(data)
              ) do
           {:error, {result, reason}, _} ->
-            maybe_punish_for_block(st, result, "invalid header via cmpctblock: #{reason}", true)
+            maybe_punish_for_block(data, result, "invalid header via cmpctblock: #{reason}", true)
 
           {:error, {result, reason}} ->
-            maybe_punish_for_block(st, result, "invalid header via cmpctblock: #{reason}", true)
+            maybe_punish_for_block(data, result, "invalid header via cmpctblock: #{reason}", true)
 
           {:ok, _} ->
-            compact_block_header_ok(st, c)
+            compact_block_header_ok(data, c)
         end
     end
   end
 
-  defp compact_block_header_ok(st, c) do
+  defp compact_block_header_ok(data, c) do
     hash = c.header.hash
-    idx = Headers.index(st.node.headers)
+    idx = Headers.index(data.node.headers)
     e = HeaderIndex.lookup(idx, hash)
-    view = ChainState.view(st.node.chain_state)
+    view = ChainState.view(data.node.chain_state)
     tip = ChainState.view_tip(view)
     tip_e = HeaderIndex.lookup(idx, tip.hash)
 
-    st = %{
-      st
-      | best_known: Peer.better(st.best_known, e),
-        best_known_block: max(st.best_known_block, e.height)
-    }
+    data =
+      Data.update_proto(data, fn proto ->
+        %{
+          proto
+          | best_known: Peer.better(proto.best_known, e),
+            best_known_block: max(proto.best_known_block, e.height)
+        }
+      end)
+
+    proto = data.proto
 
     cond do
       MapSet.member?(ChainState.view_have_many(view, [hash]), hash) ->
-        {:ok, st}
+        {:ok, data}
 
-      Map.has_key?(st.partials, hash) or hash in st.cmpct_seen ->
-        {:ok, st}
+      Map.has_key?(proto.partials, hash) or hash in proto.cmpct_seen ->
+        {:ok, data}
 
       true ->
-        {owner, already_in_flight, checking} = block_in_flight(st, hash)
+        {owner, already_in_flight, checking} = block_in_flight(data, hash)
         from_this_peer = owner == self()
 
         cond do
           checking ->
-            {:ok, st}
+            {:ok, data}
 
-          not from_this_peer and not st.hb_selected ->
-            {:ok, st}
+          not from_this_peer and not proto.hb_selected ->
+            {:ok, data}
 
           e.chain_work <= tip_e.chain_work ->
-            {:ok, if(from_this_peer, do: request_full_block(st, hash), else: st)}
+            {:ok, if(from_this_peer, do: request_full_block(data, hash), else: data)}
 
-          not already_in_flight and not can_direct_fetch?(st, tip_e) ->
-            {:ok, st}
+          not already_in_flight and not can_direct_fetch?(data, tip_e) ->
+            {:ok, data}
 
           e.height > tip.height + 2 ->
-            {:ok, maybe_request_blocks(st)}
+            {:ok, maybe_request_blocks(data)}
 
-          map_size(st.partials) >= @max_partials ->
-            {:ok, request_full_block(st, hash)}
+          map_size(proto.partials) >= @max_partials ->
+            {:ok, request_full_block(data, hash)}
 
           true ->
-            rebuild(%{st | cmpct_seen: Enum.take([hash | st.cmpct_seen], @max_cmpct_seen)}, c)
+            data =
+              Data.update_proto(data, fn p ->
+                %{p | cmpct_seen: Enum.take([hash | p.cmpct_seen], @max_cmpct_seen)}
+              end)
+
+            rebuild(data, c)
         end
     end
   end
 
-  defp block_in_flight(%{node: %{block_download: bd}}, hash) when bd != nil do
+  defp block_in_flight(%Data{node: %{block_download: bd}}, hash) when bd != nil do
     case BlockDownload.in_flight_state(bd, hash) do
       nil -> {nil, false, false}
       {:requested, peer} -> {peer, true, false}
@@ -318,13 +427,13 @@ defmodule Exnode.P2P.Peer.BlockSync do
     end
   end
 
-  defp block_in_flight(_st, _hash), do: {nil, false, false}
+  defp block_in_flight(_data, _hash), do: {nil, false, false}
 
-  defp can_direct_fetch?(st, tip_e),
-    do: tip_e.time > Peer.now(st) - st.p.pow_target_spacing * 20
+  defp can_direct_fetch?(data, tip_e),
+    do: tip_e.time > Peer.now(data) - data.p.pow_target_spacing * 20
 
-  defp rebuild(st, c) do
-    mp = st.node[:mempool]
+  defp rebuild(data, c) do
+    mp = data.node[:mempool]
 
     match = fn keys, ids ->
       if mp, do: Mempool.match_short_ids(mp, keys, ids), else: %{}
@@ -332,33 +441,42 @@ defmodule Exnode.P2P.Peer.BlockSync do
 
     case CompactBlock.init(c, match) do
       :invalid ->
-        Peer.misbehaving(st, "invalid compact block")
+        Peer.misbehaving(data, "invalid compact block")
 
       :failed ->
-        {:ok, request_full_block(st, c.header.hash)}
+        {:ok, request_full_block(data, c.header.hash)}
 
       {:ok, partial} ->
         case CompactBlock.missing(partial) do
           [] ->
-            finish_rebuild(st, c.header.hash, partial, [])
+            finish_rebuild(data, c.header.hash, partial, [])
 
           gaps ->
-            mark_in_flight(st, c.header.hash)
+            mark_in_flight(data, c.header.hash)
 
-            {:ok,
-             %{
-               Peer.push(st, {:getblocktxn, CompactBlock.encode_getblocktxn(c.header.hash, gaps)})
-               | partials:
-                   Map.put(st.partials, c.header.hash, %{partial: partial, started: Peer.now(st)})
-             }}
+            data =
+              data
+              |> Peer.push({:getblocktxn, CompactBlock.encode_getblocktxn(c.header.hash, gaps)})
+              |> Data.update_proto(fn p ->
+                %{
+                  p
+                  | partials:
+                      Map.put(p.partials, c.header.hash, %{
+                        partial: partial,
+                        started: Peer.now(data)
+                      })
+                }
+              end)
+
+            {:ok, data}
         end
     end
   end
 
-  defp finish_rebuild(st, hash, partial, txs) do
-    idx = Headers.index(st.node.headers)
+  defp finish_rebuild(data, hash, partial, txs) do
+    idx = Headers.index(data.node.headers)
     prev = HeaderIndex.lookup(idx, partial.header.prev_hash)
-    segwit? = prev == nil or prev.height + 1 >= st.p.segwit_height
+    segwit? = prev == nil or prev.height + 1 >= data.p.segwit_height
 
     case CompactBlock.fill(partial, txs, segwit?) do
       {:ok, b} ->
@@ -366,23 +484,23 @@ defmodule Exnode.P2P.Peer.BlockSync do
           "compact block #{Hash.to_hex(hash)} rebuilt: #{length(b.txs)} txs, #{length(txs)} requested"
         )
 
-        process_block(st, b, true)
+        process_block(data, b, true)
 
       :invalid ->
-        Peer.misbehaving(st, "invalid compact block txns")
+        Peer.misbehaving(data, "invalid compact block txns")
 
       :failed ->
-        {:ok, request_full_block(st, hash)}
+        {:ok, request_full_block(data, hash)}
     end
   end
 
-  defp request_full_block(st, hash) do
-    if mark_in_flight(st, hash),
-      do: Peer.push(st, {:getdata, [%{type: :block, witness: true, hash: hash}]}),
-      else: st
+  defp request_full_block(data, hash) do
+    if mark_in_flight(data, hash),
+      do: Peer.push(data, {:getdata, [%{type: :block, witness: true, hash: hash}]}),
+      else: data
   end
 
-  defp mark_in_flight(st, hash) do
-    if bd = st.node[:block_download], do: BlockDownload.mark(bd, self(), hash), else: true
+  defp mark_in_flight(data, hash) do
+    if bd = data.node[:block_download], do: BlockDownload.mark(bd, self(), hash), else: true
   end
 end

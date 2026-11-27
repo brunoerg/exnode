@@ -39,8 +39,14 @@ defmodule Exnode.Index.Follower do
     end
   end
 
-  @doc "Advances (or rewinds) the index; returns `:done` when at the committed tip, else `:more`."
-  def sync(kv, cf, chain_state, connect, disconnect) do
+  @doc """
+  Advances (or rewinds) the index; returns `:done` when at the committed tip, else `:more`.
+
+  `connect` may be 3-arity (`connect.(height, id, reader) -> ops`) or 4-arity
+  (`connect.(height, id, reader, acc) -> {ops, acc}`) when a batch needs to
+  carry state across consecutive blocks without using the process dictionary.
+  """
+  def sync(kv, cf, chain_state, connect, disconnect, acc \\ nil) do
     view = ChainState.view(chain_state)
     reader = ChainState.view_reader(view)
     committed = ChainState.view_committed(view)
@@ -58,15 +64,21 @@ defmodule Exnode.Index.Follower do
       # indexed tip), and the tip is the last linked block itself, so a batch
       # never mixes branches; it stops at the first break and the next sync
       # rewinds whatever the reorg disconnected.
-      {ops, {last_h, last_hash}} =
-        Enum.reduce_while((h + 1)..stop//1, {[], {h, hash}}, fn height, {acc, {_, prev}} ->
+      {ops, {last_h, last_hash}, _acc} =
+        Enum.reduce_while((h + 1)..stop//1, {[], {h, hash}, acc}, fn height,
+                                                                     {ops_acc, {_, prev}, c_acc} ->
           with id when id != nil <- Archive.id_at(reader, height),
                rec = Archive.block_record!(reader, id),
                true <- linked?(rec, height, prev) do
-            ops = connect.(height, id, reader) ++ [{:put, cf, <<"h", height::32>>, rec.hash}]
-            {:cont, {[ops | acc], {height, rec.hash}}}
+            {block_ops, c_acc} =
+              if is_function(connect, 4),
+                do: connect.(height, id, reader, c_acc),
+                else: {connect.(height, id, reader), c_acc}
+
+            ops = block_ops ++ [{:put, cf, <<"h", height::32>>, rec.hash}]
+            {:cont, {[ops | ops_acc], {height, rec.hash}, c_acc}}
           else
-            _ -> {:halt, {acc, {height - 1, prev}}}
+            _ -> {:halt, {ops_acc, {height - 1, prev}, c_acc}}
           end
         end)
 

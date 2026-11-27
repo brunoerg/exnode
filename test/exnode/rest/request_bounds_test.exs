@@ -27,8 +27,8 @@ defmodule Exnode.REST.RequestBoundsTest do
     {cs, mp, idx} = {:"cs_#{u}", :"mp_#{u}", :"sh_#{u}"}
 
     start_supervised!(
-      {Exnode.Store.KVOwner, {kv, [{State, cs}, {Scripthash, idx}]}},
-      id: :"kvo_#{u}"
+      {Exnode.Node.Runtime, kv: kv, cleanup_keys: [{State, cs}, {Scripthash, idx}]},
+      id: :"rt_#{u}"
     )
 
     hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_#{u}")

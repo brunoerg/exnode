@@ -21,8 +21,8 @@ defmodule Exnode.Chain.CommitCadenceTest do
   @p ChainParams.get(:regtest)
   @chain Path.expand("../../fixtures/regtest/chain150.bin", __DIR__)
 
-  # From the state, not `State.with_archive/2`, which commits first.
-  defp committed(cs), do: Archive.committed_tip(:sys.get_state(cs).a).height
+  # From the writer's state, not `State.with_archive/2`, which commits first.
+  defp committed(cs), do: State.peek_archive(cs, &Archive.committed_tip(&1).height)
 
   test "far behind the best header, a batch older than batch_ms is not committed; near it, it is",
        %{tmp_dir: dir} do

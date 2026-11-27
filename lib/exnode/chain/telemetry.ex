@@ -7,82 +7,117 @@ defmodule Exnode.Chain.Telemetry do
   require Logger
 
   alias Exnode.Archive
-  alias Exnode.Archive.Overlay
+  alias Exnode.Archive.Writer, as: ArchiveWriter
   alias Exnode.Chain.GcProbe
   alias Exnode.Validation.Connect
+
+  defstruct wait: nil,
+            cb_end: nil,
+            cb_seq: 0,
+            cs: %{},
+            vwin: %{},
+            scripts_us: 0,
+            resolve_us: 0,
+            pfwait_us: 0
+
+  @doc false
+  def new, do: %__MODULE__{}
 
   # --- callback & turn timing --------------------------------------------------
 
   @doc false
-  def timed_cb(msg, sample_queue?, fun) do
+  def timed_cb(msg, st, sample_queue?, fun) do
     t0 = System.monotonic_time(:microsecond)
     key = if is_tuple(msg) and tuple_size(msg) > 0, do: elem(msg, 0), else: msg
     key = if is_atom(key), do: key, else: :other
 
-    case Process.delete(:perf_wait) do
-      {reason, since} -> cs_time({:wait, reason}, t0 - since)
-      nil -> :ok
-    end
+    t = st.telemetry
 
-    case Process.delete(:perf_cb_end) do
-      {te, true} -> cs_time({:gap, :queued}, t0 - te)
-      {te, false} -> cs_time({:gap_for, key}, t0 - te)
-      nil -> :ok
-    end
+    t =
+      case t.wait do
+        {reason, since} -> %{t | wait: nil} |> add_cs({:wait, reason}, t0 - since)
+        nil -> t
+      end
 
-    r = fun.()
+    t =
+      case t.cb_end do
+        {te, true} -> %{t | cb_end: nil} |> add_cs({:gap, :queued}, t0 - te)
+        {te, false} -> %{t | cb_end: nil} |> add_cs({:gap_for, key}, t0 - te)
+        nil -> t
+      end
+
+    st = %{st | telemetry: t}
+    r = fun.(st)
     t1 = System.monotonic_time(:microsecond)
-    cs_time({:cb, key}, t1 - t0)
 
-    if sample_queue? do
-      seq = (Process.get(:perf_cb_seq) || 0) + 1
-      Process.put(:perf_cb_seq, seq)
+    update_return_state(r, fn st ->
+      t = add_cs(st.telemetry, {:cb, key}, t1 - t0)
 
-      queued? =
-        if band_sample?(seq) or t1 - t0 >= 5_000 do
-          {:message_queue_len, q} = Process.info(self(), :message_queue_len)
-          q > 0
+      t =
+        if sample_queue? do
+          seq = t.cb_seq + 1
+
+          queued? =
+            if band_sample?(seq) or t1 - t0 >= 5_000 do
+              {:message_queue_len, q} = Process.info(self(), :message_queue_len)
+              q > 0
+            else
+              false
+            end
+
+          %{t | cb_seq: seq, cb_end: {t1, queued?}}
         else
-          false
+          t
         end
 
-      Process.put(:perf_cb_end, {t1, queued?})
-    end
-
-    r
+      %{st | telemetry: t}
+    end)
   end
+
+  defp update_return_state({:reply, reply, st}, f), do: {:reply, reply, f.(st)}
+  defp update_return_state({:reply, reply, st, extra}, f), do: {:reply, reply, f.(st), extra}
+  defp update_return_state({:noreply, st}, f), do: {:noreply, f.(st)}
+  defp update_return_state({:noreply, st, extra}, f), do: {:noreply, f.(st), extra}
+  defp update_return_state({:stop, reason, reply, st}, f), do: {:stop, reason, reply, f.(st)}
+  defp update_return_state({:stop, reason, st}, f), do: {:stop, reason, f.(st)}
 
   defp band_sample?(seq), do: rem(seq, 32) == 0
 
   @doc false
-  def cs_timed(key, fun) do
-    t0 = System.monotonic_time(:microsecond)
-    r = fun.()
-    cs_time(key, System.monotonic_time(:microsecond) - t0)
-    r
+  def cs_time(st, key, us), do: %{st | telemetry: add_cs(st.telemetry, key, us)}
+
+  defp add_cs(%__MODULE__{cs: m} = t, key, us) do
+    {n, prev} = Map.get(m, key, {0, 0})
+    %{t | cs: Map.put(m, key, {n + 1, prev + us})}
   end
 
   @doc false
-  def cs_time(key, us) do
-    m = Process.get(:perf_cs) || %{}
-    {n, t} = Map.get(m, key, {0, 0})
-    Process.put(:perf_cs, Map.put(m, key, {n + 1, t + us}))
+  def mark_wait(st, reason) do
+    %{st | telemetry: %{st.telemetry | wait: {reason, System.monotonic_time(:microsecond)}}}
   end
 
   @doc false
-  def mark_wait(reason),
-    do: Process.put(:perf_wait, {reason, System.monotonic_time(:microsecond)})
+  def add_pfwait(st, us),
+    do: %{st | telemetry: %{st.telemetry | pfwait_us: st.telemetry.pfwait_us + us}}
 
   @doc false
-  def record_validation_window(checkblock, rules_us, connect_us) do
-    Process.put(
-      :perf_vwin,
-      add_counts(Process.get(:perf_vwin) || %{}, %{
+  def add_scripts(st, us),
+    do: %{st | telemetry: %{st.telemetry | scripts_us: st.telemetry.scripts_us + us}}
+
+  @doc false
+  def add_resolve(st, us),
+    do: %{st | telemetry: %{st.telemetry | resolve_us: st.telemetry.resolve_us + us}}
+
+  @doc false
+  def record_validation_window(st, checkblock, rules_us, connect_us) do
+    vwin =
+      add_counts(st.telemetry.vwin, %{
         checkblock: checkblock,
         contextual: max(rules_us - checkblock, 0),
         connect: connect_us
       })
-    )
+
+    %{st | telemetry: %{st.telemetry | vwin: vwin}}
   end
 
   # --- work counters & 30 s perf summary ---------------------------------------
@@ -99,7 +134,9 @@ defmodule Exnode.Chain.Telemetry do
 
   @doc false
   def take_cs_work(st) do
-    io = Map.merge(Archive.take_stats(), Connect.take_stats())
+    writer_io = ArchiveWriter.take_stats(st.writer)
+    local_io = Map.merge(Archive.take_stats(), Connect.take_stats())
+    io = add_work(writer_io, local_io)
     %{st | cs_work: add_work(st.cs_work, io), cs_window: add_work(st.cs_window, io)}
   end
 
@@ -120,9 +157,11 @@ defmodule Exnode.Chain.Telemetry do
         }
 
     inputs = Enum.reduce(block.txs, 0, &(&2 + length(&1.inputs)))
-    scripts = Process.delete(:perf_scripts_us) || 0
-    resolve = Process.delete(:perf_resolve_us) || 0
-    pfwait = Process.delete(:perf_pfwait_us) || 0
+    t = st.telemetry
+    scripts = t.scripts_us + (Process.delete(:perf_scripts_us) || 0)
+    resolve = t.resolve_us + (Process.delete(:perf_resolve_us) || 0)
+    pfwait = t.pfwait_us
+    t = %{t | scripts_us: 0, resolve_us: 0, pfwait_us: 0}
 
     p = %{
       p
@@ -138,7 +177,8 @@ defmodule Exnode.Chain.Telemetry do
 
     st = %{
       st
-      | cs_work:
+      | telemetry: t,
+        cs_work:
           add_counts(st.cs_work, %{
             blocks: 1,
             block_bytes: byte_size(block.raw || <<>>),
@@ -155,12 +195,17 @@ defmodule Exnode.Chain.Telemetry do
 
     if now - p.since >= 30_000 do
       secs = (now - p.since) / 1000
-      st = take_cs_work(st)
+      writer_io = ArchiveWriter.take_stats(st.writer)
+      local_io = Map.merge(Archive.take_stats(), Connect.take_stats())
+      io = add_work(writer_io, local_io)
+      st = %{st | cs_work: add_work(st.cs_work, io), cs_window: add_work(st.cs_window, io)}
       c = st.cs_window
       w = st.pf_window
       g = fn m, k -> Map.get(m, k, 0) end
       pf = fn k -> st.pf_stats[k] - st.pf_logged[k] end
-      v = Map.merge(Process.delete(:perf_vwin) || %{}, Connect.take_split())
+      v = add_counts(st.telemetry.vwin, Connect.take_split())
+      cs_map = st.telemetry.cs
+      t = %{st.telemetry | vwin: %{}, cs: %{}}
 
       Logger.info(
         "perf: #{p.blocks} blk (#{Float.round(p.blocks / secs, 1)}/s) #{p.txs} tx #{p.inputs} in; " <>
@@ -181,16 +226,19 @@ defmodule Exnode.Chain.Telemetry do
           "validation: check_block #{ms(g.(v, :checkblock))}ms contextual #{ms(g.(v, :contextual))}ms " <>
           "connect #{ms(g.(v, :connect))}ms (resolve #{ms(p.resolve)}ms, loop #{ms(g.(v, :txloop))}ms ages #{ms(g.(v, :ages))}ms " <>
           "finish #{ms(g.(v, :finish))}ms); " <>
-          cs_line(Process.delete(:perf_cs) || %{}, round(secs * 1_000_000), st.gc_probe)
+          cs_line(cs_map, round(secs * 1_000_000), st.gc_probe)
       )
 
-      %{st | pf_logged: st.pf_stats, pf_window: %{}, cs_window: %{}, perf: nil}
+      %{st | telemetry: t, pf_logged: st.pf_stats, pf_window: %{}, cs_window: %{}, perf: nil}
     else
       %{st | perf: p}
     end
   end
 
   defp ms(us), do: div(us, 1000)
+
+  defp format_wait_key({head, why}), do: "#{head}/#{why}"
+  defp format_wait_key(key), do: to_string(key)
 
   defp cs_line(m, window_us, probe) do
     cbs = for {{:cb, k}, {n, us}} <- m, do: {k, n, us}
@@ -205,7 +253,7 @@ defmodule Exnode.Chain.Telemetry do
     waits =
       for({{:wait, k}, {n, us}} <- m, do: {k, n, us})
       |> Enum.sort_by(&(-elem(&1, 2)))
-      |> Enum.map_join(" ", fn {k, n, us} -> "#{k} #{div(us, 1000)}ms/#{n}" end)
+      |> Enum.map_join(" ", fn {k, n, us} -> "#{format_wait_key(k)} #{div(us, 1000)}ms/#{n}" end)
 
     gaps_for =
       for({{:gap_for, k}, {n, us}} <- m, do: {k, n, us})
@@ -242,32 +290,26 @@ defmodule Exnode.Chain.Telemetry do
   @doc false
   def debug_live(st) do
     w = &:erts_debug.size/1
-    a = st.a
+    archive_parts = ArchiveWriter.debug_archive(st.writer)
     items = if st.plan, do: Map.values(st.plan.items), else: []
     item_part = fn k -> w.(Enum.map(items, &Map.get(&1, k))) end
 
-    parts = %{
-      batch_ops: w.(a.batch.ops),
-      batch_blocks: w.(a.batch.blocks),
-      batch_txindex: w.(a.batch.txindex),
-      batch_blockhash: w.(a.batch.blockhash),
-      archive_other: w.(%{a | batch: nil}),
-      ets_chain: :ets.info(a.chain, :memory) + :ets.info(a.onchain, :memory),
-      overlay_native: div(Overlay.native_bytes(a.overlay), :erlang.system_info(:wordsize)),
-      plan_items: length(items),
-      item_block: item_part.(:block),
-      item_res: item_part.(:res),
-      item_history: item_part.(:history),
-      item_other: w.(Enum.map(items, &Map.drop(&1, [:block, :res, :history]))),
-      plan_todo: if(st.plan, do: w.(st.plan.todo), else: 0),
-      uncommitted: w.(st.uncommitted),
-      round_connected: w.(st.round_connected),
-      mempool_events: w.(st.mempool_events),
-      waiters: w.({st.waiters, st.current_blocks}),
-      sets: w.({st.blocks, st.checked, st.disconnected, st.sources, st.unlinked, st.poisoned}),
-      stats: w.({st.pstats, st.cs_work, st.pf_work, st.pf_window}),
-      dict: w.(Process.get())
-    }
+    parts =
+      Map.merge(archive_parts, %{
+        plan_items: length(items),
+        item_block: item_part.(:block),
+        item_res: item_part.(:res),
+        item_history: item_part.(:history),
+        item_other: w.(Enum.map(items, &Map.drop(&1, [:block, :res, :history]))),
+        plan_todo: if(st.plan, do: w.(st.plan.todo), else: 0),
+        uncommitted: w.(st.uncommitted),
+        round_connected: w.(st.round_connected),
+        mempool_events: w.(st.mempool_events),
+        waiters: w.({st.waiters, st.current_blocks}),
+        sets: w.({st.blocks, st.checked, st.disconnected, st.sources, st.unlinked, st.poisoned}),
+        stats: w.({st.pstats, st.cs_work, st.pf_work, st.pf_window}),
+        dict: w.(Process.get())
+      })
 
     info = Process.info(self(), [:heap_size, :total_heap_size, :stack_size, :message_queue_len])
     Map.merge(parts, Map.new(info))

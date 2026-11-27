@@ -346,6 +346,59 @@ defmodule Exnode.Archive do
   end
 
   @doc """
+  Static concurrency-safe handles for an external coordinator (`Chain.State`)
+  to build a local active-chain read view via `active_reader/2` without holding
+  writer FDs or copying `batch.ops` / `batch.blocks`.
+  """
+  def handles(%__MODULE__{} = a),
+    do: %{
+      kv: a.kv,
+      readers: a.readers,
+      chain: a.chain,
+      onchain: a.onchain,
+      overlay: Overlay.hint(a.overlay),
+      genesis_hash: a.genesis_hash,
+      wpruned_live: a.wpruned_live,
+      committed_live: a.committed_live,
+      segwit_height: a.segwit_height
+    }
+
+  @doc """
+  Assembles an active-chain (committed + uncommitted batch) read-only
+  `%Archive{}` view from static `handles/1` and lightweight mutable metadata
+  (`%{tip, committed_tip, next, epoch, batch_n, batch_bytes, batch_since,
+  batch_txindex, batch_blockhash, last_commit, overwritten, wpruned}`).
+  """
+  def active_reader(handles, meta),
+    do: %__MODULE__{
+      kv: handles.kv,
+      readers: handles.readers,
+      chain: handles.chain,
+      onchain: handles.onchain,
+      overlay: handles.overlay,
+      genesis_hash: handles.genesis_hash,
+      wpruned: meta.wpruned,
+      wpruned_live: handles.wpruned_live,
+      committed_live: handles.committed_live,
+      visible: nil,
+      segwit_height: handles.segwit_height,
+      tip: meta.tip,
+      committed: meta.committed_tip,
+      next: meta.next,
+      epoch: meta.epoch,
+      last_commit: meta.last_commit,
+      overwritten: meta.overwritten,
+      batch: %{
+        empty_batch()
+        | n: meta.batch_n,
+          bytes: meta.batch_bytes,
+          since: meta.batch_since,
+          txindex: meta.batch_txindex,
+          blockhash: meta.batch_blockhash
+      }
+    }
+
+  @doc """
   A read-only view for other processes (block serving): KV, segment
   readers, the selected-chain ETS tables and the witness prune point; no
   batch and no writers. Only committed blocks are visible.

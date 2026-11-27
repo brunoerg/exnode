@@ -77,9 +77,9 @@ defmodule Exnode.Node do
   alias Exnode.ChainParams
   alias Exnode.Chain.Headers
   alias Exnode.Chain.State, as: ChainState
+  alias Exnode.Node.Runtime
   alias Exnode.P2P.BlockDownload
   alias Exnode.P2P.{AddrMan, Connman, Listener, SyncState}
-  alias Exnode.Store.KV
 
   def start_link(opts),
     do: Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -97,26 +97,29 @@ defmodule Exnode.Node do
   end
 
   @doc "Marks node `name` (or `:all` nodes) as stopping; see `stop/2`."
-  def mark_stopping(name), do: :persistent_term.put({__MODULE__, :stopping, name}, true)
+  def mark_stopping(name), do: Runtime.mark_stopping(name)
 
   @doc "Whether node `name` is stopping (`stop/2`, or the application is)."
-  def stopping?(name),
-    do:
-      :persistent_term.get({__MODULE__, :stopping, name}, false) or
-        :persistent_term.get({__MODULE__, :stopping, :all}, false)
+  def stopping?(name), do: Runtime.stopping?(name)
 
   @doc "Registered names of the node's components."
   def names(prefix \\ __MODULE__) do
     %{
+      runtime: Module.concat(prefix, Runtime),
+      handles: Runtime.handles_table(prefix),
       headers: Module.concat(prefix, Headers),
       addrman: Module.concat(prefix, AddrMan),
       sync: Module.concat(prefix, SyncState),
       peer_sup: Module.concat(prefix, PeerSup),
       local_nonces: Module.concat(prefix, LocalNonces),
+      chain_sup: Module.concat(prefix, ChainSup),
+      chain_workers: Module.concat(prefix, ChainWorkers),
+      archive_writer: Module.concat(prefix, ArchiveWriter),
       chain_state: Module.concat(prefix, ChainState),
       script_exec: Module.concat(prefix, ScriptExec),
       block_download: Module.concat(prefix, BlockDownload),
       block_serving: Module.concat(prefix, BlockServing),
+      block_serving_workers: Module.concat(prefix, BlockServingWorkers),
       shadow_monitor: Module.concat(prefix, ShadowMonitor),
       mempool: Module.concat(prefix, Mempool),
       mempool_verify: Module.concat(prefix, MempoolVerify),
@@ -127,6 +130,7 @@ defmodule Exnode.Node do
       scripthash_index: Module.concat(prefix, ScripthashIndex),
       connman: Module.concat(prefix, Connman),
       decode_budget: Module.concat(prefix, DecodeBudget),
+      decode_sup: Module.concat(prefix, DecodeSup),
       listener: Module.concat(prefix, Listener),
       relay_sup: Module.concat(prefix, RelaySup),
       p2p_sup: Module.concat(prefix, P2PSup),
@@ -260,15 +264,16 @@ defmodule Exnode.Node do
     name = Keyword.get(opts, :name, __MODULE__)
     n = names(name)
     # A node started again under this name is running, not stopping.
-    :persistent_term.erase({__MODULE__, :stopping, name})
+    Runtime.clear_stopping(name)
     datadir = Keyword.fetch!(opts, :datadir)
     budget = fd_budget!(opts)
 
-    {:ok, kv} =
-      KV.open(Path.join([datadir, Atom.to_string(chain), "index"]),
-        max_open_files: budget.table_files,
-        block_cache_bytes: Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
-      )
+    kv_path = Path.join([datadir, Atom.to_string(chain), "index"])
+
+    kv_opts = [
+      max_open_files: budget.table_files,
+      block_cache_bytes: Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
+    ]
 
     clock = Keyword.get_lazy(opts, :clock, &Exnode.Clock.new/0)
 
@@ -285,6 +290,7 @@ defmodule Exnode.Node do
       mempool: n.mempool,
       high_bandwidth: n.high_bandwidth,
       decode_budget: n.decode_budget,
+      decode_sup: n.decode_sup,
       # Each peer sends its own version nonce; outbound ones still in the
       # handshake are registered here for the inbound self-connection check.
       local_nonces: n.local_nonces,
@@ -349,14 +355,15 @@ defmodule Exnode.Node do
     indexes =
       if(Keyword.get(opts, :block_filter_index, false),
         do: [
-          {Exnode.Index.BlockFilter, name: n.filter_index, kv: kv, chain_state: n.chain_state}
+          {Exnode.Index.BlockFilter,
+           name: n.filter_index, node_name: name, chain_state: n.chain_state}
         ],
         else: []
       ) ++
         if(Keyword.get(opts, :index_scripthash, false),
           do: [
             {Exnode.Index.Scripthash,
-             name: n.scripthash_index, kv: kv, chain_state: n.chain_state}
+             name: n.scripthash_index, node_name: name, chain_state: n.chain_state}
           ],
           else: []
         )
@@ -377,9 +384,10 @@ defmodule Exnode.Node do
       indexes ++
         rpc_children(opts, n, node, params, datadir, chain) ++ rest_children(opts, n, params)
 
-    # First, so it stops last, erases published persistent_term handles and
-    # closes the store after all its users.
-    pterms = [
+    # First, so it stops last: opens RocksDB in init/1, publishes it in the
+    # per-node Handles ETS table, and on terminate erases published handles
+    # and closes the store after all its users.
+    cleanup_keys = [
       {Exnode.Chain.Headers, n.headers},
       {Exnode.Chain.State, n.chain_state},
       {Exnode.Validation.ScriptExec, :workers, n.script_exec},
@@ -387,52 +395,82 @@ defmodule Exnode.Node do
       {Exnode.Index.Scripthash, n.scripthash_index}
     ]
 
+    runtime_spec =
+      {Runtime,
+       name: n.runtime,
+       node_name: name,
+       kv_path: kv_path,
+       kv_opts: kv_opts,
+       cleanup_keys: cleanup_keys}
+
     children =
-      [{Exnode.Store.KVOwner, {kv, pterms}} | shadow] ++
+      [runtime_spec | shadow] ++
         [
           {Headers,
-           name: n.headers, params: params, kv: kv, now: fn -> Exnode.Clock.now(clock) end},
+           name: n.headers,
+           params: params,
+           node_name: name,
+           now: fn -> Exnode.Clock.now(clock) end},
           # Before the chain state (rest_for_one): an executor restart
           # restarts it, and the executor waits for its old workers' native
           # calls before taking new work (ScriptExec moduledoc).
           {Exnode.Validation.ScriptExec,
            name: n.script_exec, workers: Keyword.get(opts, :script_workers)},
-          {
-            ChainState,
-            # BlockDownload wakes waiting peers when the tip advances.
-            script_exec: n.script_exec,
-            min_heap_size:
-              Keyword.get(opts, :chain_state_min_heap, ChainState.default_min_heap_size()),
-            min_bin_vheap_size:
-              Keyword.get(
-                opts,
-                :chain_state_min_bin_vheap,
-                ChainState.default_min_bin_vheap_size()
-              ),
-            listeners: [n.block_download],
-            gc_probe: Keyword.get(opts, :gc_probe, true),
-            name: n.chain_state,
-            params: params,
-            headers: n.headers,
-            kv: kv,
-            assume_valid: Keyword.get(opts, :assume_valid),
-            prune_witness: Keyword.get(opts, :prune_witness, false),
-            commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
-            batch_blocks:
-              Keyword.get(opts, :batch_blocks, elem(ChainState.default_batch_limits(), 0)),
-            batch_bytes:
-              Keyword.get(opts, :batch_bytes, elem(ChainState.default_batch_limits(), 1)),
-            prefetch_depth:
-              Keyword.get(opts, :prefetch_depth, Exnode.Chain.State.default_prefetch_depth()),
-            mempool: n.mempool,
-            cache_bytes: Keyword.get(opts, :cache_bytes, 450 * 1024 * 1024),
-            shadow_monitor: if(Keyword.get(opts, :shadow, false), do: n.shadow_monitor),
-            hot: Path.join([datadir, Atom.to_string(chain), "archive"]),
-            crash_dir: Path.join([datadir, Atom.to_string(chain), "crashes"]),
-            cold:
-              Keyword.get(opts, :datadir_cold) &&
-                Path.join([opts[:datadir_cold], Atom.to_string(chain), "archive"])
-          },
+          # one_for_all: ArchiveWriter holds the in-memory uncommitted batch,
+          # native Overlay, and :protected Chain.View ETS table. If ChainState
+          # crashes (e.g. :archive_crashed or :kill), ArchiveWriter must also
+          # restart so uncommitted state is discarded and both reload cleanly
+          # from the last durable RocksDB commit.
+          group(n.chain_sup, :one_for_all, [
+            {Task.Supervisor, name: n.chain_workers},
+            {
+              Exnode.Archive.Writer,
+              name: n.archive_writer,
+              view_name: n.chain_state,
+              node_name: name,
+              params: params,
+              headers: n.headers,
+              prune_witness: Keyword.get(opts, :prune_witness, false),
+              cache_bytes: Keyword.get(opts, :cache_bytes, 450 * 1024 * 1024),
+              hot: Path.join([datadir, Atom.to_string(chain), "archive"]),
+              cold:
+                Keyword.get(opts, :datadir_cold) &&
+                  Path.join([opts[:datadir_cold], Atom.to_string(chain), "archive"])
+            },
+            {
+              ChainState,
+              # BlockDownload wakes waiting peers when the tip advances.
+              script_exec: n.script_exec,
+              worker_sup: n.chain_workers,
+              archive_writer: n.archive_writer,
+              min_heap_size:
+                Keyword.get(opts, :chain_state_min_heap, ChainState.default_min_heap_size()),
+              min_bin_vheap_size:
+                Keyword.get(
+                  opts,
+                  :chain_state_min_bin_vheap,
+                  ChainState.default_min_bin_vheap_size()
+                ),
+              listeners: [n.block_download],
+              gc_probe: Keyword.get(opts, :gc_probe, true),
+              name: n.chain_state,
+              node_name: name,
+              params: params,
+              headers: n.headers,
+              assume_valid: Keyword.get(opts, :assume_valid),
+              commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
+              batch_blocks:
+                Keyword.get(opts, :batch_blocks, elem(ChainState.default_batch_limits(), 0)),
+              batch_bytes:
+                Keyword.get(opts, :batch_bytes, elem(ChainState.default_batch_limits(), 1)),
+              prefetch_depth:
+                Keyword.get(opts, :prefetch_depth, Exnode.Chain.State.default_prefetch_depth()),
+              mempool: n.mempool,
+              shadow_monitor: if(Keyword.get(opts, :shadow, false), do: n.shadow_monitor),
+              hot: Path.join([datadir, Atom.to_string(chain), "archive"]),
+              crash_dir: Path.join([datadir, Atom.to_string(chain), "crashes"])
+            }
+          ]),
           group(n.relay_sup, :rest_for_one, [
             # The mempool's script checks (Core: the -par script-check threads).
             {Task.Supervisor, name: n.mempool_verify},
@@ -456,6 +494,8 @@ defmodule Exnode.Node do
             {Exnode.P2P.TxRelay,
              name: n.tx_relay,
              mempool: n.mempool,
+             mempool_policies: true,
+             async_mempool: true,
              peer_sup: n.peer_sup,
              clock: fn -> Exnode.Clock.now_ms(clock) end}
           ]),
@@ -480,7 +520,9 @@ defmodule Exnode.Node do
                params: params,
                clock: clock},
               {Exnode.P2P.HighBandwidth, name: n.high_bandwidth},
-              {Exnode.P2P.BlockServing, name: n.block_serving},
+              {Task.Supervisor, name: n.block_serving_workers},
+              {Exnode.P2P.BlockServing, name: n.block_serving, task_sup: n.block_serving_workers},
+              {Task.Supervisor, name: n.decode_sup},
               {Exnode.P2P.DecodeBudget,
                name: n.decode_budget,
                bytes:

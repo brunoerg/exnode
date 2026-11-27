@@ -55,16 +55,21 @@ defmodule Exnode.REST.Esplora do
 
   @impl Plug
   def call(conn, opts) do
-    super(conn, opts)
-  rescue
-    e in Plug.Conn.WrapperError ->
-      case e do
-        %{kind: :exit, reason: reason} -> service_unavailable(conn, reason)
-        _ -> reraise(e, __STACKTRACE__)
-      end
-  catch
-    :exit, reason ->
-      service_unavailable(conn, reason)
+    try do
+      super(conn, opts)
+    rescue
+      e in Plug.Conn.WrapperError ->
+        case e do
+          %{kind: :exit, reason: reason} -> service_unavailable(conn, reason)
+          _ -> reraise(e, __STACKTRACE__)
+        end
+    catch
+      :exit, reason ->
+        service_unavailable(conn, reason)
+    after
+      Exnode.Archive.take_stats()
+      Exnode.Archive.Segments.close_all_readers()
+    end
   end
 
   defp service_unavailable(conn, reason) do

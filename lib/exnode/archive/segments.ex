@@ -420,6 +420,14 @@ defmodule Exnode.Archive.Segments do
     :ok
   end
 
+  @doc "Closes every cached read handle owned by the calling process."
+  def close_all_readers do
+    for {_, {fd, _}} <- handles(), do: :file.close(fd)
+    Process.delete({__MODULE__, :handles})
+    Process.delete({__MODULE__, :tick})
+    :ok
+  end
+
   @doc false
   # This process's open read handles (tests).
   def open_read_handles, do: map_size(handles())

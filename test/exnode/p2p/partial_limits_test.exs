@@ -36,15 +36,15 @@ defmodule Exnode.P2P.PartialLimitsTest do
       ])
 
     _ = FakePeer.recv(sock, ["getblocktxn"], 16)
-    before = :sys.get_state(pid).partials
+    before = elem(:sys.get_state(pid), 1).proto.partials
     assert map_size(before) == 16
 
     :ok = FakePeer.send_msgs(sock, [compact.(hd(blocks)), {:ping, 81}])
     _ = FakePeer.recv(sock, ["pong"], 1)
-    assert :sys.get_state(pid).partials == before
+    assert elem(:sys.get_state(pid), 1).proto.partials == before
     :ok = FakePeer.send_msgs(sock, compact.(List.last(blocks)))
     assert [{"getdata", _}] = FakePeer.recv(sock, ["getdata"], 1)
-    assert map_size(:sys.get_state(pid).partials) == 16
+    assert map_size(elem(:sys.get_state(pid), 1).proto.partials) == 16
 
     Exnode.Clock.advance(clock, 61)
     :ok = Exnode.Clock.tick(pid)
@@ -56,7 +56,7 @@ defmodule Exnode.P2P.PartialLimitsTest do
            end)
            |> MapSet.new() == MapSet.new(Map.keys(before))
 
-    assert :sys.get_state(pid).partials == %{}
+    assert elem(:sys.get_state(pid), 1).proto.partials == %{}
 
     # A late blocktxn no longer holds or connects a partial.
     :ok =

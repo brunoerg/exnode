@@ -23,6 +23,7 @@ defmodule Exnode.P2P.BlockServing do
   use GenServer
 
   alias Exnode.Archive
+  alias Exnode.Archive.Segments
   alias Exnode.Codec.Block
   alias Exnode.P2P.CompactBlock
 
@@ -39,6 +40,16 @@ defmodule Exnode.P2P.BlockServing do
 
   @impl true
   def init(opts) do
+    {task_sup, private_sup} =
+      case Keyword.get(opts, :task_sup) do
+        nil ->
+          {:ok, sup} = Task.Supervisor.start_link()
+          {sup, sup}
+
+        sup ->
+          {sup, nil}
+      end
+
     {:ok,
      %{
        entries: %{},
@@ -49,10 +60,14 @@ defmodule Exnode.P2P.BlockServing do
        max_bytes: Keyword.get(opts, :max_bytes, @max_bytes),
        # key => callers waiting for its build
        pending: %{},
-       # monitor ref => {key, priority}
+       # monitor ref => {key, pid, priority, tag}
        builders: %{},
+       # tag => monitor ref
+       tags: %{},
        queue: :queue.new(),
-       max_builders: Keyword.get(opts, :max_builders, max(2, System.schedulers_online()))
+       max_builders: Keyword.get(opts, :max_builders, max(2, System.schedulers_online())),
+       task_sup: task_sup,
+       private_sup: private_sup
      }}
   end
 
@@ -82,39 +97,86 @@ defmodule Exnode.P2P.BlockServing do
   end
 
   @impl true
-  def handle_info({:DOWN, ref, :process, _pid, reason}, st) do
-    case Map.pop(st.builders, ref) do
+  def handle_info({:build_done, tag, result}, st) do
+    case Map.pop(st.tags, tag) do
       {nil, _} ->
         {:noreply, st}
 
-      {{key, _priority}, builders} ->
-        reply =
-          case reason do
-            {:shutdown, {:built, r}} -> r
-            _ -> :notfound
-          end
+      {mref, tags} ->
+        Process.demonitor(mref, [:flush])
+        {{key, _pid, _priority, _tag}, builders} = Map.pop!(st.builders, mref)
+        finish_build(%{st | builders: builders, tags: tags}, key, result)
+    end
+  end
 
-        {waiters, pending} = Map.pop(st.pending, key, [])
-        for w <- waiters, do: GenServer.reply(w, reply)
-        st = %{st | builders: builders, pending: pending}
-        {:noreply, st |> cache(key, reply) |> start_queued()}
+  def handle_info({:DOWN, mref, :process, _pid, _reason}, st) do
+    case Map.pop(st.builders, mref) do
+      {nil, _} ->
+        {:noreply, st}
+
+      {{key, _pid, _priority, tag}, builders} ->
+        finish_build(%{st | builders: builders, tags: Map.delete(st.tags, tag)}, key, :notfound)
     end
   end
 
   def handle_info(_msg, st), do: {:noreply, st}
 
-  # The result travels in the worker's exit reason: one message, and a crash
-  # (anything `build/4` does not rescue) is a :notfound for its waiters.
-  defp start_build(st, {key, reader, id, decode}, priority) do
-    {_, format} = key
+  @impl true
+  def terminate(_reason, st) do
+    for {mref, {_key, pid, _priority, _tag}} <- st.builders do
+      try do
+        Task.Supervisor.terminate_child(st.task_sup, pid)
+      catch
+        :exit, _ -> :ok
+      end
 
-    {_pid, ref} =
-      spawn_monitor(fn -> exit({:shutdown, {:built, build(reader, id, format, decode)}}) end)
+      Process.demonitor(mref, [:flush])
+    end
 
-    %{st | builders: Map.put(st.builders, ref, {key, priority})}
+    if is_pid(st.private_sup) and Process.alive?(st.private_sup) do
+      try do
+        Supervisor.stop(st.private_sup, :shutdown, 5_000)
+      catch
+        :exit, _ -> :ok
+      end
+    end
+
+    :ok
   end
 
-  defp ordinary_builders(st), do: Enum.count(st.builders, fn {_, {_, p}} -> not p end)
+  defp finish_build(st, key, reply) do
+    {waiters, pending} = Map.pop(st.pending, key, [])
+    for w <- waiters, do: GenServer.reply(w, reply)
+    {:noreply, %{st | pending: pending} |> cache(key, reply) |> start_queued()}
+  end
+
+  defp start_build(st, {key, reader, id, decode}, priority) do
+    {_, format} = key
+    owner = self()
+    tag = make_ref()
+
+    {:ok, pid} =
+      Task.Supervisor.start_child(st.task_sup, fn ->
+        result =
+          try do
+            build(reader, id, format, decode)
+          after
+            Segments.close_all_readers()
+          end
+
+        send(owner, {:build_done, tag, result})
+      end)
+
+    mref = Process.monitor(pid)
+
+    %{
+      st
+      | builders: Map.put(st.builders, mref, {key, pid, priority, tag}),
+        tags: Map.put(st.tags, tag, mref)
+    }
+  end
+
+  defp ordinary_builders(st), do: Enum.count(st.builders, fn {_, {_, _, p, _}} -> not p end)
 
   defp start_queued(st) do
     if ordinary_builders(st) < st.max_builders do

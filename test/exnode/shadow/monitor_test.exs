@@ -74,8 +74,9 @@ defmodule Exnode.Shadow.MonitorTest do
     # is behind the oldest reconnected block.
     File.rm_rf!(Path.join(dir, "shadow"))
 
-    # Restart: init reconnects 61..150 from `pending` while the shadow is at 0.
+    # Restart: startup replay reconnects 61..150 from `pending` while the shadow is at 0.
     n = start(dir, [])
+    assert :ok = State.await_idle(n.cs)
     assert State.tip(n.cs).height == 150
     assert %{divergences: 0} = Monitor.drain(n.mon)
     assert GenServer.call(n.cs, :halted) == false

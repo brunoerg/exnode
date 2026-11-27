@@ -62,7 +62,7 @@ defmodule Exnode.P2P.PeerAddrTest do
     if n == nonce, do: :ok, else: wait_pong(sock, nonce)
   end
 
-  defp handshaked(pid), do: wait_until(fn -> :sys.get_state(pid).verack_received end)
+  defp handshaked(pid), do: wait_until(fn -> match?({{:ready, _}, _}, :sys.get_state(pid)) end)
 
   test "a reply to our getaddr reaches the address book; it is not limited to 1 token", %{n: n} do
     {pid, sock} = FakePeer.connect_from(n, node: %{addrman: n.addrman})

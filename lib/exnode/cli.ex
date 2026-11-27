@@ -146,10 +146,11 @@ defmodule Exnode.CLI do
       end
 
     n = Exnode.Node.names()
-    Process.put(:node_ref, Process.monitor(pid))
+    ref = Process.monitor(pid)
 
     loop(
       n,
+      ref,
       opts[:status_file],
       System.monotonic_time(:second),
       Keyword.get(opts, :status_interval, 10_000)
@@ -177,9 +178,7 @@ defmodule Exnode.CLI do
   defp default_rpc_port(:signet), do: 38332
   defp default_rpc_port(:regtest), do: 18443
 
-  defp loop(n, status_file, t0, interval) do
-    ref = Process.get(:node_ref)
-
+  defp loop(n, ref, status_file, t0, interval) do
     receive do
       {:DOWN, ^ref, :process, _, reason} -> node_down(reason)
     after
@@ -192,7 +191,7 @@ defmodule Exnode.CLI do
       kind, reason -> IO.puts("status unavailable: #{inspect(kind)} #{inspect(reason, limit: 5)}")
     end
 
-    loop(n, status_file, t0, interval)
+    loop(n, ref, status_file, t0, interval)
   end
 
   # Reads the chain view (ETS) rather than calling the chain-state process,

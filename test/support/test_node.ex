@@ -32,7 +32,6 @@ defmodule Exnode.Test.Node do
           chain: :regtest,
           datadir: dir,
           connect: [{"127.0.0.1", 1}],
-          chain_state_min_heap: 2_000_000,
           gc_probe: false
         ],
         opts

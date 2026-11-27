@@ -74,13 +74,13 @@ defmodule Exnode.DoS.FrameRetentionTest do
     # The tail of the big frame and the tx go in one write, so they arrive in
     # the same receive chunk (an attacker controls its write boundaries):
     # the head is read by the peer (its byte count) before the tail is sent.
-    recv0 = :sys.get_state(pid).bytes_recv
+    recv0 = elem(:sys.get_state(pid), 1).conn.bytes_recv
 
     Enum.reduce(1..k, recv0, fn i, recv ->
       b = burst(orphan(i))
       cut = 3_990_000 - 100
       :ok = :gen_tcp.send(sock, binary_part(b, 0, cut))
-      wait_until(fn -> :sys.get_state(pid).bytes_recv >= recv + cut end)
+      wait_until(fn -> elem(:sys.get_state(pid), 1).conn.bytes_recv >= recv + cut end)
       :ok = :gen_tcp.send(sock, binary_part(b, cut, byte_size(b) - cut))
       recv + byte_size(b)
     end)
