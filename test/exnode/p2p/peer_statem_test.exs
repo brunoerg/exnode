@@ -248,8 +248,25 @@ defmodule Exnode.P2P.PeerStatemTest do
       :gen_tcp.close(sock)
     end
 
-    test "block decode runs in worker: Peer heap stays small and avoids manual GC", %{n: n} do
-      b1 = BB.build(@p.genesis.header, [BB.coinbase(1, 50 * 100_000_000)])
+    test "large block decode runs in DecodeSup worker without triggering manual GC on Peer", %{
+      n: n
+    } do
+      # Build a valid > 64 KiB block (exceeds DecodeBudget.min_bytes/0 = 65_536)
+      # via a coinbase with OP_RETURN padding outputs so the with_budget(gc: false)
+      # + DecodeSup worker path is genuinely exercised.
+      pad = :binary.copy(<<0x42>>, 80_000)
+
+      cb =
+        BB.coinbase_with(1, 50 * 100_000_000,
+          outputs: [
+            {50 * 100_000_000, <<0x51>>},
+            {0, <<0x6A, 0x4E, 80_000::little-32, pad::binary>>}
+          ]
+        )
+
+      b1 = BB.build(@p.genesis.header, [cb])
+      assert byte_size(b1.raw) > Exnode.P2P.DecodeBudget.min_bytes()
+
       {:ok, _} = Exnode.Chain.Headers.process_headers(n.headers, [b1.header])
       clock = Exnode.Clock.new()
       Exnode.Clock.set(clock, b1.header.time + 10)
@@ -258,12 +275,54 @@ defmodule Exnode.P2P.PeerStatemTest do
       _ = FakePeer.recv(sock, ["verack"], 1)
       wait_until(fn -> elem(:sys.get_state(pid), 0) == {:ready, :active} end)
 
-      :erlang.trace(pid, true, [:garbage_collection])
-      :ok = FakePeer.send_msgs(sock, [{:block, b1.raw}, {:ping, 123}])
-      [{"pong", <<123::little-64>>}] = FakePeer.recv(sock, ["pong"], 1)
-      :erlang.trace(pid, false, [:garbage_collection])
+      # Ensure modules on the decode path are already loaded so BEAM's lazy
+      # code loader (:code.ensure_loaded/1) does not trigger an incidental GC.
+      for mod <- [
+            Exnode.P2P.DecodeBudget,
+            Exnode.P2P.Peer.BlockSync,
+            Exnode.P2P.CompactBlock,
+            Exnode.Codec.Block
+          ] do
+        Code.ensure_loaded!(mod)
+      end
 
-      # Block connected on chain; Peer process did not trigger forced full-sweep GC.
+      # Trace calls on Peer and newly spawned workers so we assert:
+      # 1. DecodeBudget.with_budget/4 ran with gc: false on Peer (> 64 KiB block);
+      # 2. Block.decode_exact/1 ran in a DecodeSup worker PID != Peer;
+      # 3. Peer never called :erlang.garbage_collect/0 (manual GC skipped).
+      # (A tiny automatic BEAM major GC on a 1.5k-word young heap can occur from
+      # normal TCP frame buffering and is not a forced GC.)
+      :erlang.trace(pid, true, [:call])
+      :erlang.trace(:new_processes, true, [:call])
+      :erlang.trace_pattern({Exnode.Codec.Block, :decode_exact, 1}, true, [:local])
+      :erlang.trace_pattern({Exnode.P2P.DecodeBudget, :with_budget, 4}, true, [:local])
+      :erlang.trace_pattern({:erlang, :garbage_collect, 0}, true, [:local])
+
+      try do
+        :ok = FakePeer.send_msgs(sock, [{:block, b1.raw}, {:ping, 123}])
+        [{"pong", <<123::little-64>>}] = FakePeer.recv(sock, ["pong"], 1)
+      after
+        :erlang.trace_pattern({:erlang, :garbage_collect, 0}, false, [:local])
+        :erlang.trace_pattern({Exnode.P2P.DecodeBudget, :with_budget, 4}, false, [:local])
+        :erlang.trace_pattern({Exnode.Codec.Block, :decode_exact, 1}, false, [:local])
+        :erlang.trace(:new_processes, false, [:call])
+        :erlang.trace(pid, false, [:call])
+      end
+
+      budget_name = n.decode_budget
+      raw_size = byte_size(b1.raw)
+
+      assert_receive {:trace, ^pid, :call,
+                      {Exnode.P2P.DecodeBudget, :with_budget,
+                       [^budget_name, ^raw_size, _, [gc: false]]}},
+                     1_000
+
+      assert_receive {:trace, worker_pid, :call, {Exnode.Codec.Block, :decode_exact, _}}, 1_000
+      assert worker_pid != pid
+      refute_receive {:trace, ^pid, :call, {Exnode.Codec.Block, :decode_exact, _}}, 50
+      refute_receive {:trace, ^pid, :call, {:erlang, :garbage_collect, []}}, 50
+
+      # Block connected on chain; Peer process heap stays small.
       assert State.tip(n.chain_state).hash == b1.header.hash
       {:memory, peer_mem} = Process.info(pid, :memory)
       assert peer_mem < 1_000_000
