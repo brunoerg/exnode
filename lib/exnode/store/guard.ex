@@ -102,7 +102,10 @@ defmodule Exnode.Store.Guard do
           message:
             "#{name} store at #{dir} halted after a storage fault (#{path} present: " <>
               "#{inspect(info[:source])} #{inspect(info[:reason])} - #{info[:message]}): " <>
-              "investigate hardware/software before running `mix exnode.restore --force-from-snapshot` or resyncing"
+              "local snapshots hard-link immutable SST files on the same volume and share segment files, " <>
+              "so `mix exnode.restore --force-from-snapshot` cannot recover from a media fault or corrupted " <>
+              "SST/segment data (for media faults, replace failing hardware and resync from the network or " <>
+              "restore an independent off-volume backup)"
 
       {:corrupt_lock, reason} ->
         raise Exnode.StorageError,

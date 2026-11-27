@@ -2,25 +2,33 @@ defmodule Exnode.Store.Snapshot do
   @moduledoc """
   Quiescent, rotated store snapshots and atomic restore (libbitcoin model).
 
-  Mutable RocksDB state (`index/` for canonical state, `derived/` for optional
-  query indexes) is never trusted after an unclean shutdown or storage fault.
-  Instead:
+  Mutable RocksDB state (`index/` for canonical state, `derived/filters/` and
+  `derived/scripthash/` for optional single-writer query indexes) is never
+  trusted after an unclean shutdown or storage fault. Instead:
 
-  1. At every quiescent commit point (after append-only segments are fsynced and
-     the synced canonical KV batch has written `meta["archive"]`), `take_canonical!/3`
-     calls `KV.checkpoint/2` (flushing memtables to immutable SSTs, zero WAL,
-     hard-linking SSTs, fsyncing MANIFEST/CURRENT) into `snapshots/staging`,
-     writes a checksummed `SNAPSHOT_OK` sentinel, and rotates two slots on the
-     same filesystem via atomic directory renames + directory fsyncs:
+  1. At quiescent points (canonical commits in `Chain.State`, and between
+     batches / clean shutdown in each derived index writer), `KV.checkpoint/2`
+     flushes memtables to immutable SSTs (zero WAL), hard-links those SSTs, and
+     fsyncs MANIFEST/CURRENT into `snapshots/staging`, writes a checksummed
+     `SNAPSHOT_OK` sentinel, and rotates two slots on the same filesystem via
+     atomic directory renames + directory fsyncs:
      `rm secondary -> rename(primary, secondary) -> rename(staging, primary)`.
   2. At every instant during rotation, at least one complete snapshot (`primary`
      or `secondary`) exists on disk.
-  3. On restore (`restore!/2`), the live crashed `index/` is replaced whole from
-     a hard-linked clone of the latest valid snapshot (leaving the snapshot
-     itself intact for idempotency), append-only hot/cold segments are truncated
-     to the exact `ends` recorded in that snapshot's `meta["archive"]`,
-     ephemeral `staging/` is wiped, `derived/` is restored from its snapshot (or
-     wiped if dirty with no snapshot), and `flush.lock` is removed.
+  3. On restore (`restore!/2`), a dirty canonical `index/` is replaced whole
+     from a hard-linked clone of the latest valid snapshot (leaving the
+     snapshot itself intact for idempotency), append-only hot/cold segments are
+     truncated to the exact `ends` recorded in that snapshot's
+     `meta["archive"]`, ephemeral `staging/` is wiped, any dirty per-index
+     derived store is restored from its snapshot (or wiped if no snapshot
+     exists), and `flush.lock` is removed last.
+
+  Note: because snapshots hard-link immutable SST files on the same volume and
+  share the append-only segment files, restoring from a local snapshot recovers
+  from clean stops (crashes/power loss) under fail-stop hardware, NOT from
+  media faults or corrupted SST/segment data. Media faults require replacing
+  failing hardware and resyncing from the network or restoring an independent
+  off-volume backup.
   """
 
   require Logger
@@ -196,7 +204,11 @@ defmodule Exnode.Store.Snapshot do
       message:
         "#{label} store at #{dir} halted after a latched storage fault " <>
           "(#{inspect(info[:source])} #{inspect(info[:reason])}: #{info[:message]}). " <>
-          "Investigate hardware/software first, then re-run with --force-from-snapshot or resync"
+          "Local snapshots hard-link immutable SST files on the same volume and share segment files, " <>
+          "so --force-from-snapshot cannot repair damaged media or corrupted SST/segment data " <>
+          "(it will relink the same files). Only pass --force-from-snapshot after confirming a " <>
+          "non-media fault; for media faults, replace faulty hardware and resync from the network " <>
+          "or restore an independent off-volume backup"
   end
 
   defp check_not_faulted!(_dir, _label, _state), do: :ok

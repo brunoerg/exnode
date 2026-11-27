@@ -159,21 +159,30 @@ and the durable tip. New segment directory entries are synced before committed
 metadata can reference them. Canonical consensus state (`index/`, single-writer,
 `sync: true` only with `use_fsync`, `atomic_flush`, `paranoid_checks`, and
 `absolute_consistency` WAL recovery) is separated from ephemeral download/header
-staging (`staging/`) and optional query indexes (`derived/`).
+staging (`staging/`, whose WAL and directory are fsynced before clean-close
+unlock and whose cached headers verify their recomputed hash on reload) and
+per-index single-writer query stores (`derived/filters/` and
+`derived/scripthash/`, each with its own `flush.lock` and quiescent snapshots
+taken between batches and on clean shutdown).
 
-`flush.lock` enforces a strict clean-close gate: the lock is created and fsynced
-before opening the store and removed only after a clean, fault-free shutdown.
-After every canonical commit, `exnode` takes a quiescent RocksDB checkpoint
-(flushing memtables and hard-linking immutable SSTs) and rotates
-`snapshots/primary` and `snapshots/secondary` via atomic directory renames.
-After a crash or power loss, the node refuses to open the dirty store directly;
-`mix exnode.restore` (or `bin/exnode-restore`) replaces `index/` whole from the
-latest complete snapshot, truncates hot/cold append-only segments to the
-snapshot's exact `ends`, wipes ephemeral `staging/`, and clears `flush.lock`.
-Any storage I/O error, checksum mismatch, missing/short segment, or archive
+`flush.lock` enforces a strict clean-close gate on each store: the lock is
+created and fsynced before opening the store and removed only after a clean,
+fault-free shutdown. After every canonical commit (or every `--snapshot-every`
+commits during IBD, always near tip and on clean shutdown), `exnode` takes a
+quiescent RocksDB checkpoint (flushing memtables and hard-linking immutable
+SSTs) and rotates `snapshots/primary` and `snapshots/secondary` via atomic
+directory renames. After a crash or power loss, the node refuses to open any
+dirty store directly; `mix exnode.restore` (or `bin/exnode-restore`) replaces a
+dirty `index/` whole from the latest complete snapshot, truncates hot/cold
+append-only segments to the snapshot's exact `ends`, wipes ephemeral `staging/`,
+restores (or wipes) any dirty derived index store, and clears `flush.lock`. Any
+storage I/O error, checksum mismatch, missing/short segment, or archive
 integrity failure permanently latches a store fault, halts the node immediately,
-and retains `flush.lock` with the fault record (requiring investigation and
-`--force-from-snapshot` or a full resync).
+and retains `flush.lock` with the fault record. Because local snapshots
+hard-link immutable SST files on the same volume and share the append-only
+segment files, `--force-from-snapshot` cannot recover from damaged storage media
+or corrupted SST/segment data; media faults require replacing failing hardware
+and resyncing from the network or restoring an independent off-volume backup.
 
 Pending admission uses unsynced writes into `staging/`, so a `:stored` reply is
 not a promise that every accepted body survives power loss. Missing bodies are
