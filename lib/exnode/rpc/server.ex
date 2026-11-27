@@ -74,20 +74,25 @@ defmodule Exnode.RPC.Server do
     Exnode.Archive.Segments.limit_read_handles(Exnode.FdBudget.api_read_handles())
     conn = Plug.Conn.put_resp_content_type(conn, "application/json")
 
-    cond do
-      not authorized?(conn, opts.auth) ->
-        conn
-        |> Plug.Conn.put_resp_header("www-authenticate", ~s(Basic realm="jsonrpc"))
-        |> Plug.Conn.send_resp(401, "")
+    try do
+      cond do
+        not authorized?(conn, opts.auth) ->
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", ~s(Basic realm="jsonrpc"))
+          |> Plug.Conn.send_resp(401, "")
 
-      conn.method != "POST" ->
-        Plug.Conn.send_resp(conn, 405, "JSONRPC server handles only POST requests")
+        conn.method != "POST" ->
+          Plug.Conn.send_resp(conn, 405, "JSONRPC server handles only POST requests")
 
-      true ->
-        case Plug.Conn.read_body(conn, length: 32_000_000) do
-          {:ok, body, conn} -> handle_body(conn, body, opts.ctx)
-          {:more, _, conn} -> Plug.Conn.send_resp(conn, 413, "Request body too large")
-        end
+        true ->
+          case Plug.Conn.read_body(conn, length: 32_000_000) do
+            {:ok, body, conn} -> handle_body(conn, body, opts.ctx)
+            {:more, _, conn} -> Plug.Conn.send_resp(conn, 413, "Request body too large")
+          end
+      end
+    after
+      Exnode.Archive.take_stats()
+      Exnode.Archive.Segments.close_all_readers()
     end
   end
 

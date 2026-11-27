@@ -66,6 +66,8 @@ defmodule Exnode.Shadow.Monitor do
   def init(opts) do
     # Trap exits so terminate/2 runs on shutdown and waits for the shadow's flush.
     Process.flag(:trap_exit, true)
+    # Rounds carry raw blocks; keep old-gen turnover tight without forcing GC on every message.
+    Process.flag(:fullsweep_after, 10)
     dir = Keyword.fetch!(opts, :dir)
 
     {:ok, shadow} =
@@ -161,7 +163,7 @@ defmodule Exnode.Shadow.Monitor do
               Enum.each(st.tip_waiters, &GenServer.reply(&1, tip))
             )
 
-        {:noreply, %{st | drainers: [], tip_waiters: []}}
+        {:noreply, %{st | drainers: [], tip_waiters: []}, :hibernate}
 
       {{:value, {connected, rejected, tip} = r}, q} ->
         n = length(connected) + length(rejected)
@@ -176,8 +178,6 @@ defmodule Exnode.Shadow.Monitor do
           end
 
         send(self(), :work)
-        # Rounds carry raw blocks; release them promptly.
-        :erlang.garbage_collect()
         {:noreply, st}
     end
   end

@@ -30,7 +30,7 @@ defmodule Exnode.Index.Scripthash do
   alias Exnode.Store.KV
 
   @cf :scripthash
-  @tick_ms 200
+  @fallback_tick_ms 5_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
@@ -224,8 +224,6 @@ defmodule Exnode.Index.Scripthash do
 
   @impl true
   def init(opts) do
-    send(self(), :tick)
-
     kv =
       case Keyword.fetch(opts, :kv) do
         {:ok, kv} -> kv
@@ -235,7 +233,18 @@ defmodule Exnode.Index.Scripthash do
     # Readers scan in their own process (`history/2`).
     if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, kv)
 
-    {:ok, %{kv: kv, chain_state: Keyword.fetch!(opts, :chain_state), waiters: [], stats: %{}}}
+    st = %{
+      kv: kv,
+      chain_state: Keyword.fetch!(opts, :chain_state),
+      waiters: [],
+      stats: %{},
+      writer_mon: nil,
+      sync_queued: false,
+      fallback_timer: nil
+    }
+
+    st = st |> maybe_subscribe() |> schedule_sync(0)
+    {:ok, st}
   end
 
   @impl true
@@ -251,11 +260,21 @@ defmodule Exnode.Index.Scripthash do
   def handle_call({:sync_to, hash}, from, st) do
     if indexed?(st, hash),
       do: {:reply, :ok, st},
-      else: {:noreply, %{st | waiters: [{hash, from} | st.waiters]}}
+      else: {:noreply, %{st | waiters: [{hash, from} | st.waiters]} |> schedule_sync(0)}
   end
 
   @impl true
+  def handle_info({:archive_committed, _tip}, st), do: {:noreply, schedule_sync(st, 0)}
+  def handle_info({:archive_disconnected, _tip}, st), do: {:noreply, schedule_sync(st, 0)}
+
+  def handle_info(:fallback_tick, st) do
+    st = %{st | fallback_timer: nil} |> maybe_subscribe()
+    {:noreply, schedule_sync(st, 0)}
+  end
+
   def handle_info(:tick, st) do
+    st = %{st | sync_queued: false} |> maybe_subscribe()
+
     result =
       try do
         backfill_totals(st.kv)
@@ -273,8 +292,50 @@ defmodule Exnode.Index.Scripthash do
         indexed?(st, h) and GenServer.reply(from, :ok) == :ok
       end)
 
-    Process.send_after(self(), :tick, if(result == :more, do: 0, else: @tick_ms))
-    {:noreply, take_work(%{st | waiters: waiters})}
+    st = take_work(%{st | waiters: waiters})
+
+    st =
+      if result == :more do
+        schedule_sync(st, 0)
+      else
+        ensure_fallback_timer(st)
+      end
+
+    {:noreply, st}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{writer_mon: ref} = st) do
+    # Archive.Writer restarted; clear subscription so next tick/fallback re-subscribes.
+    {:noreply, %{st | writer_mon: nil} |> ensure_fallback_timer()}
+  end
+
+  def handle_info(_msg, st), do: {:noreply, st}
+
+  defp maybe_subscribe(%{writer_mon: ref} = st) when is_reference(ref), do: st
+
+  defp maybe_subscribe(st) do
+    try do
+      case ChainState.subscribe_commits(st.chain_state) do
+        {:ok, writer_pid} -> %{st | writer_mon: Process.monitor(writer_pid)}
+        _ -> st
+      end
+    catch
+      :exit, _ -> st
+    end
+  end
+
+  defp schedule_sync(%{sync_queued: true} = st, _ms), do: st
+
+  defp schedule_sync(st, 0) do
+    send(self(), :tick)
+    %{st | sync_queued: true}
+  end
+
+  defp ensure_fallback_timer(%{fallback_timer: ref} = st) when is_reference(ref), do: st
+
+  defp ensure_fallback_timer(st) do
+    ref = Process.send_after(self(), :fallback_tick, @fallback_tick_ms)
+    %{st | fallback_timer: ref}
   end
 
   @counters [:sh_blocks, :sh_outputs, :sh_undo, :sh_materialize_us, :sh_spent_us, :sh_rows_us]

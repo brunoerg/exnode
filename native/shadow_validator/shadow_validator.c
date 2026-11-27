@@ -197,7 +197,12 @@ int main(int argc, char **argv) {
         uint8_t *buf = malloc(len);
         if (!buf || read_full(buf, len) != 1) { free(buf); status = 3; break; }
 
-        if (buf[0] == 1) {
+        if (buf[0] == 0) {
+            /* Explicit clean-shutdown opcode: flush and exit cleanly so the
+             * BEAM port receives {:exit_status, 0} without closing the pipe. */
+            free(buf);
+            break;
+        } else if (buf[0] == 1) {
             btck_Block *block = btck_block_create(buf + 1, len - 1);
             if (!block) { send_error("bad_block_encoding"); free(buf); continue; }
             g_nevents = 0;

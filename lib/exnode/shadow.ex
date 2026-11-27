@@ -75,27 +75,32 @@ defmodule Exnode.Shadow do
     {:ok, %{port: port, os_pid: os_pid, pending: :queue.new()}}
   end
 
-  # Closing the port gives the shadow EOF on stdin and it shuts down cleanly.
-  # Wait for the OS process to exit, so its datadir lock is released before
-  # anyone reopens it.
+  # Send the explicit clean-shutdown opcode (<<0>>) and wait for the port's
+  # {:exit_status, _} message instead of closing the port and polling kill -0.
+  # Core flushes its caches on exit (up to the 450 MiB dbcache): allow 2 min.
   @impl true
-  def terminate(_reason, %{port: port, os_pid: os_pid}) do
-    try do
-      Port.close(port)
-    rescue
-      ArgumentError -> :ok
-    end
+  def terminate(_reason, %{port: port}) do
+    if Port.info(port) != nil do
+      try do
+        Port.command(port, <<0>>)
+      rescue
+        ArgumentError -> :ok
+      end
 
-    # Core flushes its caches on exit (up to the 450 MiB dbcache): allow 2 min.
-    wait_exit(os_pid, 2400)
-  end
+      receive do
+        {^port, {:exit_status, _status}} -> :ok
+      after
+        120_000 ->
+          try do
+            Port.close(port)
+          rescue
+            ArgumentError -> :ok
+          end
 
-  defp wait_exit(_pid, 0), do: :timeout
-
-  defp wait_exit(pid, n) do
-    case System.cmd("kill", ["-0", "#{pid}"], stderr_to_stdout: true) do
-      {_, 0} -> Process.sleep(50) && wait_exit(pid, n - 1)
-      _ -> :ok
+          :timeout
+      end
+    else
+      :ok
     end
   end
 
