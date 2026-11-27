@@ -50,7 +50,7 @@ defmodule Exnode.P2P.Peer do
   alias Exnode.Chain.{HeaderIndex, Headers}
   alias Exnode.Chain.State, as: ChainState
   alias Exnode.Clock
-  alias Exnode.Codec.{Block, Tx}
+  alias Exnode.Codec.Tx
   alias Exnode.Consensus
 
   alias Exnode.P2P.{
@@ -739,16 +739,6 @@ defmodule Exnode.P2P.Peer do
 
   defp handle_msg({:ready, _} = state, {:headers, headers}, data),
     do: wrap_ready(state, HeadersHandler.process_headers_message(data, headers))
-
-  defp handle_msg({:ready, _} = state, {:block, payload}, data) do
-    result =
-      case Block.decode_exact(payload) do
-        {:ok, b} -> BlockSync.received_block(data, b)
-        {:error, _} -> {:ok, data}
-      end
-
-    wrap_ready(state, result)
-  end
 
   defp handle_msg({:ready, _} = state, {:getheaders, gh}, data) do
     if Map.get(data.node, :serve_headers, true) and not initial_block_download?(data),

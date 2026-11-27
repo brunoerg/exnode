@@ -77,10 +77,6 @@ defmodule Exnode.P2P.Peer.Writer do
         send(from, {:flushed, flush_ref})
         loop(sock, send_fun, peer, ref)
 
-      {:flush, from} ->
-        send(from, :flushed)
-        loop(sock, send_fun, peer, ref)
-
       {:DOWN, ^ref, :process, _, _} ->
         :ok
     end

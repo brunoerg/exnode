@@ -125,22 +125,6 @@ defmodule Exnode.P2P.Peer.BlockSync do
     end
   end
 
-  @doc "Core `ProcessMessage` `BLOCK`: checks mutation against known parent before processing."
-  def received_block(%Data{} = data, b) do
-    idx = Headers.index(data.node.headers)
-
-    case HeaderIndex.lookup(idx, b.header.prev_hash) do
-      nil ->
-        process_block(data, b)
-
-      prev ->
-        # DeploymentActiveAfter(prev_block, SEGWIT)
-        if CompactBlock.mutated?(b, prev.height + 1 >= data.p.segwit_height),
-          do: Peer.misbehaving(data, "mutated block"),
-          else: process_block(data, b)
-    end
-  end
-
   @doc """
   Core `ProcessBlock` + `MaybePunishNodeForBlock`. `rebuilt` marks a block
   rebuilt from a compact block (`force_processing = true`).
