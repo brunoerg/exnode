@@ -12,7 +12,7 @@ defmodule Exnode.NodeRuntimeTest do
 
   alias Exnode.Chain.{Headers, State, View}
   alias Exnode.Codec.Block
-  alias Exnode.Index.BlockFilter
+  alias Exnode.Index.{BlockFilter, Scripthash}
   alias Exnode.Node.Runtime
   alias Exnode.Store.KV
   alias Exnode.Test.BlockBuilder, as: BB
@@ -300,5 +300,33 @@ defmodule Exnode.NodeRuntimeTest do
     assert View.view_active_gen(view) == 0
     assert View.bump_active_gen(view) == 1
     assert View.view_active_gen(view) == 1
+  end
+
+  test "Scripthash falls back to GenServer.call(:kv) on ETS miss and for unnamed pids", %{
+    tmp_dir: dir
+  } do
+    %{n: n} = TestNode.start(dir, index_scripthash: true)
+
+    [b1 | _] =
+      for raw <- Enum.take(BB.read_chain(@chain), 1),
+          do: elem(Block.decode_exact(raw), 1)
+
+    assert {:ok, :connected} = State.submit_block(n.chain_state, b1)
+    State.commit_now(n.chain_state)
+    :ok = Scripthash.sync_to(n.scripthash_index, b1.header.hash)
+
+    spk = hd(hd(b1.txs).outputs).script_pubkey
+    sh = Scripthash.scripthash(spk)
+    expected = Scripthash.history(n.scripthash_index, sh)
+    assert length(expected) == 1
+
+    # Remove the cached handle from Exnode.Handles: named lookup falls back to GenServer.call(:kv).
+    Runtime.delete_handle({Scripthash, n.scripthash_index})
+    assert Runtime.get_handle({Scripthash, n.scripthash_index}) == nil
+    assert Scripthash.history(n.scripthash_index, sh) == expected
+
+    # Passing the pid directly also exercises the GenServer.call(:kv) clause.
+    pid = GenServer.whereis(n.scripthash_index)
+    assert Scripthash.history(pid, sh) == expected
   end
 end
