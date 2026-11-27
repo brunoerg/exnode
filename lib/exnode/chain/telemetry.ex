@@ -7,7 +7,7 @@ defmodule Exnode.Chain.Telemetry do
   require Logger
 
   alias Exnode.Archive
-  alias Exnode.Archive.Overlay
+  alias Exnode.Archive.Writer, as: ArchiveWriter
   alias Exnode.Chain.GcProbe
   alias Exnode.Validation.Connect
 
@@ -17,6 +17,7 @@ defmodule Exnode.Chain.Telemetry do
             cs: %{},
             vwin: %{},
             scripts_us: 0,
+            resolve_us: 0,
             pfwait_us: 0
 
   @doc false
@@ -104,6 +105,10 @@ defmodule Exnode.Chain.Telemetry do
     do: %{st | telemetry: %{st.telemetry | scripts_us: st.telemetry.scripts_us + us}}
 
   @doc false
+  def add_resolve(st, us),
+    do: %{st | telemetry: %{st.telemetry | resolve_us: st.telemetry.resolve_us + us}}
+
+  @doc false
   def record_validation_window(st, checkblock, rules_us, connect_us) do
     vwin =
       add_counts(st.telemetry.vwin, %{
@@ -129,7 +134,9 @@ defmodule Exnode.Chain.Telemetry do
 
   @doc false
   def take_cs_work(st) do
-    io = Map.merge(Archive.take_stats(), Connect.take_stats())
+    writer_io = ArchiveWriter.take_stats(st.writer)
+    local_io = Map.merge(Archive.take_stats(), Connect.take_stats())
+    io = add_work(writer_io, local_io)
     %{st | cs_work: add_work(st.cs_work, io), cs_window: add_work(st.cs_window, io)}
   end
 
@@ -152,9 +159,9 @@ defmodule Exnode.Chain.Telemetry do
     inputs = Enum.reduce(block.txs, 0, &(&2 + length(&1.inputs)))
     t = st.telemetry
     scripts = t.scripts_us + (Process.delete(:perf_scripts_us) || 0)
-    resolve = Process.delete(:perf_resolve_us) || 0
+    resolve = t.resolve_us + (Process.delete(:perf_resolve_us) || 0)
     pfwait = t.pfwait_us
-    t = %{t | scripts_us: 0, pfwait_us: 0}
+    t = %{t | scripts_us: 0, resolve_us: 0, pfwait_us: 0}
 
     p = %{
       p
@@ -188,12 +195,15 @@ defmodule Exnode.Chain.Telemetry do
 
     if now - p.since >= 30_000 do
       secs = (now - p.since) / 1000
-      st = take_cs_work(st)
+      writer_io = ArchiveWriter.take_stats(st.writer)
+      local_io = Map.merge(Archive.take_stats(), Connect.take_stats())
+      io = add_work(writer_io, local_io)
+      st = %{st | cs_work: add_work(st.cs_work, io), cs_window: add_work(st.cs_window, io)}
       c = st.cs_window
       w = st.pf_window
       g = fn m, k -> Map.get(m, k, 0) end
       pf = fn k -> st.pf_stats[k] - st.pf_logged[k] end
-      v = Map.merge(st.telemetry.vwin, Connect.take_split())
+      v = add_counts(st.telemetry.vwin, Connect.take_split())
       cs_map = st.telemetry.cs
       t = %{st.telemetry | vwin: %{}, cs: %{}}
 
@@ -280,32 +290,26 @@ defmodule Exnode.Chain.Telemetry do
   @doc false
   def debug_live(st) do
     w = &:erts_debug.size/1
-    a = st.a
+    archive_parts = ArchiveWriter.debug_archive(st.writer)
     items = if st.plan, do: Map.values(st.plan.items), else: []
     item_part = fn k -> w.(Enum.map(items, &Map.get(&1, k))) end
 
-    parts = %{
-      batch_ops: w.(a.batch.ops),
-      batch_blocks: w.(a.batch.blocks),
-      batch_txindex: w.(a.batch.txindex),
-      batch_blockhash: w.(a.batch.blockhash),
-      archive_other: w.(%{a | batch: nil}),
-      ets_chain: :ets.info(a.chain, :memory) + :ets.info(a.onchain, :memory),
-      overlay_native: div(Overlay.native_bytes(a.overlay), :erlang.system_info(:wordsize)),
-      plan_items: length(items),
-      item_block: item_part.(:block),
-      item_res: item_part.(:res),
-      item_history: item_part.(:history),
-      item_other: w.(Enum.map(items, &Map.drop(&1, [:block, :res, :history]))),
-      plan_todo: if(st.plan, do: w.(st.plan.todo), else: 0),
-      uncommitted: w.(st.uncommitted),
-      round_connected: w.(st.round_connected),
-      mempool_events: w.(st.mempool_events),
-      waiters: w.({st.waiters, st.current_blocks}),
-      sets: w.({st.blocks, st.checked, st.disconnected, st.sources, st.unlinked, st.poisoned}),
-      stats: w.({st.pstats, st.cs_work, st.pf_work, st.pf_window}),
-      dict: w.(Process.get())
-    }
+    parts =
+      Map.merge(archive_parts, %{
+        plan_items: length(items),
+        item_block: item_part.(:block),
+        item_res: item_part.(:res),
+        item_history: item_part.(:history),
+        item_other: w.(Enum.map(items, &Map.drop(&1, [:block, :res, :history]))),
+        plan_todo: if(st.plan, do: w.(st.plan.todo), else: 0),
+        uncommitted: w.(st.uncommitted),
+        round_connected: w.(st.round_connected),
+        mempool_events: w.(st.mempool_events),
+        waiters: w.({st.waiters, st.current_blocks}),
+        sets: w.({st.blocks, st.checked, st.disconnected, st.sources, st.unlinked, st.poisoned}),
+        stats: w.({st.pstats, st.cs_work, st.pf_work, st.pf_window}),
+        dict: w.(Process.get())
+      })
 
     info = Process.info(self(), [:heap_size, :total_heap_size, :stack_size, :message_queue_len])
     Map.merge(parts, Map.new(info))

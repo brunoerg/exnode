@@ -35,6 +35,7 @@ defmodule Exnode.Chain.State do
 
   alias Exnode.Archive
   alias Exnode.Archive.Segments
+  alias Exnode.Archive.Writer, as: ArchiveWriter
   alias Exnode.Chain.{GcProbe, HeaderIndex, Headers, Prefetch, Quarantine, Telemetry, View}
   alias Exnode.Codec.Block
   alias Exnode.Consensus.Pow
@@ -49,7 +50,6 @@ defmodule Exnode.Chain.State do
   @batch_ms 5_000
   @batch_ms_behind 300_000
   @near_tip_blocks 128
-  @gc_bytes 256 * 1024 * 1024
   @prefetch_depth 8
   @activation_step 32
   @pipeline_depth 8
@@ -60,7 +60,10 @@ defmodule Exnode.Chain.State do
   defstruct [
     :p,
     :headers,
-    :a,
+    :writer,
+    :writer_private,
+    :archive_handles,
+    :writer_meta,
     :kv,
     :view,
     :exec,
@@ -82,7 +85,6 @@ defmodule Exnode.Chain.State do
     :pf_wait_since,
     :perf,
     :gc_probe,
-    :durable_epoch,
     telemetry: %Telemetry{},
     blocks: MapSet.new(),
     script_stats: %{checked: 0, skipped: 0},
@@ -125,7 +127,6 @@ defmodule Exnode.Chain.State do
     next_sequence: 2,
     unlinked: %{},
     mempool_events: [],
-    gc_bytes: 0,
     turn_retired: 0
   ]
 
@@ -179,11 +180,19 @@ defmodule Exnode.Chain.State do
   @doc "Default commit batch limits: `{blocks, bytes}`."
   def default_batch_limits, do: {@batch_blocks, @batch_bytes}
 
-  @doc "The node's chain-state minimum heap (words, 384 MiB)."
-  def default_min_heap_size, do: div(384 * 1024 * 1024, :erlang.system_info(:wordsize))
+  @doc "Default minimum heap floor for the chain state (nil: use the BEAM VM default)."
+  def default_min_heap_size, do: nil
 
-  @doc "The node's chain-state minimum binary virtual heap (words)."
-  def default_min_bin_vheap_size, do: 10_000_000_000
+  @doc "Default minimum binary virtual heap floor for the chain state (nil: use the BEAM VM default)."
+  def default_min_bin_vheap_size, do: nil
+
+  @doc "Subscribes `pid` to archive commit/disconnect events (`{:archive_committed, tip}` / `{:archive_disconnected, tip}`)."
+  def subscribe_commits(server, pid \\ self()),
+    do: GenServer.call(server, {:subscribe_commits, pid}, 5_000)
+
+  @doc "Unsubscribes `pid` from archive commit/disconnect events."
+  def unsubscribe_commits(server, pid \\ self()),
+    do: GenServer.cast(server, {:unsubscribe_commits, pid})
 
   def tip(server), do: GenServer.call(server, :tip, :infinity)
   def have_block?(server, hash), do: GenServer.call(server, {:have?, hash}, 5_000)
@@ -274,20 +283,31 @@ defmodule Exnode.Chain.State do
         :error -> Exnode.Node.Runtime.kv(Keyword.fetch!(opts, :node_name))
       end
 
-    a =
-      Archive.open(
-        kv,
-        Keyword.fetch!(opts, :hot),
-        Keyword.get(opts, :cold),
-        p.genesis,
-        [
-          max: opts[:segment_max],
-          cache_bytes: opts[:cache_bytes],
-          prune_keep: if(opts[:prune_witness], do: Keyword.get(opts, :prune_keep, 288)),
-          segwit_height: p.segwit_height
-        ]
-        |> Enum.reject(&is_nil(elem(&1, 1)))
-      )
+    {writer, writer_private} =
+      case Keyword.get(opts, :archive_writer) do
+        nil ->
+          writer_opts =
+            [
+              params: p,
+              headers: headers,
+              kv: kv,
+              view_name: opts[:name]
+            ] ++
+              Keyword.take(opts, [
+                :hot,
+                :cold,
+                :segment_max,
+                :cache_bytes,
+                :prune_witness,
+                :prune_keep
+              ])
+
+          {:ok, pid} = ArchiveWriter.start_link(writer_opts)
+          {pid, {pid, Process.monitor(pid)}}
+
+        w ->
+          {w, nil}
+      end
 
     {exec, private} =
       case Keyword.get(opts, :script_exec) do
@@ -318,13 +338,15 @@ defmodule Exnode.Chain.State do
           {sup, nil}
       end
 
-    view = View.new(kv, opts[:name])
+    {view, {halted, poisoned}, archive_handles, writer_meta} = ArchiveWriter.handles(writer)
 
     st = %__MODULE__{
       p: p,
       headers: headers,
-      a: a,
-      durable_epoch: record_durable_epoch(kv, a),
+      writer: writer,
+      writer_private: writer_private,
+      archive_handles: archive_handles,
+      writer_meta: writer_meta,
       kv: kv,
       view: view,
       exec: exec,
@@ -359,8 +381,8 @@ defmodule Exnode.Chain.State do
       availability: :ets.new(:block_availability, [:set, :private]),
       mempool: Keyword.get(opts, :mempool),
       gc_probe: gc_probe,
-      halted: Quarantine.load_halt(kv, view),
-      poisoned: Quarantine.load_poisoned(kv, view)
+      halted: halted,
+      poisoned: poisoned
     }
 
     st =
@@ -388,15 +410,14 @@ defmodule Exnode.Chain.State do
   defp run_shadow_catch_up(st) do
     {:ok, {sh, shash}} = Exnode.Shadow.Monitor.shadow_tip(st.monitor)
     st = commit(st)
-    tip = Archive.tip(st.a)
+    a = active_archive(st)
+    tip = st.writer_meta.tip
 
     if sh > tip.height do
       Exnode.Shadow.Monitor.set_ahead(st.monitor, {sh, shash})
     else
-      a = st.a
-
       start =
-        if Archive.id_at(a, sh) && Archive.block_record!(a, Archive.id_at(a, sh)).hash == shash,
+        if (id = Archive.id_at(a, sh)) && Archive.block_record!(a, id).hash == shash,
           do: sh + 1,
           else: 1
 
@@ -410,11 +431,12 @@ defmodule Exnode.Chain.State do
 
   defp catch_up(st, from, to) do
     stop = min(to, from + st.catch_up_chunk - 1)
+    a = active_archive(st)
 
     blocks =
       for h <- from..stop//1,
-          id = Archive.id_at(st.a, h),
-          do: {Archive.block_record!(st.a, id).hash, Archive.read_block(st.a, id)}
+          id = Archive.id_at(a, h),
+          do: {Archive.block_record!(a, id).hash, Archive.read_block(a, id)}
 
     if Enum.any?(blocks, &match?({_, {:error, _}}, &1)) do
       Logger.error("shadow catch-up impossible from height #{from}: witness data pruned; halting")
@@ -427,13 +449,13 @@ defmodule Exnode.Chain.State do
   end
 
   defp publish(st) do
-    View.publish(st.view, st.a)
+    ArchiveWriter.view_op(st.writer, :publish)
     st
   end
 
   defp hold(st, hash, %Block{raw: raw}) do
     :ok = KV.write(st.kv, [{:put, :pending, hash, raw}], sync: false)
-    View.hold(st.view, hash)
+    ArchiveWriter.view_op(st.writer, {:hold, hash})
     %{st | blocks: MapSet.put(st.blocks, hash), retarget: true} |> received_block(hash)
   end
 
@@ -443,46 +465,22 @@ defmodule Exnode.Chain.State do
 
   defp commit(st) do
     hashes = Enum.map(st.uncommitted, &elem(&1, 0))
-    :ok = Headers.flush(st.headers)
-
-    a =
-      View.with_active_mutation(st.view, fn ->
-        a = Archive.flush(st.a, for(h <- hashes, do: {:delete, :pending, h}))
-        View.unhold_many(st.view, hashes)
-        View.put_committed(st.view, a)
-        a
-      end)
+    {:ok, meta} = ArchiveWriter.flush(st.writer, hashes)
 
     %{
       st
-      | a: a,
-        durable_epoch: record_durable_epoch(st.kv, a),
+      | writer_meta: meta,
         round_connected: st.uncommitted ++ st.round_connected,
         uncommitted: []
     }
   end
 
-  defp durable_current?(%__MODULE__{a: a, kv: kv, durable_epoch: epoch}) do
-    Archive.epoch(a) == epoch and
-      case KV.get(kv, :meta, "durable_epoch") do
-        {:ok, <<stored::64>>} -> stored == epoch
-        :not_found -> true
-      end
-  end
-
-  defp record_durable_epoch(kv, a) do
-    epoch = Archive.epoch(a)
-    :ok = KV.write(kv, [{:put, :meta, "durable_epoch", <<epoch::64>>}], sync: false)
-    epoch
-  end
-
   defp maybe_commit(%__MODULE__{uncommitted: []} = st), do: st
 
   defp maybe_commit(st) do
-    {n, bytes} = Archive.batch_size(st.a)
-    age = System.monotonic_time(:millisecond) - (Archive.batch_since(st.a) || 0)
+    %{batch_n: n, batch_bytes: bytes, batch_since: since, tip: tip} = st.writer_meta
+    age = System.monotonic_time(:millisecond) - (since || 0)
     best = HeaderIndex.best(Headers.index(st.headers))
-    tip = Archive.tip(st.a)
     caught_up = st.commit_at_tip and best.hash == tip.hash
 
     max_age =
@@ -498,7 +496,7 @@ defmodule Exnode.Chain.State do
 
   defp unhold(st, hash) do
     :ok = KV.write(st.kv, [{:delete, :pending, hash}], sync: false)
-    View.unhold(st.view, hash)
+    ArchiveWriter.view_op(st.writer, {:unhold, hash})
     :ets.delete(st.availability, hash)
     %{st | blocks: MapSet.delete(st.blocks, hash), sources: Map.delete(st.sources, hash)}
   end
@@ -542,17 +540,19 @@ defmodule Exnode.Chain.State do
     hashes = Enum.reject(hashes, &MapSet.member?(st.poisoned, &1))
     idx = Headers.index(st.headers)
 
+    a = active_archive(st)
+
     {dropped, held} =
       Enum.split_with(
         hashes,
-        &(Archive.block_id(st.a, &1) != nil or
+        &(Archive.block_id(a, &1) != nil or
             match?(e when e == nil or e.status == :failed, HeaderIndex.lookup(idx, &1)))
       )
 
     if dropped != [],
       do: :ok = KV.write(st.kv, for(h <- dropped, do: {:delete, :pending, h}), sync: false)
 
-    View.hold_many(st.view, held)
+    ArchiveWriter.view_op(st.writer, {:hold_many, held})
     st = %{st | blocks: MapSet.new(held)}
 
     held
@@ -566,9 +566,11 @@ defmodule Exnode.Chain.State do
   end
 
   defp load_candidates(st) do
+    a = active_archive(st)
+
     disconnected =
       KV.fold_prefix(st.kv, :blockhash, <<>>, MapSet.new(), fn {hash, <<id::32>>}, acc ->
-        active = Archive.on_chain?(st.a, id)
+        active = Archive.on_chain?(a, id)
         :ets.insert(st.availability, {hash, if(active, do: 0, else: 1)})
         if active, do: acc, else: MapSet.put(acc, hash)
       end)
@@ -629,7 +631,11 @@ defmodule Exnode.Chain.State do
     end
   end
 
-  defp do_handle_call(:tip, _from, st), do: {:reply, Archive.tip(st.a), st}
+  defp do_handle_call({:subscribe_commits, pid}, _from, st) do
+    {:reply, ArchiveWriter.subscribe(st.writer, pid), st}
+  end
+
+  defp do_handle_call(:tip, _from, st), do: {:reply, st.writer_meta.tip, st}
   defp do_handle_call({:set_monitor, m}, _from, st), do: {:reply, :ok, %{st | monitor: m}}
 
   defp do_handle_call(:script_stats, _from, st), do: {:reply, st.script_stats, st}
@@ -670,13 +676,14 @@ defmodule Exnode.Chain.State do
 
   defp do_handle_call({:with_archive, fun}, _from, st) do
     st = commit(st)
-    {:reply, fun.(st.a), st}
+    {:reply, ArchiveWriter.with_archive(st.writer, [], fun), st}
   end
 
-  defp do_handle_call({:peek_archive, fun}, _from, st), do: {:reply, fun.(st.a), st}
+  defp do_handle_call({:peek_archive, fun}, _from, st),
+    do: {:reply, ArchiveWriter.peek_archive(st.writer, fun), st}
 
   defp do_handle_call({:mempool_view, ops}, _from, st),
-    do: {:reply, {Archive.tip(st.a), Archive.resolve_many(st.a, ops)}, st}
+    do: {:reply, ArchiveWriter.mempool_view(st.writer, ops), st}
 
   defp do_handle_call({:precheck_block, header, requested}, _from, st) do
     reply =
@@ -716,22 +723,6 @@ defmodule Exnode.Chain.State do
     st = st |> flush_round() |> flush_mempool()
     us = System.monotonic_time(:microsecond) - t0
     st = st |> update_pstats(%{submits: 1, submit_us: us}) |> hwm(:submit_max_us, us)
-    gc = st.gc_bytes + byte_size(b.raw || <<>>)
-
-    {st, gc} =
-      if gc >= @gc_bytes do
-        tg = System.monotonic_time(:microsecond)
-        :erlang.garbage_collect()
-        gc_us = System.monotonic_time(:microsecond) - tg
-
-        {st
-         |> update_pstats(%{explicit_gcs: 1, explicit_gc_us: gc_us})
-         |> hwm(:explicit_gc_max_us, gc_us), 0}
-      else
-        {st, gc}
-      end
-
-    st = %{st | gc_bytes: gc}
     if reply == :connect, do: {:noreply, st}, else: {:reply, reply, st}
   end
 
@@ -741,7 +732,7 @@ defmodule Exnode.Chain.State do
     do: {:reply, :not_halted, st}
 
   defp do_handle_call(:clear_halt, _from, st) do
-    Quarantine.clear_halt_mark(st.kv, st.view)
+    ArchiveWriter.clear_halt_mark(st.writer)
     Logger.warning("block connection halt cleared (was #{inspect(st.halted)})")
     {:reply, st.halted, queue_drive(%{st | halted: false, retarget: true})}
   end
@@ -749,19 +740,21 @@ defmodule Exnode.Chain.State do
   defp do_handle_call(:poisoned, _from, st), do: {:reply, MapSet.to_list(st.poisoned), st}
 
   defp do_handle_call({:reconsider_poisoned, which}, from, st) do
-    {hashes, poisoned} = Quarantine.clear_poisoned(st.kv, st.view, st.poisoned, which)
+    {hashes, poisoned} = ArchiveWriter.clear_poisoned(st.writer, st.poisoned, which)
     st = %{st | poisoned: poisoned}
+
+    a = active_archive(st)
 
     st =
       Enum.reduce(hashes, st, fn h, st ->
-        id = Archive.block_id(st.a, h)
+        id = Archive.block_id(a, h)
 
         cond do
           KV.get(st.kv, :pending, h) != :not_found ->
-            View.hold(st.view, h)
+            ArchiveWriter.view_op(st.writer, {:hold, h})
             %{st | blocks: MapSet.put(st.blocks, h)} |> received_block(h)
 
-          id != nil and not Archive.on_chain?(st.a, id) ->
+          id != nil and not Archive.on_chain?(a, id) ->
             %{st | disconnected: MapSet.put(st.disconnected, h)}
 
           true ->
@@ -794,6 +787,12 @@ defmodule Exnode.Chain.State do
        ),
        do: {:stop, {:script_exec_down, reason}, st}
 
+  defp do_handle_info(
+         {:DOWN, mref, :process, _, reason},
+         %__MODULE__{writer_private: {_, mref}} = st
+       ),
+       do: {:stop, {:archive_writer_down, reason}, st}
+
   defp do_handle_info({:DOWN, mref, :process, _, _} = down, st),
     do: {:noreply, elem(handle_down(st, mref, down), 1)}
 
@@ -813,24 +812,39 @@ defmodule Exnode.Chain.State do
   defp do_handle_info(_msg, st), do: {:noreply, st}
 
   @impl true
-  def terminate(_reason, st) do
+  def terminate(reason, st) do
     st = cancel_plan(st)
 
-    if durable_current?(st) do
+    # Commit uncommitted blocks only on clean shutdown. On abnormal crashes or
+    # archive-crash exits, leave the last durable commit intact so restart
+    # replays from :pending.
+    clean_stop? =
+      reason in [:normal, :shutdown] or
+        (match?({:shutdown, _}, reason) and not match?({:shutdown, {:archive_crashed, _}}, reason))
+
+    if clean_stop? do
       try do
         commit(st)
       catch
-        kind, reason ->
+        kind, err ->
           Logger.warning(
             "chain state stopped without committing (the restart resumes from the disk): " <>
-              Exception.format_banner(kind, reason, __STACKTRACE__)
+              Exception.format_banner(kind, err, __STACKTRACE__)
           )
       end
-    else
-      Logger.warning(
-        "chain state stopped with an archive state older than its last commit; " <>
-          "not committing it (the restart resumes from the disk)"
-      )
+    end
+
+    case st.writer_private do
+      {pid, mref} ->
+        Process.demonitor(mref, [:flush])
+
+        if Process.alive?(pid) do
+          stop_reason = if clean_stop?, do: :shutdown, else: reason
+          catch_exit(fn -> GenServer.stop(pid, stop_reason, :infinity) end)
+        end
+
+      nil ->
+        :ok
     end
 
     case st.exec_private do
@@ -848,6 +862,7 @@ defmodule Exnode.Chain.State do
       catch_exit(fn -> Supervisor.stop(st.worker_sup_private, :shutdown, 5_000) end)
     end
 
+    Segments.close_all_readers()
     :ok
   end
 
@@ -855,9 +870,14 @@ defmodule Exnode.Chain.State do
   def handle_cast(msg, st),
     do: Telemetry.timed_cb(msg, st, st.gc_probe != nil, &do_handle_cast(msg, &1))
 
+  defp do_handle_cast({:unsubscribe_commits, pid}, st) do
+    ArchiveWriter.unsubscribe(st.writer, pid)
+    {:noreply, st}
+  end
+
   defp do_handle_cast({:halt, reason}, %__MODULE__{halted: false} = st) do
     Logger.error("block connection halted: #{inspect(reason)}")
-    Quarantine.put_halt_mark(st.kv, st.view, reason, Archive.tip(st.a))
+    ArchiveWriter.put_halt_mark(st.writer, reason)
     ack_halt(st)
     {:noreply, queue_drive(%{st | halted: reason})}
   end
@@ -873,14 +893,17 @@ defmodule Exnode.Chain.State do
   defp flush_mempool(%__MODULE__{mempool_events: []} = st), do: st
 
   defp flush_mempool(%__MODULE__{reorg_work: w, plan: plan} = st) when w != nil and plan != nil do
-    tip = HeaderIndex.lookup(Headers.index(st.headers), Archive.tip(st.a).hash)
+    tip = HeaderIndex.lookup(Headers.index(st.headers), st.writer_meta.tip.hash)
     if tip.chain_work > w, do: flush_mempool(%{st | reorg_work: nil}), else: st
   end
 
   defp flush_mempool(st) do
     case st.mempool && GenServer.whereis(st.mempool) do
       pid when is_pid(pid) ->
-        send(pid, {:mempool_update, Archive.tip(st.a).hash, Enum.reverse(st.mempool_events)})
+        send(
+          pid,
+          {:mempool_update, st.writer_meta.tip.hash, Enum.reverse(st.mempool_events)}
+        )
 
       _ ->
         :ok
@@ -902,7 +925,7 @@ defmodule Exnode.Chain.State do
       st.monitor,
       Enum.reverse(st.round_connected),
       Enum.reverse(st.round_rejected),
-      Archive.committed_tip(st.a).hash
+      st.writer_meta.committed_tip.hash
     )
 
     %{st | round_connected: [], round_rejected: []}
@@ -962,7 +985,7 @@ defmodule Exnode.Chain.State do
 
       true ->
         idx = Headers.index(st.headers)
-        tip = HeaderIndex.lookup(idx, Archive.tip(st.a).hash)
+        tip = HeaderIndex.lookup(idx, st.writer_meta.tip.hash)
 
         with {:ok, _} <-
                Headers.process_headers(st.headers, [header],
@@ -1009,12 +1032,12 @@ defmodule Exnode.Chain.State do
   end
 
   defp fail_submitted(st, hash, reason) do
-    Headers.invalidate(st.headers, hash, Archive.tip(st.a).hash)
+    Headers.invalidate(st.headers, hash, st.writer_meta.tip.hash)
     {{:error, reason}, unhold_failed(st)}
   end
 
   defp have?(st, hash),
-    do: MapSet.member?(st.blocks, hash) or Archive.have_block_data?(st.a, hash)
+    do: MapSet.member?(st.blocks, hash) or Archive.have_block_data?(active_archive(st), hash)
 
   # --- activation --------------------------------------------------------------
 
@@ -1096,7 +1119,7 @@ defmodule Exnode.Chain.State do
 
   defp new_plan(st) do
     idx = Headers.index(st.headers)
-    tip_entry = HeaderIndex.lookup(idx, Archive.tip(st.a).hash)
+    tip_entry = HeaderIndex.lookup(idx, st.writer_meta.tip.hash)
 
     case timed_find_target(st, idx, tip_entry) do
       {nil, _st} ->
@@ -1112,7 +1135,8 @@ defmodule Exnode.Chain.State do
 
         st = disconnect_to(st, fork)
         path = path(idx, fork, target)
-        archived = Enum.any?(path, &(Archive.block_id(st.a, &1.hash) != nil))
+        a = active_archive(st)
+        archived = Enum.any?(path, &(Archive.block_id(a, &1.hash) != nil))
         depth = if archived, do: 0, else: st.prefetch_depth
 
         ctx = %{
@@ -1120,7 +1144,7 @@ defmodule Exnode.Chain.State do
           params: st.p,
           idx: idx,
           current: current_block(st),
-          hint: Archive.overlay_hint(st.a)
+          hint: st.archive_handles.overlay
         }
 
         plan = %{
@@ -1138,7 +1162,17 @@ defmodule Exnode.Chain.State do
         }
 
         st = %{st | plan: plan}
-        pf = Prefetch.start(path, depth, Archive.reader(st.a), ctx, admit_fun(st), st.worker_sup)
+
+        pf =
+          Prefetch.start(
+            path,
+            depth,
+            View.view_reader(st.view),
+            ctx,
+            admit_fun(st),
+            st.worker_sup
+          )
+
         {:ok, put_in(st.plan.pf, pf)}
     end
   end
@@ -1229,7 +1263,7 @@ defmodule Exnode.Chain.State do
                 {Map.put(items, ref, item), item.apre_next, true}
             end
         end,
-        {plan.items, Archive.next_ids(st.a), false},
+        {plan.items, st.writer_meta.next, false},
         plan.order
       )
 
@@ -1245,7 +1279,7 @@ defmodule Exnode.Chain.State do
     next = %{block: ids.block + 1, out: ids.out + nouts, inp: ids.inp + nins}
     owner = self()
     tag = {:apre, st.plan.gen, ref}
-    reader = Archive.kv_reader(st.a)
+    reader = Archive.kv_reader(active_archive(st))
 
     history =
       cond do
@@ -1374,7 +1408,7 @@ defmodule Exnode.Chain.State do
   defp extend_plan(st) do
     plan = st.plan
     idx = Headers.index(st.headers)
-    tip_entry = HeaderIndex.lookup(idx, Archive.tip(st.a).hash)
+    tip_entry = HeaderIndex.lookup(idx, st.writer_meta.tip.hash)
 
     case timed_find_target(st, idx, tip_entry) do
       {nil, st} ->
@@ -1390,11 +1424,21 @@ defmodule Exnode.Chain.State do
 
           anc != nil and anc.hash == last.hash and target.height > last.height ->
             ext = path(idx, last, target)
+            a = active_archive(st)
 
-            if plan.archived or Enum.any?(ext, &(Archive.block_id(st.a, &1.hash) != nil)) do
+            if plan.archived or
+                 Enum.any?(ext, &(Archive.block_id(a, &1.hash) != nil)) do
               {:waiting, put_in(st.plan.final, true)}
             else
-              pf = Prefetch.extend(plan.pf, ext, idx, Archive.reader(st.a), admit_fun(st))
+              pf =
+                Prefetch.extend(
+                  plan.pf,
+                  ext,
+                  idx,
+                  View.view_reader(st.view),
+                  admit_fun(st)
+                )
+
               st = update_pstat(st, :extensions, 1)
               {:extended, %{st | plan: %{plan | todo: ext, last: List.last(ext), pf: pf}}}
             end
@@ -1422,7 +1466,9 @@ defmodule Exnode.Chain.State do
   end
 
   defp take_prefetched(st, entry) do
-    {result, pf} = Prefetch.take(st.plan.pf, entry, Archive.reader(st.a), admit_fun(st))
+    {result, pf} =
+      Prefetch.take(st.plan.pf, entry, View.view_reader(st.view), admit_fun(st))
+
     st = put_in(st.plan.pf, pf)
 
     case result do
@@ -1436,10 +1482,12 @@ defmodule Exnode.Chain.State do
             pf_window: Telemetry.add_counts(st.pf_window, stats)
         }
 
-        if epoch == Archive.epoch(st.a) do
+        a = active_archive(st)
+
+        if epoch == a.epoch do
           {block, answers, history, update_in(st.pf_stats.used, &(&1 + 1))}
         else
-          case Archive.revalidate(st.a, epoch, answers, history) do
+          case Archive.revalidate(a, epoch, answers, history) do
             {:ok, answers, history, dropped} ->
               st = %{
                 st
@@ -1504,10 +1552,11 @@ defmodule Exnode.Chain.State do
             st.plan.order
           )
 
-        spec_out = Archive.next_ids(st.a).out + st.plan.new_outputs
-        archived = Archive.block_id(st.a, entry.hash) != nil
+        a = active_archive(st)
+        spec_out = st.writer_meta.next.out + st.plan.new_outputs
+        archived = Archive.block_id(a, entry.hash) != nil
 
-        {result, checkblock, rules_us, connect_us} =
+        {result, checkblock, rules_us, connect_us, resolve_us, scripts_us} =
           try do
             tc = System.monotonic_time(:microsecond)
 
@@ -1537,27 +1586,47 @@ defmodule Exnode.Chain.State do
                     ] ++
                       if(archived, do: [], else: [base_out: spec_out])
 
-                  tconn = System.monotonic_time(:microsecond)
-                  r = Connect.connect_block(st.a, block, entry, st.p, idx, opts)
-                  c_us = System.monotonic_time(:microsecond) - tconn
-                  {r, cb_us, r_us, c_us}
+                  t_conn = System.monotonic_time(:microsecond)
+                  r = Connect.connect_block(a, block, entry, st.p, idx, opts)
+                  c_us = System.monotonic_time(:microsecond) - t_conn
+                  res_us = Process.delete(:perf_resolve_us) || 0
+                  sc_us = Process.delete(:perf_scripts_us) || 0
+                  {r, cb_us, r_us, c_us, res_us, sc_us}
                 else
-                  err -> {err, cb_us, System.monotonic_time(:microsecond) - tc, 0}
+                  err -> {err, cb_us, System.monotonic_time(:microsecond) - tc, 0, 0, 0}
                 end
 
               err ->
-                {err, System.monotonic_time(:microsecond) - tc, 0, 0}
+                {err, System.monotonic_time(:microsecond) - tc, 0, 0, 0, 0}
             end
           rescue
-            e -> {{:crash, e, __STACKTRACE__}, 0, 0, 0}
+            e ->
+              {
+                {:crash, e, __STACKTRACE__},
+                0,
+                0,
+                0,
+                Process.delete(:perf_resolve_us) || 0,
+                Process.delete(:perf_scripts_us) || 0
+              }
           catch
-            kind, reason -> {{:crash, {kind, reason}, __STACKTRACE__}, 0, 0, 0}
+            kind, reason ->
+              {
+                {:crash, {kind, reason}, __STACKTRACE__},
+                0,
+                0,
+                0,
+                Process.delete(:perf_resolve_us) || 0,
+                Process.delete(:perf_scripts_us) || 0
+              }
           end
 
         validate_us = System.monotonic_time(:microsecond) - t0
 
         st =
           st
+          |> Telemetry.add_resolve(resolve_us)
+          |> Telemetry.add_scripts(scripts_us)
           |> Telemetry.record_validation_window(checkblock, rules_us, connect_us)
           |> update_pstats(%{prep_rules_us: rules_us, prep_connect_us: connect_us})
 
@@ -1819,8 +1888,9 @@ defmodule Exnode.Chain.State do
     case item.failure do
       nil ->
         case archive_connect(st, item) do
-          {:ok, a, archive_us} ->
-            {:retired, archive_block(st, item, a, archive_us, item.done_at - item.prepared_at)}
+          {:ok, st, batch_size, archive_us} ->
+            {:retired,
+             archive_block(st, item, batch_size, archive_us, item.done_at - item.prepared_at)}
 
           {:crash, _, _} = crash ->
             st = cancel_plan(st)
@@ -1914,6 +1984,8 @@ defmodule Exnode.Chain.State do
   end
 
   defp submit_outcome(st, hash) do
+    a = active_archive(st)
+
     cond do
       MapSet.member?(st.poisoned, hash) ->
         {:error, {:crash, "validation crashed; block quarantined"}}
@@ -1921,7 +1993,7 @@ defmodule Exnode.Chain.State do
       Map.has_key?(st.rejected_seen, hash) ->
         {:error, Map.fetch!(st.rejected_seen, hash)}
 
-      Archive.on_chain?(st.a, Archive.block_id(st.a, hash) || -1) ->
+      Archive.on_chain?(a, Archive.block_id(a, hash) || -1) ->
         {:ok, :connected}
 
       true ->
@@ -2003,78 +2075,76 @@ defmodule Exnode.Chain.State do
   end
 
   defp disconnect_to(st, fork) do
-    if Archive.tip(st.a).height > fork.height do
+    if st.writer_meta.tip.height > fork.height do
       st = commit(st)
-
-      st =
-        if st.mempool do
-          {:ok, b} = Archive.read_block_txs(st.a, Archive.tip(st.a).id)
-          mempool_event(st, {:disconnected, b.txs})
-        else
-          st
-        end
-
-      old = Archive.tip(st.a).hash
-
-      a =
-        View.with_active_mutation(st.view, fn ->
-          {a, _id} = Archive.disconnect_tip(st.a)
-          View.publish(st.view, a)
-          a
-        end)
-
+      {:ok, meta, old, txs} = ArchiveWriter.disconnect_tip(st.writer, st.mempool != nil)
+      st = %{st | writer_meta: meta}
+      st = if txs, do: mempool_event(st, {:disconnected, txs}), else: st
       notify(st, {:block_disconnected, old})
-
-      disconnect_to(
-        %{
-          st
-          | a: a,
-            durable_epoch: record_durable_epoch(st.kv, a),
-            disconnected: MapSet.put(st.disconnected, old)
-        },
-        fork
-      )
+      disconnect_to(%{st | disconnected: MapSet.put(st.disconnected, old)}, fork)
     else
       st
     end
   end
 
   defp archive_connect(st, %{entry: entry, block: block, res: res} = item) do
-    t1 = System.monotonic_time(:microsecond)
-
     prepared =
       case item do
         %{apre: {:done, p}} -> p
         _ -> nil
       end
 
-    a =
-      View.with_active_mutation(st.view, fn ->
-        a =
-          Archive.connect(st.a, block, entry.height, res.spent,
-            delta: res.delta,
-            commit: false,
-            history: item.history,
-            prepared: prepared,
-            unique_txids: unique_txids?(st, entry)
-          )
+    opts = [
+      delta: res.delta,
+      commit: false,
+      history: item.history,
+      prepared: prepared,
+      unique_txids: unique_txids?(st, entry),
+      test_archive_hook: st.test_archive_hook
+    ]
 
-        View.put_tip(st.view, Archive.tip(a), a.batch.txindex)
-        a
-      end)
+    case ArchiveWriter.connect(st.writer, block, entry.height, res.spent, opts) do
+      {:ok, reply} ->
+        meta = st.writer_meta
 
-    if hook = st.test_archive_hook, do: hook.(block)
-    {:ok, a, System.monotonic_time(:microsecond) - t1}
-  catch
-    kind, reason ->
-      if Quarantine.host_fault?(kind, reason, __STACKTRACE__),
-        do: :erlang.raise(kind, reason, __STACKTRACE__)
+        txindex =
+          if item.archived do
+            meta.batch_txindex
+          else
+            Enum.reduce(res.delta.txids, meta.batch_txindex, &Map.put(&2, &1, true))
+          end
 
-      {:crash, {kind, reason}, __STACKTRACE__}
+        blockhash =
+          if item.archived do
+            meta.batch_blockhash
+          else
+            Map.put(meta.batch_blockhash, entry.hash, reply.tip.id)
+          end
+
+        meta = %{
+          meta
+          | tip: reply.tip,
+            next: reply.next,
+            batch_n: reply.batch_n,
+            batch_bytes: reply.batch_bytes,
+            batch_since: reply.batch_since,
+            batch_txindex: txindex,
+            batch_blockhash: blockhash,
+            overwritten: reply.overwritten
+        }
+
+        {:ok, %{st | writer_meta: meta}, {reply.batch_n, reply.batch_bytes}, reply.archive_us}
+
+      {:host_fault, kind, reason, stack} ->
+        :erlang.raise(kind, reason, stack)
+
+      {:crash, error, stack} ->
+        {:crash, error, stack}
+    end
   end
 
   defp unique_txids?(st, entry) do
-    if Archive.linear?(st.a) do
+    if Archive.linear?(active_archive(st)) do
       idx = Headers.index(st.headers)
       prev = HeaderIndex.prev(idx, entry)
       Connect.bip34_unique_txids?(entry, prev, st.p, idx)
@@ -2099,7 +2169,7 @@ defmodule Exnode.Chain.State do
   defp archive_block(
          st,
          %{entry: entry, block: block, res: res} = item,
-         a,
+         {n, bytes},
          archive_us,
          scripts_us
        ) do
@@ -2126,19 +2196,15 @@ defmodule Exnode.Chain.State do
          )}
       )
 
-    View.put_tip(st.view, Archive.tip(a))
-
     st = %{
       st
-      | a: a,
-        blocks: MapSet.delete(st.blocks, entry.hash),
+      | blocks: MapSet.delete(st.blocks, entry.hash),
         sources: Map.delete(st.sources, entry.hash),
         disconnected: MapSet.delete(st.disconnected, entry.hash),
         checked: MapSet.delete(st.checked, entry.hash),
         uncommitted: [{entry.hash, block.raw} | st.uncommitted]
     }
 
-    {n, bytes} = Archive.batch_size(a)
     if n >= st.batch_blocks or bytes >= st.batch_bytes, do: commit(st), else: st
   end
 
@@ -2147,7 +2213,7 @@ defmodule Exnode.Chain.State do
     st = commit(st)
 
     if result_kind != :mutated,
-      do: Headers.invalidate(st.headers, entry.hash, Archive.tip(st.a).hash)
+      do: Headers.invalidate(st.headers, entry.hash, st.writer_meta.tip.hash)
 
     notify(st, {:block_invalid, entry.hash, r})
     {source, sources} = Map.pop(st.sources, entry.hash)
@@ -2193,7 +2259,7 @@ defmodule Exnode.Chain.State do
 
   defp poison(st, entry, block, error, msg) do
     hash = entry.hash
-    Quarantine.mark_poisoned(st.kv, st.crash_dir, st.view, entry, block, error, msg)
+    ArchiveWriter.mark_poisoned(st.writer, st.crash_dir, entry, block, error, msg)
     notify(st, {:block_quarantined, hash, error})
     {source, sources} = Map.pop(st.sources, hash)
 
@@ -2221,8 +2287,10 @@ defmodule Exnode.Chain.State do
   defp override(_st, _block, _entry), do: :ok
 
   defp read_archived(st, hash) do
+    a = active_archive(st)
+
     raw =
-      case Archive.read_block(st.a, Archive.block_id(st.a, hash)) do
+      case Archive.read_block(a, Archive.block_id(a, hash)) do
         raw when is_binary(raw) ->
           raw
 
@@ -2233,6 +2301,8 @@ defmodule Exnode.Chain.State do
     {:ok, b} = Block.decode_exact(raw)
     b
   end
+
+  defp active_archive(st), do: Archive.active_reader(st.archive_handles, st.writer_meta)
 
   defp catch_exit(f) do
     f.()

@@ -112,7 +112,9 @@ defmodule Exnode.Node do
       sync: Module.concat(prefix, SyncState),
       peer_sup: Module.concat(prefix, PeerSup),
       local_nonces: Module.concat(prefix, LocalNonces),
+      chain_sup: Module.concat(prefix, ChainSup),
       chain_workers: Module.concat(prefix, ChainWorkers),
+      archive_writer: Module.concat(prefix, ArchiveWriter),
       chain_state: Module.concat(prefix, ChainState),
       script_exec: Module.concat(prefix, ScriptExec),
       block_download: Module.concat(prefix, BlockDownload),
@@ -414,44 +416,61 @@ defmodule Exnode.Node do
           # calls before taking new work (ScriptExec moduledoc).
           {Exnode.Validation.ScriptExec,
            name: n.script_exec, workers: Keyword.get(opts, :script_workers)},
-          {Task.Supervisor, name: n.chain_workers},
-          {
-            ChainState,
-            # BlockDownload wakes waiting peers when the tip advances.
-            script_exec: n.script_exec,
-            worker_sup: n.chain_workers,
-            min_heap_size:
-              Keyword.get(opts, :chain_state_min_heap, ChainState.default_min_heap_size()),
-            min_bin_vheap_size:
-              Keyword.get(
-                opts,
-                :chain_state_min_bin_vheap,
-                ChainState.default_min_bin_vheap_size()
-              ),
-            listeners: [n.block_download],
-            gc_probe: Keyword.get(opts, :gc_probe, true),
-            name: n.chain_state,
-            node_name: name,
-            params: params,
-            headers: n.headers,
-            assume_valid: Keyword.get(opts, :assume_valid),
-            prune_witness: Keyword.get(opts, :prune_witness, false),
-            commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
-            batch_blocks:
-              Keyword.get(opts, :batch_blocks, elem(ChainState.default_batch_limits(), 0)),
-            batch_bytes:
-              Keyword.get(opts, :batch_bytes, elem(ChainState.default_batch_limits(), 1)),
-            prefetch_depth:
-              Keyword.get(opts, :prefetch_depth, Exnode.Chain.State.default_prefetch_depth()),
-            mempool: n.mempool,
-            cache_bytes: Keyword.get(opts, :cache_bytes, 450 * 1024 * 1024),
-            shadow_monitor: if(Keyword.get(opts, :shadow, false), do: n.shadow_monitor),
-            hot: Path.join([datadir, Atom.to_string(chain), "archive"]),
-            crash_dir: Path.join([datadir, Atom.to_string(chain), "crashes"]),
-            cold:
-              Keyword.get(opts, :datadir_cold) &&
-                Path.join([opts[:datadir_cold], Atom.to_string(chain), "archive"])
-          },
+          # one_for_all: ArchiveWriter holds the in-memory uncommitted batch,
+          # native Overlay, and :protected Chain.View ETS table. If ChainState
+          # crashes (e.g. :archive_crashed or :kill), ArchiveWriter must also
+          # restart so uncommitted state is discarded and both reload cleanly
+          # from the last durable RocksDB commit.
+          group(n.chain_sup, :one_for_all, [
+            {Task.Supervisor, name: n.chain_workers},
+            {
+              Exnode.Archive.Writer,
+              name: n.archive_writer,
+              view_name: n.chain_state,
+              node_name: name,
+              params: params,
+              headers: n.headers,
+              prune_witness: Keyword.get(opts, :prune_witness, false),
+              cache_bytes: Keyword.get(opts, :cache_bytes, 450 * 1024 * 1024),
+              hot: Path.join([datadir, Atom.to_string(chain), "archive"]),
+              cold:
+                Keyword.get(opts, :datadir_cold) &&
+                  Path.join([opts[:datadir_cold], Atom.to_string(chain), "archive"])
+            },
+            {
+              ChainState,
+              # BlockDownload wakes waiting peers when the tip advances.
+              script_exec: n.script_exec,
+              worker_sup: n.chain_workers,
+              archive_writer: n.archive_writer,
+              min_heap_size:
+                Keyword.get(opts, :chain_state_min_heap, ChainState.default_min_heap_size()),
+              min_bin_vheap_size:
+                Keyword.get(
+                  opts,
+                  :chain_state_min_bin_vheap,
+                  ChainState.default_min_bin_vheap_size()
+                ),
+              listeners: [n.block_download],
+              gc_probe: Keyword.get(opts, :gc_probe, true),
+              name: n.chain_state,
+              node_name: name,
+              params: params,
+              headers: n.headers,
+              assume_valid: Keyword.get(opts, :assume_valid),
+              commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
+              batch_blocks:
+                Keyword.get(opts, :batch_blocks, elem(ChainState.default_batch_limits(), 0)),
+              batch_bytes:
+                Keyword.get(opts, :batch_bytes, elem(ChainState.default_batch_limits(), 1)),
+              prefetch_depth:
+                Keyword.get(opts, :prefetch_depth, Exnode.Chain.State.default_prefetch_depth()),
+              mempool: n.mempool,
+              shadow_monitor: if(Keyword.get(opts, :shadow, false), do: n.shadow_monitor),
+              hot: Path.join([datadir, Atom.to_string(chain), "archive"]),
+              crash_dir: Path.join([datadir, Atom.to_string(chain), "crashes"])
+            }
+          ]),
           group(n.relay_sup, :rest_for_one, [
             # The mempool's script checks (Core: the -par script-check threads).
             {Task.Supervisor, name: n.mempool_verify},

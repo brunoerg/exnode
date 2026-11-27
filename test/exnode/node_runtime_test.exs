@@ -149,7 +149,7 @@ defmodule Exnode.NodeRuntimeTest do
     idx = Headers.index(n.headers)
 
     assert :ets.info(view, :protection) == :protected
-    assert :ets.info(view, :owner) == GenServer.whereis(n.chain_state)
+    assert :ets.info(view, :owner) == GenServer.whereis(n.archive_writer)
 
     # Direct writes from a non-owner process fail with ArgumentError.
     assert_raise ArgumentError, fn ->
