@@ -340,6 +340,41 @@ defmodule Exnode.P2P.PeerStatemTest do
       {:memory, peer_mem} = Process.info(pid, :memory)
       assert peer_mem < 1_000_000
     end
+
+    test "DecodeBudget.with_worker runs :erlang.garbage_collect/0 on inline fallback", %{n: n} do
+      parent = self()
+
+      runner =
+        spawn_link(fn ->
+          receive do
+            :go ->
+              result =
+                Exnode.P2P.DecodeBudget.with_worker(
+                  n.decode_budget,
+                  :nonexistent_decode_sup,
+                  Exnode.P2P.DecodeBudget.min_bytes(),
+                  fn -> :inline_ok end
+                )
+
+              send(parent, {:done, result})
+              receive do: (:stop -> :ok)
+          end
+        end)
+
+      :erlang.trace(runner, true, [:call])
+      :erlang.trace_pattern({:erlang, :garbage_collect, 0}, true, [:local])
+
+      try do
+        send(runner, :go)
+        assert_receive {:done, :inline_ok}, 1_000
+      after
+        :erlang.trace_pattern({:erlang, :garbage_collect, 0}, false, [:local])
+        if Process.alive?(runner), do: :erlang.trace(runner, false, [:call])
+        send(runner, :stop)
+      end
+
+      assert_receive {:trace, ^runner, :call, {:erlang, :garbage_collect, []}}, 1_000
+    end
   end
 
   describe "P2P.Listener bounded Connman handoff" do

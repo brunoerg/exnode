@@ -88,8 +88,15 @@ defmodule Exnode.P2P.DecodeBudget do
       n,
       fn ->
         case run_in_worker(task_sup, fun) do
-          {:ok, result} -> result
-          :fallback -> fun.()
+          {:ok, result} ->
+            result
+
+          :fallback ->
+            try do
+              fun.()
+            after
+              if budget != nil and n >= @min_bytes, do: :erlang.garbage_collect()
+            end
         end
       end,
       gc: false
