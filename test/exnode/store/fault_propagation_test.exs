@@ -297,4 +297,39 @@ defmodule Exnode.Store.FaultPropagationTest do
     KV.close(kv2)
     Guard.abandon(g)
   end
+
+  test "corrupt key/hash mismatch in staging headers_cache raises StorageError and latches guard", %{
+    tmp_dir: dir
+  } do
+    chain_dir = Path.join(dir, "regtest")
+    [b1] = blocks(1)
+
+    %{name: name, n: n} = TestNode.start(dir)
+    # Persist b1's header only (not connected -> lives in staging/:headers_cache).
+    assert {:ok, _} = Headers.process_headers(n.headers, [b1.header])
+    :ok = stop_supervised(name)
+    assert Guard.inspect_lock(chain_dir) == :clean
+
+    # Tamper with staging/:headers_cache so the key does not match the 80-byte raw header hash.
+    {:ok, stg} = KV.open(Path.join(chain_dir, "staging"), mode: :staging)
+    wrong_key = <<0xAA::256>>
+    raw = Exnode.Codec.Header.encode(b1.header)
+    :ok = KV.write(stg, [{:put, :headers_cache, wrong_key, <<1::32, 0, raw::binary>>}], sync: true)
+    :ok = KV.sync_wal!(stg)
+    KV.close(stg)
+
+    g = Guard.acquire!(chain_dir, name: "canonical", require_clean_mark: false)
+    {:ok, kv2} = KV.open(Path.join(chain_dir, "index"), mode: :canonical, guard: g)
+    {:ok, stg2} = KV.open(Path.join(chain_dir, "staging"), mode: :staging, guard: g)
+
+    capture_log(fn ->
+      assert {:error, {%Exnode.StorageError{reason: {:corrupt_staging_header_hash, _, _}}, _}} =
+               GenServer.start(Headers, params: @p, kv: kv2, staging_kv: stg2)
+    end)
+
+    assert Guard.faulted?(g)
+    KV.close(stg2)
+    KV.close(kv2)
+    Guard.abandon(g)
+  end
 end

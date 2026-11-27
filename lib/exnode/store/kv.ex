@@ -219,7 +219,15 @@ defmodule Exnode.Store.KV do
     ]
   end
 
-  defp mode_db_opts(:staging), do: [enable_pipelined_write: false]
+  defp mode_db_opts(:staging) do
+    [
+      enable_pipelined_write: false,
+      use_fsync: true,
+      atomic_flush: true,
+      wal_recovery_mode: :absolute_consistency
+    ]
+  end
+
   defp mode_db_opts(:legacy), do: [enable_pipelined_write: true]
 
   # Retries while this VM holds the store, until `deadline` (see @lock_wait_ms).
@@ -410,6 +418,25 @@ defmodule Exnode.Store.KV do
   rescue
     # Already closed: erlang-rocksdb raises badarg for a closing handle.
     ArgumentError -> :ok
+  end
+
+  @doc """
+  Flushes and fsyncs the WAL and DB directory so every prior `sync: false`
+  write is durable on disk before closing the store and releasing `flush.lock`.
+  Latches `guard` and raises `Exnode.Store.KV.Error` on failure.
+  """
+  @spec sync_wal!(t()) :: :ok
+  def sync_wal!(%__MODULE__{db: db, path: path, guard: guard}) do
+    Guard.check!(guard)
+
+    case :rocksdb.sync_wal(db) do
+      :ok ->
+        Guard.sync_dir!(path, guard)
+        :ok
+
+      {:error, reason} ->
+        fail!(guard, :sync_wal, :db, reason)
+    end
   end
 
   @doc """

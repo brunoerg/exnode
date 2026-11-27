@@ -282,20 +282,39 @@ defmodule Exnode.Chain.Headers do
     end)
   end
 
-  # Ephemeral ahead-of-tip headers cached in staging/: non-authoritative,
-  # skipped if already present in canonical or if parent is absent.
+  # Ephemeral ahead-of-tip headers cached in staging/: non-authoritative
+  # across crashes (staging/ is wiped on restore), durable across clean closes
+  # (staging WAL is fsynced before flush.lock is removed). Recomputes every
+  # header hash from the 80 raw bytes rather than trusting the key.
   defp load_staging(idx, staging_kv) do
     staging_kv
     |> KV.fold_prefix(:headers_cache, <<>>, [], fn
-      {k, <<h::32, s, raw::binary-size(80)>>}, acc -> [{h, s, k, raw} | acc]
-      _, acc -> acc
+      {k, <<h::32, s, raw::binary-size(80)>>}, acc ->
+        [{h, s, k, raw} | acc]
+
+      {k, bad}, _acc ->
+        StorageError.raise_and_latch!(
+          staging_kv.guard,
+          :headers,
+          {:corrupt_staging_header_row, k, byte_size(bad)},
+          "staging header cache corrupt: invalid row length #{byte_size(bad)}"
+        )
     end)
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.reduce(idx, fn {_h, s, k, raw}, idx ->
       if Index.lookup(idx, k) do
         idx
       else
-        hdr = Header.decode_with_hash(raw, k)
+        {hdr, ""} = Header.decode(raw)
+
+        if hdr.hash != k do
+          StorageError.raise_and_latch!(
+            staging_kv.guard,
+            :headers,
+            {:corrupt_staging_header_hash, k, hdr.hash},
+            "staging header cache corrupt: stored key does not match header hash"
+          )
+        end
 
         case Index.lookup(idx, hdr.prev_hash) do
           nil ->

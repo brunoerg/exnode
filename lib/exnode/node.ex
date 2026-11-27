@@ -307,6 +307,7 @@ defmodule Exnode.Node do
         {:staging_kv, Path.join(chain_dir, "staging"),
          [
            mode: :staging,
+           guard: canonical_guard,
            max_open_files: staging_fds,
            block_cache_bytes: min(16 * 1024 * 1024, max(4 * 1024 * 1024, div(kv_cache, 16)))
          ]}

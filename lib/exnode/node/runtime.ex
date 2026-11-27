@@ -246,6 +246,7 @@ defmodule Exnode.Node.Runtime do
        guards: guards,
        node_name: node_name,
        node_pid: Keyword.get(opts, :node_pid),
+       staging_kv: Map.get(store_map, :staging_kv),
        derived_kv: derived_kv,
        derived_guard: derived_guard,
        chain_dir: chain_dir,
@@ -308,6 +309,26 @@ defmodule Exnode.Node.Runtime do
 
     clean_stop? = reason in [:normal, :shutdown] and not st.fault_triggered
 
+    # Make `staging/` durable (fsync WAL + dir) BEFORE closing and removing
+    # `flush.lock`, so a power loss after a clean shutdown never leaves an
+    # unsynced staging WAL behind a missing lock.
+    staging_synced? =
+      if clean_stop? and st.staging_kv != nil do
+        try do
+          :ok = KV.sync_wal!(st.staging_kv)
+          true
+        catch
+          kind, err ->
+            Logger.error(
+              "staging clean-close sync failed (retaining flush.lock): #{inspect(kind)} #{inspect(err, limit: 5)}"
+            )
+
+            false
+        end
+      else
+        true
+      end
+
     # Final snapshot for derived indexes on clean shutdown (after index processes stopped).
     if clean_stop? and st.derived_kv != nil and st.chain_dir != nil and
          not Guard.faulted?(st.derived_guard) do
@@ -327,7 +348,7 @@ defmodule Exnode.Node.Runtime do
       end)
 
     for g <- st.guards, g != nil do
-      if clean_stop? and close_ok? do
+      if clean_stop? and staging_synced? and close_ok? do
         _ = Guard.release_clean!(g)
       else
         Guard.abandon(g)
