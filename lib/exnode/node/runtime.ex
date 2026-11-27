@@ -5,20 +5,18 @@ defmodule Exnode.Node.Runtime do
   Sits first under `Exnode.Node` (`:rest_for_one`):
   * opens the node's RocksDB store (`Exnode.Store.KV`) in `init/1` and closes
     it in `terminate/2`, stopping last after every process that uses the store;
-  * owns the node's `:stopping` 1-slot `:atomics` flag (`0` running, `1`
-    stopping), replacing mutable `:persistent_term` entries;
   * owns the per-node named ETS handle table (`Handles`, `:protected`,
     `read_concurrency: true`) for lock-free lookups of node-scoped resources
-    (`:kv`, `:stopping`, etc.).
+    (`:kv`, etc.).
 
   Also maintains the VM-wide `Exnode.Handles` ETS table (owned by the
   application supervisor via `Exnode.Application`) that maps registered
   component names (`{mod, server}`) to their published lock-free handles
   (`HeaderIndex`, `Chain.View`, `ScriptExec` worker fence pids, index `KV`
-  handles) and tracks the application-wide stopping `:atomics` flag.
+  handles) and tracks per-node and application-wide stopping flags.
 
-  Using ETS + `:atomics` instead of `:persistent_term` means starting/stopping
-  nodes, restarting components, or losing/replacing `ScriptExec` workers never
+  Using ETS instead of `:persistent_term` means starting/stopping nodes,
+  restarting components, or losing/replacing `ScriptExec` workers never
   triggers a VM-wide global GC.
   """
   use GenServer
@@ -47,8 +45,6 @@ defmodule Exnode.Node.Runtime do
   @doc false
   def init_global_table do
     ensure_global_table()
-    # Application-wide stopping latch: 0 running, 1 stopping (prep_stop/1).
-    :ets.insert_new(@global_table, {:app_stopping, :atomics.new(1, [])})
     :ok
   end
 
@@ -79,58 +75,38 @@ defmodule Exnode.Node.Runtime do
 
   @doc false
   def mark_app_stopping do
-    init_global_table()
-    ref = :ets.lookup_element(@global_table, :app_stopping, 2)
-    :atomics.put(ref, 1, 1)
+    ensure_global_table()
+    :ets.insert(@global_table, {:app_stopping, true})
     :ok
   end
 
   @doc false
   def app_stopping? do
     case :ets.lookup(@global_table, :app_stopping) do
-      [{:app_stopping, ref}] -> :atomics.get(ref, 1) == 1
-      [] -> false
+      [{:app_stopping, true}] -> true
+      _ -> false
     end
   rescue
     ArgumentError -> false
   end
 
-  # --- Per-node stopping latch ------------------------------------------------
+  # --- Per-node stopping flag -------------------------------------------------
 
   @doc """
-  Marks node `name` (or `:all` nodes) as stopping. Uses `:atomics` so no
-  `:persistent_term` entry is created or mutated.
+  Marks node `name` (or `:all` nodes) as stopping. Stored as a single ETS entry
+  in `Exnode.Handles` so no `:persistent_term` entry is created or mutated.
   """
   def mark_stopping(:all), do: mark_app_stopping()
 
   def mark_stopping(node_name) when is_atom(node_name) do
-    # Update the per-node table if the node is running, and also record in the
-    # global registry so standalone tests (without a running Exnode.Node) work.
-    table = handles_table(node_name)
-
-    try do
-      ref = :ets.lookup_element(table, :stopping, 2)
-      :atomics.put(ref, 1, 1)
-    rescue
-      ArgumentError -> :ok
-    end
-
     ensure_global_table()
-    ref = get_or_create_stopping_atomic(node_name)
-    :atomics.put(ref, 1, 1)
+    :ets.insert(@global_table, {{:stopping, node_name}, true})
     :ok
   end
 
   @doc false
   def clear_stopping(node_name) when is_atom(node_name) do
-    ensure_global_table()
-
-    case :ets.lookup(@global_table, {:stopping, node_name}) do
-      [{{:stopping, ^node_name}, ref}] -> :atomics.put(ref, 1, 0)
-      [] -> :ok
-    end
-
-    :ok
+    delete_handle({:stopping, node_name})
   end
 
   @doc "Whether node `name` is stopping (`Exnode.Node.stop/2`, or the application is)."
@@ -139,43 +115,15 @@ defmodule Exnode.Node.Runtime do
   end
 
   defp node_stopping?(node_name) when is_atom(node_name) do
-    table = handles_table(node_name)
-
-    case :ets.lookup(table, :stopping) do
-      [{:stopping, ref}] ->
-        :atomics.get(ref, 1) == 1
-
-      [] ->
-        global_node_stopping?(node_name)
-    end
-  rescue
-    ArgumentError -> global_node_stopping?(node_name)
-  end
-
-  defp node_stopping?(_), do: false
-
-  defp global_node_stopping?(node_name) do
     case :ets.lookup(@global_table, {:stopping, node_name}) do
-      [{{:stopping, ^node_name}, ref}] -> :atomics.get(ref, 1) == 1
-      [] -> false
+      [{{:stopping, ^node_name}, true}] -> true
+      _ -> false
     end
   rescue
     ArgumentError -> false
   end
 
-  defp get_or_create_stopping_atomic(node_name) do
-    key = {:stopping, node_name}
-
-    case :ets.lookup(@global_table, key) do
-      [{^key, ref}] ->
-        ref
-
-      [] ->
-        ref = :atomics.new(1, [])
-        :ets.insert_new(@global_table, {key, ref})
-        :ets.lookup_element(@global_table, key, 2)
-    end
-  end
+  defp node_stopping?(_), do: false
 
   # --- Per-node Runtime process & Handles ETS table ---------------------------
 
@@ -247,9 +195,6 @@ defmodule Exnode.Node.Runtime do
 
     table =
       if node_name do
-        stopping = :atomics.new(1, [])
-        clear_stopping(node_name)
-
         t =
           :ets.new(handles_table(node_name), [
             :named_table,
@@ -258,7 +203,7 @@ defmodule Exnode.Node.Runtime do
             read_concurrency: true
           ])
 
-        :ets.insert(t, [{:kv, kv}, {:stopping, stopping}])
+        :ets.insert(t, {:kv, kv})
         t
       end
 

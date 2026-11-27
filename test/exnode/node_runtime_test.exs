@@ -209,6 +209,42 @@ defmodule Exnode.NodeRuntimeTest do
     assert Runtime.get_handle({ScriptExec, :workers, n.script_exec}, :missing) == :missing
   end
 
+  test "stopping flag is single-source-of-truth and survives Node.Runtime restart", %{
+    tmp_dir: dir
+  } do
+    %{n: n, name: name} = TestNode.start(dir)
+    refute Exnode.Node.stopping?(name)
+
+    # Mark stopping, then kill Node.Runtime: its restart must not wipe the flag.
+    Exnode.Node.mark_stopping(name)
+    assert Exnode.Node.stopping?(name)
+
+    rt_before = GenServer.whereis(n.runtime)
+    Process.exit(rt_before, :kill)
+
+    wait_until(fn ->
+      rt = GenServer.whereis(n.runtime)
+      is_pid(rt) and rt != rt_before
+    end)
+
+    assert Exnode.Node.stopping?(name)
+
+    # clear_stopping/1 immediately clears the single stopping entry.
+    Runtime.clear_stopping(name)
+    refute Exnode.Node.stopping?(name)
+
+    # Stopping the node cleans up any stopping entry; restarting a fresh Node
+    # supervisor also clears a stale stopping flag set before start.
+    Exnode.Node.mark_stopping(name)
+    :ok = stop_supervised(name)
+    refute Exnode.Node.stopping?(name)
+
+    Exnode.Node.mark_stopping(name)
+    assert Exnode.Node.stopping?(name)
+    %{name: ^name} = TestNode.start(dir, name: name)
+    refute Exnode.Node.stopping?(name)
+  end
+
   test "Chain.View is :protected ETS and latches ibd_done concurrently from non-owner processes",
        %{tmp_dir: dir} do
     %{n: n} = TestNode.start(dir)
