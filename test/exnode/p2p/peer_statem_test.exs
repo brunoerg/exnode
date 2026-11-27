@@ -115,6 +115,30 @@ defmodule Exnode.P2P.PeerStatemTest do
       %{n: TestNode.start(dir).n}
     end
 
+    test "orphaned inbound Peer times out in :awaiting_socket", %{n: n} do
+      node = %{
+        params: @p,
+        headers: n.headers,
+        addrman: nil,
+        sync: n.sync,
+        services: 0,
+        user_agent: "/test/",
+        tick_ms: nil
+      }
+
+      {:ok, pid} =
+        Exnode.P2P.Peer.start_link(%{
+          node: node,
+          conn_type: :inbound,
+          socket_timeout_ms: 50
+        })
+
+      Process.unlink(pid)
+      ref = Process.monitor(pid)
+      assert elem(:sys.get_state(pid), 0) == :awaiting_socket
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :socket_timeout}}, 1_000
+    end
+
     test "progresses through :awaiting_version -> :awaiting_verack -> {:ready, :active}", %{n: n} do
       {pid, sock} = FakePeer.connect_from(n, handshake: false, node: %{tick_ms: nil})
       wait_until(fn -> elem(:sys.get_state(pid), 0) == :awaiting_version end)

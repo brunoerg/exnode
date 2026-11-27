@@ -71,6 +71,8 @@ defmodule Exnode.P2P.Peer do
 
   # net.cpp m_peer_connect_timeout default (DEFAULT_PEER_CONNECT_TIMEOUT)
   @handshake_timeout_s 60
+  # Bound inbound :awaiting_socket so an orphaned Peer cannot leak if Listener crashes mid-handoff.
+  @socket_handoff_timeout_ms 10_000
   # net_processing.cpp
   @ping_interval_s 120
   @timeout_interval_s 20 * 60
@@ -156,7 +158,8 @@ defmodule Exnode.P2P.Peer do
         {:ok, :connecting, %{data | target: {host, port}}, [{:next_event, :internal, :connect}]}
 
       nil ->
-        {:ok, :awaiting_socket, data}
+        timeout = Map.get(args, :socket_timeout_ms, @socket_handoff_timeout_ms)
+        {:ok, :awaiting_socket, data, [{:state_timeout, timeout, :socket_timeout}]}
     end
   end
 
@@ -194,6 +197,10 @@ defmodule Exnode.P2P.Peer do
       |> Data.update_handshake(&%{&1 | connected_at: t})
 
     {:next_state, :awaiting_version, data, tick_actions(data)}
+  end
+
+  def handle_event(:state_timeout, :socket_timeout, :awaiting_socket, %Data{} = data) do
+    {:stop, {:shutdown, :socket_timeout}, data}
   end
 
   # --- Calls (valid in all states) -------------------------------------------
