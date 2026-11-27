@@ -12,7 +12,10 @@ defmodule Exnode.P2P.Listener do
   Calls into `Connman` (`accept_inbound?/3` and `register_inbound/4`) are
   bounded by `@connman_timeout_ms` (default 5 s) so a stalled `Connman`
   cannot wedge the accept loop indefinitely; timed-out or unregistered
-  connections are closed cleanly.
+  connections are closed cleanly. Trade-off: if `Connman` is merely slow
+  (> 5 s) rather than dead, `accept_inbound?/3` still completes inside
+  `Connman` and may evict an existing inbound peer for a connection the
+  listener already closed on timeout.
 
   An accept error does not end the loop (Core AcceptConnection logs "socket
   error accept failed" and goes on): under fd exhaustion (`:emfile`,
