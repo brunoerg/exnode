@@ -272,32 +272,49 @@ defmodule Exnode.Store.SnapshotTest do
     tmp_dir: dir
   } do
     chain_dir = Path.join(dir, "regtest")
-    derived_dir = Path.join(chain_dir, "derived")
-    File.mkdir_p!(derived_dir)
+    filters_dir = Path.join([chain_dir, "derived", "filters"])
+    File.mkdir_p!(filters_dir)
 
-    # Case 1: Dirty derived with no snapshot -> wiped.
-    gd = Guard.acquire!(derived_dir, name: "derived", require_clean_mark: false)
-    {:ok, dkv} = KV.open(derived_dir, mode: :derived, guard: gd)
+    # Case 1: Dirty derived store with no snapshot -> wiped.
+    gd = Guard.acquire!(filters_dir, name: "derived:filters", require_clean_mark: false)
+
+    {:ok, dkv} =
+      KV.open(Path.join(filters_dir, "index"),
+        mode: :derived,
+        column_families: [:filters],
+        guard: gd
+      )
+
     :ok = KV.write(dkv, [{:put, :filters, "k", "v"}], sync: true)
     KV.close(dkv)
     Guard.abandon(gd)
 
-    assert Snapshot.restore_derived!(chain_dir) == :wiped
-    refute File.exists?(derived_dir)
+    assert Snapshot.restore_derived!(chain_dir) == %{"filters" => :wiped}
+    refute File.exists?(filters_dir)
 
-    # Case 2: Derived with snapshot -> restored to exact snapshot state.
-    File.mkdir_p!(derived_dir)
-    gd2 = Guard.acquire!(derived_dir, name: "derived", require_clean_mark: false)
-    {:ok, dkv2} = KV.open(derived_dir, mode: :derived, guard: gd2)
+    # Case 2: Derived store with quiescent snapshot -> restored to exact snapshot state.
+    File.mkdir_p!(filters_dir)
+    gd2 = Guard.acquire!(filters_dir, name: "derived:filters", require_clean_mark: false)
+
+    {:ok, dkv2} =
+      KV.open(Path.join(filters_dir, "index"),
+        mode: :derived,
+        column_families: [:filters],
+        guard: gd2
+      )
+
     :ok = KV.write(dkv2, [{:put, :filters, "k", "v1"}], sync: true)
-    :ok = Snapshot.take_derived!(dkv2, chain_dir)
+    :ok = Snapshot.take_derived!(dkv2, filters_dir)
     :ok = KV.write(dkv2, [{:put, :filters, "k", "v2"}], sync: true)
     KV.close(dkv2)
     Guard.abandon(gd2)
 
-    assert {:restored, :primary} == Snapshot.restore_derived!(chain_dir)
-    assert Guard.inspect_lock(derived_dir) == :clean
-    {:ok, dkv3} = KV.open(derived_dir, mode: :derived)
+    assert Snapshot.restore_derived!(chain_dir) == %{"filters" => {:restored, :primary}}
+    assert Guard.inspect_lock(filters_dir) == :clean
+
+    {:ok, dkv3} =
+      KV.open(Path.join(filters_dir, "index"), mode: :derived, column_families: [:filters])
+
     assert KV.get(dkv3, :filters, "k") == {:ok, "v1"}
     KV.close(dkv3)
   end

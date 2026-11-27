@@ -1,13 +1,34 @@
 defmodule Exnode.Node.Runtime do
   @moduledoc """
-  Per-node runtime resource owner and lock-free handle registry.
+  Per-node runtime resource owner, `Exnode.Store.Guard` clean-close owner, and
+  lock-free handle registry.
 
   Sits first under `Exnode.Node` (`:rest_for_one`):
-  * opens the node's RocksDB store (`Exnode.Store.KV`) in `init/1` and closes
-    it in `terminate/2`, stopping last after every process that uses the store;
-  * owns the per-node named ETS handle table (`Handles`, `:protected`,
-    `read_concurrency: true`) for lock-free lookups of node-scoped resources
-    (`:kv`, etc.).
+  * opens the node's RocksDB stores (`Exnode.Store.KV`: canonical `index/`,
+    ephemeral `staging/`, and optional single-writer derived index stores) in
+    `init/1` and owns the per-node named ETS handle table (`Handles`,
+    `:protected`, `read_concurrency: true`) for lock-free lookups (`:kv`,
+    `:staging_kv`, `:filters_kv`, `:scripthash_kv`);
+  * stops last, after every writer and reader has stopped:
+    1. Erases the node's global `Exnode.Handles` entries so closed KV handles
+       and dead ETS tables are not rooted across runs.
+    2. Syncs ephemeral `staging/` WAL + directory before releasing `flush.lock`
+       so clean shutdown leaves no unsynced WAL behind a missing lock.
+    3. Closes every KV handle.
+    4. Releases each `flush.lock` (`Guard.release_clean!/1`) ONLY on a clean
+       shutdown with zero latched storage faults and clean writer completion. On
+       any latched storage fault or abnormal exit, `flush.lock` is retained on
+       disk.
+
+  Snapshots are never taken here: each store's sole writer (`Chain.State` for
+  canonical `index/`, `Index.BlockFilter` for `derived/filters/`, and
+  `Index.Scripthash` for `derived/scripthash/`) takes its own snapshots at true
+  quiescent points between batches and on clean shutdown.
+
+  When any process latches a storage fault on a managed `Guard`, `Runtime`
+  immediately triggers an asynchronous non-clean stop of the `Exnode.Node`
+  supervisor (`{:shutdown, :storage_fault}`) so the node halts without
+  restarting writers or committing dirty state.
 
   Also provides access to the VM-wide `Exnode.Handles` ETS table (owned by
   `Exnode.Node.Handles`, a permanent child under `Exnode.Supervisor`) that maps
@@ -22,10 +43,9 @@ defmodule Exnode.Node.Runtime do
   use GenServer
   require Logger
 
-  alias Exnode.Store.{Guard, KV, Snapshot}
+  alias Exnode.Store.{Guard, KV}
 
   @global_table Exnode.Handles
-  @derived_snapshot_ms 60_000
 
   # --- VM-wide handle registry (owned by Exnode.Node.Handles) -----------------
 
@@ -135,9 +155,14 @@ defmodule Exnode.Node.Runtime do
     store_kv(node_name, :staging_kv, nil)
   end
 
-  @doc "Returns the derived `%KV{}` handle for `node_name`, falling back to canonical `:kv`."
-  def derived_kv(node_name \\ Exnode.Node) do
-    store_kv(node_name, :derived_kv, nil) || kv(node_name)
+  @doc "Returns the block-filter derived `%KV{}` handle for `node_name`, falling back to canonical `:kv`."
+  def filters_kv(node_name \\ Exnode.Node) do
+    store_kv(node_name, :filters_kv, nil) || kv(node_name)
+  end
+
+  @doc "Returns the scripthash derived `%KV{}` handle for `node_name`, falling back to canonical `:kv`."
+  def scripthash_kv(node_name \\ Exnode.Node) do
+    store_kv(node_name, :scripthash_kv, nil) || kv(node_name)
   end
 
   @doc "Returns the store `%KV{}` handle stored under `key` for `node_name`, or `default`."
@@ -231,14 +256,6 @@ defmodule Exnode.Node.Runtime do
         t
       end
 
-    derived_kv = Map.get(store_map, :derived_kv)
-    derived_guard = Keyword.get(opts, :derived_guard)
-    chain_dir = Keyword.get(opts, :chain_dir)
-
-    if derived_kv && chain_dir do
-      Process.send_after(self(), :derived_snapshot, @derived_snapshot_ms)
-    end
-
     {:ok,
      %{
        kv: Map.fetch!(store_map, :kv),
@@ -247,9 +264,6 @@ defmodule Exnode.Node.Runtime do
        node_name: node_name,
        node_pid: Keyword.get(opts, :node_pid),
        staging_kv: Map.get(store_map, :staging_kv),
-       derived_kv: derived_kv,
-       derived_guard: derived_guard,
-       chain_dir: chain_dir,
        table: table,
        cleanup_keys: cleanup_keys,
        fault_triggered: false
@@ -277,23 +291,6 @@ defmodule Exnode.Node.Runtime do
     end
 
     {:noreply, %{st | fault_triggered: true}}
-  end
-
-  def handle_info(:derived_snapshot, %{derived_kv: dkv, derived_guard: dg, chain_dir: dir} = st)
-      when dkv != nil and dir != nil do
-    if not st.fault_triggered and not Guard.faulted?(dg) do
-      try do
-        Snapshot.take_derived!(dkv, dir)
-      catch
-        kind, reason ->
-          Logger.error(
-            "periodic derived snapshot failed: #{inspect(kind)} #{inspect(reason, limit: 5)}"
-          )
-      end
-    end
-
-    Process.send_after(self(), :derived_snapshot, @derived_snapshot_ms)
-    {:noreply, st}
   end
 
   def handle_info({:EXIT, _, _}, st), do: {:noreply, st}
@@ -329,19 +326,6 @@ defmodule Exnode.Node.Runtime do
         true
       end
 
-    # Final snapshot for derived indexes on clean shutdown (after index processes stopped).
-    if clean_stop? and st.derived_kv != nil and st.chain_dir != nil and
-         not Guard.faulted?(st.derived_guard) do
-      try do
-        Snapshot.take_derived!(st.derived_kv, st.chain_dir)
-      catch
-        kind, err ->
-          Logger.error(
-            "final derived snapshot failed: #{inspect(kind)} #{inspect(err, limit: 5)}"
-          )
-      end
-    end
-
     close_ok? =
       Enum.reduce(st.kvs, true, fn kv, ok ->
         ok and KV.close(kv) == :ok
@@ -367,22 +351,30 @@ defmodule Exnode.Node.Runtime do
 
         {:error, reason} ->
           for {_, kv} <- opened, do: KV.close(kv)
+          failed_guard = Keyword.get(kv_opts, :guard)
 
-          for g <- guards do
+          # Cleanly release independent guards that did not fail so a corrupt
+          # derived store does not collaterally dirty the canonical store.
+          for g <- guards, g != nil and g != failed_guard do
+            Guard.mark_clean_close!(g)
+            Guard.release_clean!(g)
+          end
+
+          if failed_guard != nil do
             Guard.latch_fault(
-              g,
+              failed_guard,
               :kv,
               {:open, path, reason},
               "cannot open store #{path}: #{inspect(reason)}"
             )
 
-            Guard.abandon(g)
+            Guard.abandon(failed_guard)
           end
 
           raise Exnode.StorageError,
             source: :kv,
             reason: {:open, path, reason},
-            latched: guards != [],
+            latched: failed_guard != nil,
             message: "cannot open store at #{path}: #{inspect(reason)}"
       end
     end)

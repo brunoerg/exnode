@@ -262,6 +262,14 @@ defmodule Exnode.Store.Guard do
     :ok
   end
 
+  @doc "Clears the clean-close mark when a writer starts or restarts in-process."
+  def clear_clean_close!(nil), do: :ok
+
+  def clear_clean_close!(%__MODULE__{state: state}) do
+    :atomics.put(state, @slot_clean, 0)
+    :ok
+  end
+
   @doc "True if the primary writer completed a clean close with zero latched faults."
   def clean_close_ready?(nil), do: true
 

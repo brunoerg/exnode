@@ -266,9 +266,9 @@ defmodule Exnode.Node do
     chain_dir = Path.join(datadir, Atom.to_string(chain))
     File.mkdir_p!(chain_dir)
 
-    need_derived? =
-      Keyword.get(opts, :block_filter_index, false) or
-        Keyword.get(opts, :index_scripthash, false)
+    want_filters? = Keyword.get(opts, :block_filter_index, false)
+    want_scripthash? = Keyword.get(opts, :index_scripthash, false)
+    derived_count = if(want_filters?, do: 1, else: 0) + if want_scripthash?, do: 1, else: 0
 
     # Acquire clean-close lock BEFORE opening RocksDB or any segment file.
     # A dirty or faulted store is refused here and must be restored via
@@ -276,23 +276,32 @@ defmodule Exnode.Node do
     canonical_guard = Guard.acquire!(chain_dir, name: "canonical", require_clean_mark: true)
 
     {canonical_fds, staging_fds, derived_fds} =
-      split_table_files(budget.table_files, need_derived?)
+      split_table_files(budget.table_files, derived_count)
 
     kv_cache = Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
 
-    derived_guard =
-      if need_derived? do
-        derived_dir = Path.join(chain_dir, "derived")
-        File.mkdir_p!(derived_dir)
+    derived_cache = min(32 * 1024 * 1024, max(8 * 1024 * 1024, div(kv_cache, 8)))
 
-        try do
-          Guard.acquire!(derived_dir, name: "derived", require_clean_mark: false)
-        rescue
-          e ->
-            Guard.mark_clean_close!(canonical_guard)
-            Guard.release_clean!(canonical_guard)
-            reraise e, __STACKTRACE__
-        end
+    {filters_store, filters_guard} =
+      if want_filters? do
+        dir = Path.join([chain_dir, "derived", "filters"])
+        {dir, acquire_derived_guard!(dir, :filters, [canonical_guard])}
+      else
+        {nil, nil}
+      end
+
+    {scripthash_store, scripthash_guard} =
+      if want_scripthash? do
+        dir = Path.join([chain_dir, "derived", "scripthash"])
+
+        {dir,
+         acquire_derived_guard!(
+           dir,
+           :scripthash,
+           Enum.reject([canonical_guard, filters_guard], &is_nil/1)
+         )}
+      else
+        {nil, nil}
       end
 
     stores =
@@ -312,14 +321,28 @@ defmodule Exnode.Node do
            block_cache_bytes: min(16 * 1024 * 1024, max(4 * 1024 * 1024, div(kv_cache, 16)))
          ]}
       ] ++
-        if(need_derived?,
+        if(want_filters?,
           do: [
-            {:derived_kv, Path.join(chain_dir, "derived"),
+            {:filters_kv, Path.join(filters_store, "index"),
              [
                mode: :derived,
-               guard: derived_guard,
+               column_families: [:filters],
+               guard: filters_guard,
                max_open_files: derived_fds,
-               block_cache_bytes: min(64 * 1024 * 1024, max(8 * 1024 * 1024, div(kv_cache, 4)))
+               block_cache_bytes: derived_cache
+             ]}
+          ],
+          else: []
+        ) ++
+        if(want_scripthash?,
+          do: [
+            {:scripthash_kv, Path.join(scripthash_store, "index"),
+             [
+               mode: :derived,
+               column_families: [:scripthash],
+               guard: scripthash_guard,
+               max_open_files: derived_fds,
+               block_cache_bytes: derived_cache
              ]}
           ],
           else: []
@@ -407,17 +430,23 @@ defmodule Exnode.Node do
       end
 
     indexes =
-      if(Keyword.get(opts, :block_filter_index, false),
+      if(want_filters?,
         do: [
           {Exnode.Index.BlockFilter,
-           name: n.filter_index, node_name: name, chain_state: n.chain_state}
+           name: n.filter_index,
+           node_name: name,
+           store_dir: filters_store,
+           chain_state: n.chain_state}
         ],
         else: []
       ) ++
-        if(Keyword.get(opts, :index_scripthash, false),
+        if(want_scripthash?,
           do: [
             {Exnode.Index.Scripthash,
-             name: n.scripthash_index, node_name: name, chain_state: n.chain_state}
+             name: n.scripthash_index,
+             node_name: name,
+             store_dir: scripthash_store,
+             chain_state: n.chain_state}
           ],
           else: []
         )
@@ -457,9 +486,7 @@ defmodule Exnode.Node do
        node_name: name,
        node_pid: self(),
        stores: stores,
-       guards: Enum.reject([canonical_guard, derived_guard], &is_nil/1),
-       derived_guard: derived_guard,
-       chain_dir: chain_dir,
+       guards: Enum.reject([canonical_guard, filters_guard, scripthash_guard], &is_nil/1),
        cleanup_keys: cleanup_keys}
 
     children =
@@ -610,14 +637,37 @@ defmodule Exnode.Node do
     end
   end
 
-  defp split_table_files(total, false) do
+  defp split_table_files(total, 0) do
     staging = min(64, max(16, div(total, 8)))
     {max(32, total - staging), staging, 0}
   end
 
-  defp split_table_files(total, true) do
+  defp split_table_files(total, n_derived) when n_derived > 0 do
     staging = min(64, max(16, div(total, 8)))
-    derived = min(128, max(32, div(total, 4)))
-    {max(32, total - staging - derived), staging, derived}
+    derived_total = min(128, max(32 * n_derived, div(total, 4)))
+    per_derived = max(16, div(derived_total, n_derived))
+    {max(32, total - staging - per_derived * n_derived), staging, per_derived}
+  end
+
+  # Acquires the clean-close lock for a dedicated single-writer derived index
+  # store under `store_dir` (`store_dir/flush.lock`, `store_dir/index/`,
+  # `store_dir/snapshots/`). If acquiring the derived lock fails (dirty/faulted
+  # derived store), cleanly releases any already-acquired locks so clean stores
+  # stay clean.
+  defp acquire_derived_guard!(store_dir, cf, prior_guards) do
+    File.mkdir_p!(store_dir)
+    name = "derived:#{cf}"
+
+    try do
+      Guard.acquire!(store_dir, name: name, require_clean_mark: true)
+    rescue
+      e ->
+        for g <- prior_guards do
+          Guard.mark_clean_close!(g)
+          Guard.release_clean!(g)
+        end
+
+        reraise e, __STACKTRACE__
+    end
   end
 end

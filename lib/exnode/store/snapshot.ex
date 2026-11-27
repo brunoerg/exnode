@@ -33,11 +33,16 @@ defmodule Exnode.Store.Snapshot do
   @tag "exnode-snapshot-ok"
   @version 1
 
-  @doc "Path of the canonical snapshots directory under `chain_dir`."
-  def snapshots_dir(chain_dir), do: Path.join(chain_dir, "snapshots")
+  @doc "Path of the snapshots directory inside any store directory (`chain_dir` or `derived/<name>`)."
+  def snapshots_dir(store_dir), do: Path.join(store_dir, "snapshots")
 
-  @doc "Path of the derived index snapshots directory under `chain_dir`."
-  def derived_snapshots_dir(chain_dir), do: Path.join(chain_dir, "derived_snapshots")
+  @doc "Known per-index derived store directories under `chain_dir` that exist on disk."
+  def derived_store_dirs(chain_dir) do
+    for name <- ["filters", "scripthash"],
+        dir = Path.join([chain_dir, "derived", name]),
+        File.dir?(dir),
+        do: {name, dir}
+  end
 
   @doc """
   Takes a quiescent canonical snapshot of `kv` and rotates `primary` / `secondary`.
@@ -66,11 +71,12 @@ defmodule Exnode.Store.Snapshot do
   end
 
   @doc """
-  Takes a quiescent snapshot of the derived indexes DB (`derived/`) and rotates
-  `derived_snapshots/{primary,secondary}`.
+  Takes a quiescent snapshot of a single-writer derived index DB (`store_dir/index`)
+  and rotates `store_dir/snapshots/{primary,secondary}`. Must be called by that
+  index's sole writer process between batches or on clean shutdown.
   """
-  def take_derived!(%KV{} = kv, chain_dir) do
-    snaps = derived_snapshots_dir(chain_dir)
+  def take_derived!(%KV{} = kv, store_dir) do
+    snaps = snapshots_dir(store_dir)
 
     sentinel_payload = %{
       version: @version,
@@ -157,35 +163,46 @@ defmodule Exnode.Store.Snapshot do
   end
 
   @doc """
-  Restores a dirty `derived/` store from `derived_snapshots/`, or wipes it if
-  no valid derived snapshot exists (so optional indexes rebuild cleanly from the
-  canonical archive). Returns `:clean | {:restored, slot} | :wiped`.
+  Restores a dirty per-index derived store at `store_dir` (`derived/filters` or
+  `derived/scripthash`) from `store_dir/snapshots/`, or wipes `store_dir` if no
+  valid snapshot exists (so the index rebuilds cleanly from the canonical
+  archive). Returns `:clean | {:restored, slot} | :wiped`.
   """
-  def restore_derived!(chain_dir) do
-    derived_dir = Path.join(chain_dir, "derived")
-    snaps = derived_snapshots_dir(chain_dir)
-
-    if not File.dir?(derived_dir) do
+  def restore_derived_store!(store_dir) do
+    if not File.dir?(store_dir) do
       :clean
     else
-      case Guard.inspect_lock(derived_dir) do
+      case Guard.inspect_lock(store_dir) do
         :clean ->
           :clean
 
         _dirty ->
+          snaps = snapshots_dir(store_dir)
+          index_dir = Path.join(store_dir, "index")
+
           case latest_valid(snaps) do
             {:ok, slot, snap_dir, _payload} ->
-              replace_db_from_snapshot!(chain_dir, derived_dir, snap_dir)
-              Guard.remove_lock_for_restore!(derived_dir)
+              replace_db_from_snapshot!(store_dir, index_dir, snap_dir)
+              Guard.remove_lock_for_restore!(store_dir)
               clean_staging!(snaps)
               {:restored, slot}
 
             {:error, :no_valid_snapshot} ->
-              File.rm_rf!(derived_dir)
-              Guard.sync_dir!(chain_dir)
+              File.rm_rf!(store_dir)
+              Guard.sync_dir!(Path.dirname(store_dir))
               :wiped
           end
       end
+    end
+  end
+
+  @doc """
+  Restores or wipes all dirty derived index stores under `chain_dir`.
+  Returns a map of `%{name => :clean | {:restored, slot} | :wiped}`.
+  """
+  def restore_derived!(chain_dir) do
+    for {name, dir} <- derived_store_dirs(chain_dir), into: %{} do
+      {name, restore_derived_store!(dir)}
     end
   end
 

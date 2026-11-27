@@ -24,10 +24,11 @@ defmodule Exnode.Index.BlockFilter do
   alias Exnode.{Archive, BlockFilter}
   alias Exnode.Index.Follower
   alias Exnode.Node.Runtime
-  alias Exnode.Store.KV
+  alias Exnode.Store.{Guard, KV, Snapshot}
 
   @cf :filters
   @tick_ms 200
+  @snapshot_interval_ms 60_000
   # Blocks backfilled per tick (see moduledoc).
   @backfill_batch 2_000
 
@@ -92,13 +93,29 @@ defmodule Exnode.Index.BlockFilter do
     kv =
       case Keyword.fetch(opts, :kv) do
         {:ok, kv} -> kv
-        :error -> Runtime.derived_kv(Keyword.fetch!(opts, :node_name))
+        :error -> Runtime.filters_kv(Keyword.fetch!(opts, :node_name))
       end
+
+    store_dir = Keyword.get(opts, :store_dir)
+
+    if store_dir != nil do
+      Process.flag(:trap_exit, true)
+      Guard.clear_clean_close!(kv.guard)
+    end
 
     if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, kv)
 
     send(self(), :tick)
-    {:ok, %{kv: kv, chain_state: Keyword.fetch!(opts, :chain_state), waiters: []}}
+
+    {:ok,
+     %{
+       kv: kv,
+       store_dir: store_dir,
+       chain_state: Keyword.fetch!(opts, :chain_state),
+       waiters: [],
+       dirty_since_snap: false,
+       last_snap_ms: System.monotonic_time(:millisecond)
+     }}
   end
 
   @impl true
@@ -113,6 +130,8 @@ defmodule Exnode.Index.BlockFilter do
 
   @impl true
   def handle_info(:tick, st) do
+    tip_before = Follower.tip(st.kv, @cf)
+
     result =
       try do
         Follower.sync(st.kv, @cf, st.chain_state, &connect(st.kv, &1, &2, &3), fn _, _, _ ->
@@ -134,7 +153,9 @@ defmodule Exnode.Index.BlockFilter do
       end
 
     for {{:filter_header, _} = k, _} <- Process.get(), do: Process.delete(k)
-    backfill(st.kv)
+    backfilled? = backfill(st.kv) == :wrote
+    wrote? = backfilled? or Follower.tip(st.kv, @cf) != tip_before
+    st = maybe_snapshot(%{st | dirty_since_snap: st.dirty_since_snap or wrote?}, result)
 
     waiters =
       Enum.reject(st.waiters, fn {h, from} ->
@@ -143,6 +164,55 @@ defmodule Exnode.Index.BlockFilter do
 
     Process.send_after(self(), :tick, if(result == :more, do: 0, else: @tick_ms))
     {:noreply, %{st | waiters: waiters}}
+  end
+
+  def handle_info({:EXIT, _pid, reason}, st) do
+    if reason in [:normal, :shutdown], do: {:noreply, st}, else: {:stop, reason, st}
+  end
+
+  @impl true
+  def terminate(reason, %{store_dir: dir} = st) when dir != nil do
+    if reason in [:normal, :shutdown] and not Guard.faulted?(st.kv.guard) do
+      try do
+        :ok = KV.sync_wal!(st.kv)
+
+        if st.dirty_since_snap or
+             match?(
+               {:error, :no_valid_snapshot},
+               Snapshot.latest_valid(Snapshot.snapshots_dir(dir))
+             ) do
+          :ok = Snapshot.take_derived!(st.kv, dir)
+        end
+
+        Guard.mark_clean_close!(st.kv.guard)
+      catch
+        kind, err ->
+          Logger.warning(
+            "filter index clean close failed (retaining flush.lock): #{inspect(kind)} #{inspect(err, limit: 5)}"
+          )
+      end
+    end
+
+    :ok
+  end
+
+  def terminate(_reason, _st), do: :ok
+
+  # Sole writer of `derived/filters/`: take a quiescent snapshot between batches
+  # once caught up or after `@snapshot_interval_ms`.
+  defp maybe_snapshot(%{store_dir: nil} = st, _result), do: st
+  defp maybe_snapshot(%{dirty_since_snap: false} = st, _result), do: st
+
+  defp maybe_snapshot(%{store_dir: dir} = st, result) do
+    now = System.monotonic_time(:millisecond)
+
+    if result == :done or now - st.last_snap_ms >= @snapshot_interval_ms do
+      :ok = KV.sync_wal!(st.kv)
+      :ok = Snapshot.take_derived!(st.kv, dir)
+      %{st | dirty_since_snap: false, last_snap_ms: now}
+    else
+      st
+    end
   end
 
   defp lookup(kv, hash) do
@@ -177,6 +247,7 @@ defmodule Exnode.Index.BlockFilter do
 
         next = if to >= tip, do: "done", else: <<to + 1::32>>
         :ok = KV.write(kv, ops ++ [{:put, @cf, "sfill", next}], sync: false)
+        :wrote
     end
   end
 

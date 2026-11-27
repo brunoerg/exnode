@@ -270,6 +270,7 @@ defmodule Exnode.Chain.State do
 
     guard = Keyword.get(opts, :guard, kv.guard)
     chain_dir = Keyword.get(opts, :chain_dir)
+    if chain_dir != nil, do: Guard.clear_clean_close!(guard)
 
     strict_clean? =
       case Keyword.get(opts, :boot_open) do
