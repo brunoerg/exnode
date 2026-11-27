@@ -45,6 +45,19 @@ defmodule Exnode.NodeRuntimeTest do
         do: k
   end
 
+  test "Exnode.Handles is owned by the permanent Exnode.Node.Handles child under Exnode.Supervisor" do
+    owner = GenServer.whereis(Exnode.Node.Handles)
+    assert is_pid(owner)
+    assert :ets.info(Exnode.Handles, :owner) == owner
+
+    # Confirm it is a supervised child of Exnode.Supervisor.
+    children = Supervisor.which_children(Exnode.Supervisor)
+
+    assert Enum.any?(children, fn {id, pid, _type, _mods} ->
+             id == Exnode.Node.Handles and pid == owner
+           end)
+  end
+
   test "zero :persistent_term churn across node lifecycle, restarts, and ScriptExec worker churn",
        %{tmp_dir: dir} do
     # Warm up the one-time VM-global KV compression probe and Logger/OTP internals.

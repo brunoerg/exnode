@@ -7,11 +7,8 @@ defmodule Exnode.Application do
 
   @impl true
   def start(_type, _args) do
-    Exnode.Node.Runtime.init_global_table()
-
     children = [
-      # Starts a worker by calling: Exnode.Worker.start_link(arg)
-      # {Exnode.Worker, arg}
+      Exnode.Node.Handles
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

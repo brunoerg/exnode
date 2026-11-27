@@ -9,11 +9,11 @@ defmodule Exnode.Node.Runtime do
     `read_concurrency: true`) for lock-free lookups of node-scoped resources
     (`:kv`, etc.).
 
-  Also maintains the VM-wide `Exnode.Handles` ETS table (owned by the
-  application supervisor via `Exnode.Application`) that maps registered
-  component names (`{mod, server}`) to their published lock-free handles
-  (`HeaderIndex`, `Chain.View`, `ScriptExec` worker fence pids, index `KV`
-  handles) and tracks per-node and application-wide stopping flags.
+  Also provides access to the VM-wide `Exnode.Handles` ETS table (owned by
+  `Exnode.Node.Handles`, a permanent child under `Exnode.Supervisor`) that maps
+  registered component names (`{mod, server}`) to their published lock-free
+  handles (`HeaderIndex`, `Chain.View`, `ScriptExec` worker fence pids, index
+  `KV` handles) and tracks per-node and application-wide stopping flags.
 
   Using ETS instead of `:persistent_term` means starting/stopping nodes,
   restarting components, or losing/replacing `ScriptExec` workers never
@@ -25,10 +25,9 @@ defmodule Exnode.Node.Runtime do
 
   @global_table Exnode.Handles
 
-  # --- VM-wide handle registry (owned by Exnode.Application) ------------------
+  # --- VM-wide handle registry (owned by Exnode.Node.Handles) -----------------
 
-  @doc false
-  def ensure_global_table do
+  defp ensure_global_table do
     case :ets.whereis(@global_table) do
       :undefined ->
         try do
@@ -40,12 +39,6 @@ defmodule Exnode.Node.Runtime do
       _tid ->
         @global_table
     end
-  end
-
-  @doc false
-  def init_global_table do
-    ensure_global_table()
-    :ok
   end
 
   @doc false
@@ -171,7 +164,7 @@ defmodule Exnode.Node.Runtime do
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
-    init_global_table()
+    ensure_global_table()
 
     node_name = Keyword.get(opts, :node_name)
     cleanup_keys = Keyword.get(opts, :cleanup_keys, [])
