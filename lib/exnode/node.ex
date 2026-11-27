@@ -77,9 +77,9 @@ defmodule Exnode.Node do
   alias Exnode.ChainParams
   alias Exnode.Chain.Headers
   alias Exnode.Chain.State, as: ChainState
+  alias Exnode.Node.Runtime
   alias Exnode.P2P.BlockDownload
   alias Exnode.P2P.{AddrMan, Connman, Listener, SyncState}
-  alias Exnode.Store.KV
 
   def start_link(opts),
     do: Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -97,17 +97,16 @@ defmodule Exnode.Node do
   end
 
   @doc "Marks node `name` (or `:all` nodes) as stopping; see `stop/2`."
-  def mark_stopping(name), do: :persistent_term.put({__MODULE__, :stopping, name}, true)
+  def mark_stopping(name), do: Runtime.mark_stopping(name)
 
   @doc "Whether node `name` is stopping (`stop/2`, or the application is)."
-  def stopping?(name),
-    do:
-      :persistent_term.get({__MODULE__, :stopping, name}, false) or
-        :persistent_term.get({__MODULE__, :stopping, :all}, false)
+  def stopping?(name), do: Runtime.stopping?(name)
 
   @doc "Registered names of the node's components."
   def names(prefix \\ __MODULE__) do
     %{
+      runtime: Module.concat(prefix, Runtime),
+      handles: Runtime.handles_table(prefix),
       headers: Module.concat(prefix, Headers),
       addrman: Module.concat(prefix, AddrMan),
       sync: Module.concat(prefix, SyncState),
@@ -260,15 +259,16 @@ defmodule Exnode.Node do
     name = Keyword.get(opts, :name, __MODULE__)
     n = names(name)
     # A node started again under this name is running, not stopping.
-    :persistent_term.erase({__MODULE__, :stopping, name})
+    Runtime.clear_stopping(name)
     datadir = Keyword.fetch!(opts, :datadir)
     budget = fd_budget!(opts)
 
-    {:ok, kv} =
-      KV.open(Path.join([datadir, Atom.to_string(chain), "index"]),
-        max_open_files: budget.table_files,
-        block_cache_bytes: Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
-      )
+    kv_path = Path.join([datadir, Atom.to_string(chain), "index"])
+
+    kv_opts = [
+      max_open_files: budget.table_files,
+      block_cache_bytes: Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
+    ]
 
     clock = Keyword.get_lazy(opts, :clock, &Exnode.Clock.new/0)
 
@@ -349,14 +349,15 @@ defmodule Exnode.Node do
     indexes =
       if(Keyword.get(opts, :block_filter_index, false),
         do: [
-          {Exnode.Index.BlockFilter, name: n.filter_index, kv: kv, chain_state: n.chain_state}
+          {Exnode.Index.BlockFilter,
+           name: n.filter_index, node_name: name, chain_state: n.chain_state}
         ],
         else: []
       ) ++
         if(Keyword.get(opts, :index_scripthash, false),
           do: [
             {Exnode.Index.Scripthash,
-             name: n.scripthash_index, kv: kv, chain_state: n.chain_state}
+             name: n.scripthash_index, node_name: name, chain_state: n.chain_state}
           ],
           else: []
         )
@@ -377,21 +378,35 @@ defmodule Exnode.Node do
       indexes ++
         rpc_children(opts, n, node, params, datadir, chain) ++ rest_children(opts, n, params)
 
-    # First, so it stops last, erases published persistent_term handles and
-    # closes the store after all its users.
-    pterms = [
+    # First, so it stops last: opens RocksDB in init/1, publishes it in the
+    # per-node Handles ETS table, and on terminate erases published handles
+    # and closes the store after all its users.
+    # ScriptExec's worker fence key is intentionally omitted: it holds only
+    # PIDs (no %KV{} ref) and must survive a Node.Runtime crash/restart so the
+    # restarted ScriptExec still awaits any lingering dirty-NIF workers.
+    cleanup_keys = [
       {Exnode.Chain.Headers, n.headers},
       {Exnode.Chain.State, n.chain_state},
-      {Exnode.Validation.ScriptExec, :workers, n.script_exec},
       {Exnode.Index.BlockFilter, n.filter_index},
       {Exnode.Index.Scripthash, n.scripthash_index}
     ]
 
+    runtime_spec =
+      {Runtime,
+       name: n.runtime,
+       node_name: name,
+       kv_path: kv_path,
+       kv_opts: kv_opts,
+       cleanup_keys: cleanup_keys}
+
     children =
-      [{Exnode.Store.KVOwner, {kv, pterms}} | shadow] ++
+      [runtime_spec | shadow] ++
         [
           {Headers,
-           name: n.headers, params: params, kv: kv, now: fn -> Exnode.Clock.now(clock) end},
+           name: n.headers,
+           params: params,
+           node_name: name,
+           now: fn -> Exnode.Clock.now(clock) end},
           # Before the chain state (rest_for_one): an executor restart
           # restarts it, and the executor waits for its old workers' native
           # calls before taking new work (ScriptExec moduledoc).
@@ -412,9 +427,9 @@ defmodule Exnode.Node do
             listeners: [n.block_download],
             gc_probe: Keyword.get(opts, :gc_probe, true),
             name: n.chain_state,
+            node_name: name,
             params: params,
             headers: n.headers,
-            kv: kv,
             assume_valid: Keyword.get(opts, :assume_valid),
             prune_witness: Keyword.get(opts, :prune_witness, false),
             commit_at_tip: Keyword.get(opts, :commit_at_tip, true),

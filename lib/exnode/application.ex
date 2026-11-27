@@ -8,8 +8,7 @@ defmodule Exnode.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: Exnode.Worker.start_link(arg)
-      # {Exnode.Worker, arg}
+      Exnode.Node.Handles
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

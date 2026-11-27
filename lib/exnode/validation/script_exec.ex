@@ -36,7 +36,7 @@ defmodule Exnode.Validation.ScriptExec do
     kill after the shutdown timeout) does not interrupt a native call: each
     worker finishes its job, then sees the exit and leaves. A restarted
     executor with the same name first waits for the previous executor's
-    workers to exit (their pids are kept in `:persistent_term`), so a
+    workers to exit (their pids are kept in `Exnode.Node.Runtime`), so a
     restart never adds capacity while old native work still runs;
   * `terminate/2` (normal shutdown) asks every worker to stop after its
     current job and waits for all of them.
@@ -58,6 +58,7 @@ defmodule Exnode.Validation.ScriptExec do
   require Logger
 
   alias Exnode.Kernel
+  alias Exnode.Node.Runtime
   alias Exnode.Validation.Scripts
 
   def default_workers do
@@ -123,7 +124,7 @@ defmodule Exnode.Validation.ScriptExec do
     Process.flag(:trap_exit, true)
     name = opts[:name]
     # Fence: the previous executor's workers finish their native jobs first.
-    if name, do: await_old_workers(:persistent_term.get({__MODULE__, :workers, name}, []))
+    if name, do: await_old_workers(Runtime.get_handle({__MODULE__, :workers, name}, []))
     n = Keyword.get(opts, :workers) || default_workers()
     run = Keyword.get(opts, :run, &run_job/1)
     exec = self()
@@ -174,7 +175,7 @@ defmodule Exnode.Validation.ScriptExec do
   defp publish_workers(%{name: nil}), do: :ok
 
   defp publish_workers(st),
-    do: :persistent_term.put({__MODULE__, :workers, st.name}, Map.keys(st.workers))
+    do: Runtime.put_handle({__MODULE__, :workers, st.name}, Map.keys(st.workers))
 
   defp spawn_worker(exec, run) do
     spawn_link(fn ->
@@ -334,6 +335,9 @@ defmodule Exnode.Validation.ScriptExec do
       receive do: ({:DOWN, ^ref, _, _, _} -> :ok)
     end
 
+    # Only erase the fence once every worker has exited; a crash or shutdown
+    # timeout skips this so the restarted executor still awaits lingering work.
+    if st.name, do: Runtime.delete_handle({__MODULE__, :workers, st.name})
     :ok
   end
 

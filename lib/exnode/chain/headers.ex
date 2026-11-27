@@ -14,7 +14,7 @@ defmodule Exnode.Chain.Headers do
 
   Readers get the index with `index/1` and then read the ETS tables
   directly. For a registered server, `index/1` and `best_header/1` do not
-  call this process: the index handle is published in `:persistent_term`
+  call this process: the index handle is published in `Exnode.Node.Runtime`
   at init (as `Chain.State.view/1`), because this process can be blocked
   for seconds (e.g. on a long `invalidate/3`) and a 5 s call timeout
   there used to crash callers such as `P2P.BlockDownload`.
@@ -29,6 +29,7 @@ defmodule Exnode.Chain.Headers do
   alias Exnode.Chain.HeaderIndex, as: Index
   alias Exnode.Chain.Headers.Writer
   alias Exnode.Codec.Header
+  alias Exnode.Node.Runtime
   alias Exnode.Store.KV
   alias Exnode.Validation.Header, as: HeaderRules
 
@@ -40,7 +41,7 @@ defmodule Exnode.Chain.Headers do
   name; a pid (tests) falls back to a call.
   """
   def index(server) when is_atom(server) do
-    case :persistent_term.get({__MODULE__, server}, nil) do
+    case Runtime.get_handle({__MODULE__, server}, nil) do
       nil -> GenServer.call(server, :index)
       idx -> idx
     end
@@ -81,13 +82,18 @@ defmodule Exnode.Chain.Headers do
   @impl true
   def init(opts) do
     %ChainParams{} = p = Keyword.fetch!(opts, :params)
-    kv = Keyword.get(opts, :kv)
+
+    kv =
+      case Keyword.fetch(opts, :kv) do
+        {:ok, kv} -> kv
+        :error -> if node_name = opts[:node_name], do: Runtime.kv(node_name), else: nil
+      end
 
     idx = Index.insert(Index.new(), Index.make_entry(p.genesis.header, nil))
     idx = if kv, do: load(idx, kv), else: idx
 
     # Trapping exits so terminate/2 runs on a supervisor shutdown and drains
-    # the writer before the store closes (KVOwner stops after this process).
+    # the writer before the store closes (Node.Runtime stops after this process).
     writer =
       if kv do
         Process.flag(:trap_exit, true)
@@ -96,7 +102,7 @@ defmodule Exnode.Chain.Headers do
       end
 
     # Published only once loaded, so readers never see a half-loaded tree.
-    if name = opts[:name], do: :persistent_term.put({__MODULE__, name}, idx)
+    if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, idx)
     {:ok, %{params: p, idx: idx, writer: writer, now: Keyword.get(opts, :now)}}
   end
 
