@@ -381,10 +381,12 @@ defmodule Exnode.Node do
     # First, so it stops last: opens RocksDB in init/1, publishes it in the
     # per-node Handles ETS table, and on terminate erases published handles
     # and closes the store after all its users.
+    # ScriptExec's worker fence key is intentionally omitted: it holds only
+    # PIDs (no %KV{} ref) and must survive a Node.Runtime crash/restart so the
+    # restarted ScriptExec still awaits any lingering dirty-NIF workers.
     cleanup_keys = [
       {Exnode.Chain.Headers, n.headers},
       {Exnode.Chain.State, n.chain_state},
-      {Exnode.Validation.ScriptExec, :workers, n.script_exec},
       {Exnode.Index.BlockFilter, n.filter_index},
       {Exnode.Index.Scripthash, n.scripthash_index}
     ]

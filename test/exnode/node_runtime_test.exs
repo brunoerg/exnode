@@ -142,6 +142,73 @@ defmodule Exnode.NodeRuntimeTest do
     assert State.tip(n.chain_state).hash == b6.header.hash
   end
 
+  test "killing Node.Runtime preserves ScriptExec worker fence across restart", %{tmp_dir: dir} do
+    %{n: n, name: name} = TestNode.start(dir, script_workers: 1)
+
+    rt_before = GenServer.whereis(n.runtime)
+    exec_before = GenServer.whereis(n.script_exec)
+
+    # Hold the ScriptExec worker in a blocking `pre` hook (simulating a long
+    # dirty NIF) and kill ScriptExec so its worker outlives the executor while
+    # Node.Runtime restarts.
+    test_pid = self()
+
+    ScriptExec.submit(n.script_exec, [
+      %{
+        tag: :fence_test,
+        group: :fence_test,
+        prio: {0, 0},
+        checks: [],
+        flags: 0,
+        pre: fn ->
+          send(test_pid, {:worker_in_flight, self()})
+          receive do: (:release -> :ok)
+        end
+      }
+    ])
+
+    assert_receive {:worker_in_flight, lingering_worker}, 2_000
+    on_exit(fn -> send(lingering_worker, :release) end)
+
+    # Kill Node.Runtime first so the supervisor stops downstream children in
+    # reverse order: ChainState stops, then ScriptExec blocks in terminate/2
+    # waiting on lingering_worker.
+    Process.exit(rt_before, :kill)
+    wait_until(fn -> GenServer.whereis(n.chain_state) == nil end)
+
+    # Simulate a ScriptExec shutdown timeout (:kill) while lingering_worker is
+    # still running native work. The supervisor then restarts Node.Runtime
+    # (running Runtime.init/1) before restarting ScriptExec.
+    Process.exit(exec_before, :kill)
+
+    # Wait for Node.Runtime to come back with a fresh pid; the supervisor must
+    # then block inside ScriptExec.init/1's await_old_workers/1 (so ChainState
+    # has not started and no replacement worker pool has been published).
+    wait_until(fn ->
+      rt = GenServer.whereis(n.runtime)
+      is_pid(rt) and rt != rt_before
+    end)
+
+    Process.sleep(100)
+    assert Process.alive?(lingering_worker)
+    assert Runtime.get_handle({ScriptExec, :workers, n.script_exec}, []) == [lingering_worker]
+    assert GenServer.whereis(n.chain_state) == nil
+
+    # Release the lingering worker; ScriptExec finishes init and ChainState comes up.
+    send(lingering_worker, :release)
+
+    wait_until(fn -> GenServer.whereis(n.chain_state) != nil end)
+
+    new_workers = Runtime.get_handle({ScriptExec, :workers, n.script_exec}, [])
+    assert length(new_workers) == 1
+    assert lingering_worker not in new_workers
+    assert ScriptExec.stats(n.script_exec).workers == 1
+
+    # Normal shutdown clears the worker fence once all workers exit.
+    :ok = stop_supervised(name)
+    assert Runtime.get_handle({ScriptExec, :workers, n.script_exec}, :missing) == :missing
+  end
+
   test "Chain.View is :protected ETS and latches ibd_done concurrently from non-owner processes",
        %{tmp_dir: dir} do
     %{n: n} = TestNode.start(dir)

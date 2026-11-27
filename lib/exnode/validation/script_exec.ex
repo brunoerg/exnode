@@ -335,6 +335,9 @@ defmodule Exnode.Validation.ScriptExec do
       receive do: ({:DOWN, ^ref, _, _, _} -> :ok)
     end
 
+    # Only erase the fence once every worker has exited; a crash or shutdown
+    # timeout skips this so the restarted executor still awaits lingering work.
+    if st.name, do: Runtime.delete_handle({__MODULE__, :workers, st.name})
     :ok
   end
 
