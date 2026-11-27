@@ -97,6 +97,8 @@ defmodule Exnode.Chain.State do
     batch_ms: @batch_ms,
     batch_ms_behind: @batch_ms_behind,
     near_tip_blocks: @near_tip_blocks,
+    snapshot_every_commits: 1,
+    commits_since_snapshot: 0,
     prefetch_depth: @prefetch_depth,
     pf_stats: %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0},
     pf_logged: %{used: 0, revalidated: 0, reval_dropped: 0, stale: 0, none: 0},
@@ -361,6 +363,7 @@ defmodule Exnode.Chain.State do
       batch_ms: Keyword.get(opts, :batch_ms, @batch_ms),
       batch_ms_behind: Keyword.get(opts, :batch_ms_behind, @batch_ms_behind),
       near_tip_blocks: Keyword.get(opts, :near_tip_blocks, @near_tip_blocks),
+      snapshot_every_commits: max(1, Keyword.get(opts, :snapshot_every_commits, 1)),
       prefetch_depth: Keyword.get(opts, :prefetch_depth, @prefetch_depth),
       catch_up_chunk: Keyword.get(opts, :catch_up_chunk, 128),
       commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
@@ -477,19 +480,18 @@ defmodule Exnode.Chain.State do
       end
 
     a = Archive.flush(st.a, extra_ops) |> note_durable()
-    a = maybe_snapshot_and_prune(st, a)
+    st = maybe_snapshot_after_commit(st, a)
 
     if split_store?(st) and hashes != [] do
       :ok = KV.write(st.staging_kv, for(h <- hashes, do: {:delete, :pending, h}), sync: false)
     end
 
     View.unhold_many(st.view, hashes)
-    View.put_committed(st.view, a)
+    View.put_committed(st.view, st.a)
 
     %{
       st
-      | a: a,
-        canonical_headers_count: new_headers_count,
+      | canonical_headers_count: new_headers_count,
         round_connected: st.uncommitted ++ st.round_connected,
         uncommitted: []
     }
@@ -497,11 +499,40 @@ defmodule Exnode.Chain.State do
 
   defp split_store?(%__MODULE__{kv: kv, staging_kv: skv}), do: kv != skv
 
-  defp maybe_snapshot_and_prune(%__MODULE__{chain_dir: nil}, a), do: a
+  defp maybe_snapshot_after_commit(%__MODULE__{chain_dir: nil} = st, a), do: %{st | a: a}
 
-  defp maybe_snapshot_and_prune(%__MODULE__{chain_dir: dir}, a) do
+  defp maybe_snapshot_after_commit(st, a) do
+    next_since = st.commits_since_snapshot + 1
+    best = HeaderIndex.best(Headers.index(st.headers))
+    tip = Archive.committed_tip(a)
+    near_tip? = best.height - tip.height < st.near_tip_blocks
+
+    if st.snapshot_every_commits <= 1 or near_tip? or next_since >= st.snapshot_every_commits or
+         st.halted != false do
+      take_snapshot_and_prune(st, a)
+    else
+      %{st | a: a, commits_since_snapshot: next_since}
+    end
+  end
+
+  defp take_snapshot_and_prune(%__MODULE__{chain_dir: nil} = st, a), do: %{st | a: a}
+
+  defp take_snapshot_and_prune(%__MODULE__{chain_dir: dir} = st, a) do
+    t0 = System.monotonic_time(:microsecond)
     {:ok, safe_wpruned} = take_canonical_snapshot!(a, dir)
-    Archive.finalize_pruned_witness(a, safe_wpruned)
+    a = Archive.finalize_pruned_witness(a, safe_wpruned)
+    us = System.monotonic_time(:microsecond) - t0
+    snap_work = %{snapshots: 1, snapshot_us: us, snapshot_max_us: us}
+
+    %{
+      st
+      | a: a,
+        commits_since_snapshot: 0,
+        cs_work: Telemetry.add_work(st.cs_work, snap_work),
+        cs_window: Telemetry.add_work(st.cs_window, snap_work)
+    }
+    |> update_pstats(%{snap_count: 1, snap_us: us})
+    |> hwm(:snap_max_us, us)
   end
 
   defp take_canonical_snapshot!(a, chain_dir) do
@@ -795,17 +826,17 @@ defmodule Exnode.Chain.State do
 
   defp do_handle_call(:clear_halt, _from, st) do
     Quarantine.clear_halt_mark(st.kv, st.view)
-    a = maybe_snapshot_and_prune(st, st.a)
+    st = take_snapshot_and_prune(st, st.a)
     Logger.warning("block connection halt cleared (was #{inspect(st.halted)})")
-    {:reply, st.halted, queue_drive(%{st | a: a, halted: false, retarget: true})}
+    {:reply, st.halted, queue_drive(%{st | halted: false, retarget: true})}
   end
 
   defp do_handle_call(:poisoned, _from, st), do: {:reply, MapSet.to_list(st.poisoned), st}
 
   defp do_handle_call({:reconsider_poisoned, which}, from, st) do
     {hashes, poisoned} = Quarantine.clear_poisoned(st.kv, st.view, st.poisoned, which)
-    a = maybe_snapshot_and_prune(st, st.a)
-    st = %{st | a: a, poisoned: poisoned}
+    st = take_snapshot_and_prune(st, st.a)
+    st = %{st | poisoned: poisoned}
 
     st =
       Enum.reduce(hashes, st, fn h, st ->
@@ -875,16 +906,17 @@ defmodule Exnode.Chain.State do
     if clean_reason? and durable_current?(st.a) and not Guard.faulted?(st.guard) do
       try do
         st = commit(st)
-        # On clean shutdown with snapshots enabled, ensure the latest state
-        # (and any 1-snapshot-deferred witness pruning) is captured before close.
-        a =
-          if st.chain_dir != nil and st.a.wpruned > st.a.wpruned_deleted do
-            maybe_snapshot_and_prune(st, st.a)
+        # On clean shutdown with snapshots enabled, ensure any deferred IBD
+        # snapshot or 1-snapshot-deferred witness pruning is captured before close.
+        st =
+          if st.chain_dir != nil and
+               (st.commits_since_snapshot > 0 or st.a.wpruned > st.a.wpruned_deleted) do
+            take_snapshot_and_prune(st, st.a)
           else
-            st.a
+            st
           end
 
-        Archive.close(a)
+        Archive.close(st.a)
         Guard.mark_clean_close!(st.guard)
       catch
         kind, err ->
@@ -921,9 +953,9 @@ defmodule Exnode.Chain.State do
   defp do_handle_cast({:halt, reason}, %__MODULE__{halted: false} = st) do
     Logger.error("block connection halted: #{inspect(reason)}")
     Quarantine.put_halt_mark(st.kv, st.view, reason, Archive.tip(st.a))
-    a = maybe_snapshot_and_prune(st, st.a)
+    st = take_snapshot_and_prune(st, st.a)
     ack_halt(st)
-    {:noreply, queue_drive(%{st | a: a, halted: reason})}
+    {:noreply, queue_drive(%{st | halted: reason})}
   end
 
   defp do_handle_cast({:halt, _reason}, st) do
@@ -1091,8 +1123,8 @@ defmodule Exnode.Chain.State do
           [{:put, :meta, Headers.headers_count_key(), <<new_count::32>>}]
 
       :ok = KV.write(st.kv, ops, sync: true)
-      a = maybe_snapshot_and_prune(st, st.a)
-      %{st | a: a, canonical_headers_count: new_count}
+      st = take_snapshot_and_prune(st, st.a)
+      %{st | canonical_headers_count: new_count}
     else
       st
     end
@@ -2113,11 +2145,11 @@ defmodule Exnode.Chain.State do
 
       old = Archive.tip(st.a).hash
       {a, _id} = Archive.disconnect_tip(st.a)
-      a = maybe_snapshot_and_prune(st, a)
-      note_durable(a)
-      View.publish(st.view, a)
+      st = take_snapshot_and_prune(st, a)
+      note_durable(st.a)
+      View.publish(st.view, st.a)
       notify(st, {:block_disconnected, old})
-      disconnect_to(%{st | a: a, disconnected: MapSet.put(st.disconnected, old)}, fork)
+      disconnect_to(%{st | disconnected: MapSet.put(st.disconnected, old)}, fork)
     else
       st
     end
@@ -2284,14 +2316,14 @@ defmodule Exnode.Chain.State do
       st.staging_kv
     )
 
-    a = maybe_snapshot_and_prune(st, st.a)
+    st = take_snapshot_and_prune(st, st.a)
     notify(st, {:block_quarantined, hash, error})
     {source, sources} = Map.pop(st.sources, hash)
 
     if is_pid(source),
       do: send(source, {:block_checked, hash, {:error, {:crash, "validation crashed locally"}}})
 
-    {%{st | a: a}, sources}
+    {st, sources}
   end
 
   defp load_block(st, entry) do

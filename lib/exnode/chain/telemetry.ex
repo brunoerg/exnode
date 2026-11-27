@@ -166,7 +166,8 @@ defmodule Exnode.Chain.Telemetry do
         "perf: #{p.blocks} blk (#{Float.round(p.blocks / secs, 1)}/s) #{p.txs} tx #{p.inputs} in; " <>
           "validate #{ms(p.validate)}ms (resolve #{ms(p.resolve)}ms), script latency #{ms(p.scripts)}ms (overlapping) " <>
           "archive append #{ms(p.archive)}ms; commit #{g.(c, :commits)}x #{ms(g.(c, :commit_us))}ms " <>
-          "(sync #{ms(g.(c, :commit_sync_us))}ms, kv #{ms(g.(c, :commit_kv_us))}ms) over #{Float.round(secs, 1)}s; " <>
+          "(sync #{ms(g.(c, :commit_sync_us))}ms, kv #{ms(g.(c, :commit_kv_us))}ms, " <>
+          "snap #{g.(c, :snapshots)}x #{ms(g.(c, :snapshot_us))}ms) over #{Float.round(secs, 1)}s; " <>
           "prefetch used #{pf.(:used)} revalidated #{pf.(:revalidated)} (dropped #{pf.(:reval_dropped)} answers) stale #{pf.(:stale)} none #{pf.(:none)} wait #{ms(p.pfwait)}ms; " <>
           "prefetch ops #{g.(w, :considered)} omitted #{g.(w, :omitted)} sent #{g.(w, :sent)}, " <>
           "worker busy #{ms(g.(w, :worker_us))}ms (overlapping), worker reads #{g.(w, :output_groups)} groups " <>

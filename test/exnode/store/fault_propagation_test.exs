@@ -400,4 +400,60 @@ defmodule Exnode.Store.FaultPropagationTest do
     :ok = Exnode.Index.BlockFilter.sync_to(n2.filter_index, b2.header.hash)
     :ok = stop_supervised(name2)
   end
+
+  test "snapshot_every_commits defers intermediate IBD snapshots, records timing stats, and snapshots on clean shutdown",
+       %{tmp_dir: dir} do
+    chain_dir = Path.join(dir, "regtest")
+    all = blocks(140)
+    [b1, b2, b3, b4 | _] = all
+
+    %{name: name, n: n} =
+      TestNode.start(dir,
+        batch_blocks: 1,
+        commit_at_tip: false,
+        snapshot_every_commits: 3
+      )
+
+    # Feed 140 headers so best_header is >= 128 blocks ahead (IBD mode).
+    assert {:ok, _} = Headers.process_headers(n.headers, Enum.map(all, & &1.header))
+
+    # Genesis snapshot is taken at boot.
+    assert {:ok, :primary, _, %{tip: %{height: 0}}} =
+             Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
+
+    # Commits 1 and 2 are skipped while in IBD.
+    assert {:ok, :connected} = State.submit_block(n.chain_state, b1)
+    assert {:ok, :connected} = State.submit_block(n.chain_state, b2)
+
+    assert {:ok, :primary, _, %{tip: %{height: 0}}} =
+             Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
+
+    assert Map.get(State.work_stats(n.chain_state).pipeline, :snap_count, 0) == 0
+
+    # Commit 3 reaches snapshot_every_commits -> takes snapshot and records timing counters.
+    assert {:ok, :connected} = State.submit_block(n.chain_state, b3)
+
+    assert {:ok, :primary, _, %{tip: %{height: 3}}} =
+             Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
+
+    stats = State.work_stats(n.chain_state)
+    assert stats.pipeline.snap_count == 1
+    assert stats.pipeline.snap_us >= 0
+    assert stats.pipeline.snap_max_us >= 0
+    assert stats.chain_state.snapshots == 1
+
+    # Commit 4 is deferred until clean shutdown.
+    assert {:ok, :connected} = State.submit_block(n.chain_state, b4)
+
+    assert {:ok, :primary, _, %{tip: %{height: 3}}} =
+             Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
+
+    :ok = stop_supervised(name)
+
+    # Clean shutdown captures the deferred commit so the latest snapshot matches height 4.
+    assert Guard.inspect_lock(chain_dir) == :clean
+
+    assert {:ok, :primary, _, %{tip: %{height: 4}}} =
+             Snapshot.latest_valid(Snapshot.snapshots_dir(chain_dir))
+  end
 end

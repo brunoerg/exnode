@@ -30,6 +30,7 @@ defmodule Exnode.CLI do
     prefetch: :integer,
     batch_blocks: :integer,
     batch_mib: :integer,
+    snapshot_every: :integer,
     chain_state_heap_mib: :integer,
     decode_budget_mib: :integer,
     max_connections: :integer,
@@ -93,6 +94,12 @@ defmodule Exnode.CLI do
             do: opts[:batch_mib] * 1024 * 1024,
             else: elem(Exnode.Chain.State.default_batch_limits(), 1)
           ),
+        # IBD canonical snapshot cadence in commits (always 1 near tip and on clean shutdown).
+        snapshot_every_commits:
+          case Keyword.get(opts, :snapshot_every, 1) do
+            n when is_integer(n) and n >= 1 -> n
+            other -> fail("invalid --snapshot-every #{inspect(other)}; expected integer >= 1")
+          end,
         # The chain state's minimum heap, in words.
         chain_state_min_heap:
           if(opts[:chain_state_heap_mib],

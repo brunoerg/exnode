@@ -530,6 +530,7 @@ defmodule Exnode.Node do
               Keyword.get(opts, :batch_blocks, elem(ChainState.default_batch_limits(), 0)),
             batch_bytes:
               Keyword.get(opts, :batch_bytes, elem(ChainState.default_batch_limits(), 1)),
+            snapshot_every_commits: Keyword.get(opts, :snapshot_every_commits, 1),
             prefetch_depth:
               Keyword.get(opts, :prefetch_depth, Exnode.Chain.State.default_prefetch_depth()),
             mempool: n.mempool,
