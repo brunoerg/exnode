@@ -110,8 +110,8 @@ defmodule Exnode.NodeSupervisionTest do
     ids = for {id, _, _, _} <- Supervisor.which_children(name), do: id
 
     assert Enum.reverse(ids) == [
-             # Stops last: closes the store after everything using it.
-             Exnode.Store.KVOwner,
+             # Stops last: owns Handles ETS and closes the store after everything using it.
+             Exnode.Node.Runtime,
              Exnode.Chain.Headers,
              # The shared script executor, upstream of the chain state.
              Exnode.Validation.ScriptExec,

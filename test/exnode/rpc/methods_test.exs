@@ -22,9 +22,10 @@ defmodule Exnode.RPC.MethodsTest do
   alias Exnode.Codec.{Block, Tx}
   alias Exnode.Crypto.Hash
   alias Exnode.Index.BlockFilter
+  alias Exnode.Node.Runtime
   alias Exnode.REST.Esplora
   alias Exnode.RPC.Methods
-  alias Exnode.Store.{KV, KVOwner}
+  alias Exnode.Store.KV
   alias Exnode.Test.{BlockBuilder, CallTrace, SpendChain}
 
   @moduletag :tmp_dir
@@ -37,7 +38,10 @@ defmodule Exnode.RPC.MethodsTest do
     u = System.unique_integer([:positive])
     {cs, mp, bf} = {:"rpc_cs_#{u}", :"rpc_mp_#{u}", :"rpc_bf_#{u}"}
 
-    start_supervised!({KVOwner, {kv, [{State, cs}, {BlockFilter, bf}]}}, id: :"kvo_#{u}")
+    start_supervised!({Runtime, kv: kv, cleanup_keys: [{State, cs}, {BlockFilter, bf}]},
+      id: :"rt_#{u}"
+    )
+
     hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_#{u}")
 
     start_supervised!(
@@ -121,7 +125,7 @@ defmodule Exnode.RPC.MethodsTest do
     {:ok, kv} = KV.open(Path.join(dir, "kv"))
     u = System.unique_integer([:positive])
     {cs, mp} = {:"rpcp_cs_#{u}", :"rpcp_mp_#{u}"}
-    start_supervised!({KVOwner, {kv, [{State, cs}]}}, id: :"kvo_p_#{u}")
+    start_supervised!({Runtime, kv: kv, cleanup_keys: [{State, cs}]}, id: :"rt_p_#{u}")
     hs = start_supervised!({Headers, params: @p, kv: kv}, id: :"hs_p_#{u}")
 
     start_supervised!(
