@@ -260,6 +260,8 @@ defmodule Exnode.P2P.Peer.Conn do
   defp skip_flush?({:shutdown, {:tcp_error, _}}), do: true
   defp skip_flush?({:shutdown, {:closed, _}}), do: true
   defp skip_flush?({:shutdown, {:reconnect_v1, _}}), do: true
+  defp skip_flush?({:shutdown, :send_buffer_full}), do: true
+  defp skip_flush?({:shutdown, :send_timeout}), do: true
   defp skip_flush?(_), do: false
 
   defp dial(host, port, opts) do

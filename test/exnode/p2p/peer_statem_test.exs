@@ -67,6 +67,19 @@ defmodule Exnode.P2P.PeerStatemTest do
       assert Conn.inactivity_reason(conn, 1_000, 1_050, 60, 1200) == nil
       assert Conn.inactivity_reason(conn, 1_000, 1_003 + 1201, 60, 1200) == :send_timeout
 
+      # Skip flush immediately on send-wedged shutdown reasons even while writer is blocked.
+      blocked_writer = spawn(fn -> receive do: (:never -> :ok) end)
+      on_exit(fn -> Process.exit(blocked_writer, :kill) end)
+
+      for reason <- [{:shutdown, :send_buffer_full}, {:shutdown, :send_timeout}] do
+        {us, :ok} =
+          :timer.tc(fn ->
+            Conn.flush_on_terminate(%{conn | writer: blocked_writer, send_queued: 100}, reason)
+          end)
+
+        assert us < 50_000
+      end
+
       # Safe flush when writer is already dead returns immediately.
       Process.unlink(conn.writer)
       Process.exit(conn.writer, :kill)
