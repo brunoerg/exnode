@@ -116,7 +116,7 @@ defmodule Exnode.P2P.Peer do
   # --- :gen_statem callbacks -------------------------------------------------
 
   @impl :gen_statem
-  def callback_mode, do: [:handle_event_function, :state_enter]
+  def callback_mode, do: :handle_event_function
 
   @impl :gen_statem
   def init(args) do
@@ -165,19 +165,9 @@ defmodule Exnode.P2P.Peer do
     Conn.flush_on_terminate(conn, reason)
   end
 
-  # --- State enter clauses ---------------------------------------------------
-
-  @impl :gen_statem
-  def handle_event(:enter, _old_state, {:ready, :active}, %Data{} = data) do
-    {:keep_state, data}
-  end
-
-  def handle_event(:enter, _old_state, _state, _data) do
-    :keep_state_and_data
-  end
-
   # --- :connecting & :awaiting_socket ----------------------------------------
 
+  @impl :gen_statem
   def handle_event(:internal, :connect, :connecting, %Data{target: target} = data) do
     t = now(data)
 
@@ -401,7 +391,7 @@ defmodule Exnode.P2P.Peer do
     :keep_state_and_data
   end
 
-  # Plan 02 hook: TxRelay notifies Peer when an in-flight tx finishes validation.
+  # TxRelay notifies Peer when an in-flight tx finishes validation.
   def handle_event(
         :info,
         {:tx_done, _ref},
