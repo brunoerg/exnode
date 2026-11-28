@@ -296,10 +296,11 @@ defmodule Exnode.NodeRuntimeTest do
     # Latched: stays false even when clock moves past 24 h.
     assert View.view_ibd?(view, idx, t + 48 * 3600, @p) == false
 
-    # active_gen seqlock slot starts at 0 and bumps monotonically.
-    assert View.view_active_gen(view) == 0
-    assert View.bump_active_gen(view) == 1
-    assert View.view_active_gen(view) == 1
+    # active_gen seqlock slot is even when quiescent and bumps monotonically.
+    gen = View.view_active_gen(view)
+    assert gen > 0 and rem(gen, 2) == 0
+    assert View.bump_active_gen(view) == gen + 1
+    assert View.view_active_gen(view) == gen + 1
   end
 
   test "Scripthash falls back to GenServer.call(:kv) on ETS miss and for unnamed pids", %{

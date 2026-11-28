@@ -42,25 +42,87 @@ defmodule Exnode.P2P.DecodeBudget do
   `:unavailable` (fun not run) if the budget server is not running: it sits
   before the connections in the P2P subtree, so the peers are being
   restarted with it anyway.
-  """
-  def with_budget(nil, _n, fun), do: fun.()
-  def with_budget(_server, n, fun) when n < @min_bytes, do: fun.()
 
-  def with_budget(server, n, fun) do
+  Options:
+    * `:gc` — whether to run `:erlang.garbage_collect/0` after `fun` returns
+      (default `true`). Pass `gc: false` when `fun` delegates its large
+      allocations to a short-lived worker process via `with_worker/4`.
+  """
+  def with_budget(server, n, fun, opts \\ [])
+  def with_budget(nil, _n, fun, _opts), do: fun.()
+  def with_budget(_server, n, fun, _opts) when n < @min_bytes, do: fun.()
+
+  def with_budget(server, n, fun, opts) do
     case acquire(server, n) do
       :ok ->
         try do
           fun.()
         after
-          # The decoded term is garbage once fun returns: collect it before
-          # the bytes are handed to another peer.
-          :erlang.garbage_collect()
+          if Keyword.get(opts, :gc, true) do
+            # The decoded term is garbage once fun returns: collect it before
+            # the bytes are handed to another peer.
+            :erlang.garbage_collect()
+          end
+
           GenServer.cast(server, {:release, self()})
         end
 
       :unavailable ->
         :unavailable
     end
+  end
+
+  @doc """
+  Runs `fun` inside a short-lived worker under `task_sup` while holding `n`
+  bytes of `budget`. When the worker exits, BEAM reclaims its entire heap
+  in O(1) without growing or GC-scanning the caller's heap.
+
+  Falls back to running `fun` inline via `with_budget/3` when `task_sup` is
+  `nil` or not running.
+  """
+  def with_worker(budget, nil, n, fun), do: with_budget(budget, n, fun)
+
+  def with_worker(budget, task_sup, n, fun) do
+    with_budget(
+      budget,
+      n,
+      fn ->
+        case run_in_worker(task_sup, fun) do
+          {:ok, result} ->
+            result
+
+          :fallback ->
+            try do
+              fun.()
+            after
+              if budget != nil and n >= @min_bytes, do: :erlang.garbage_collect()
+            end
+        end
+      end,
+      gc: false
+    )
+  end
+
+  defp run_in_worker(task_sup, fun) do
+    case start_worker(task_sup, fun) do
+      {:ok, task} ->
+        {:ok, Task.await(task, :infinity)}
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp start_worker(task_sup, fun) do
+    if GenServer.whereis(task_sup) != nil do
+      # Linked to the caller so if Peer dies (:kill, eviction, writer crash),
+      # the decode worker dies with it instead of outliving its budget grant.
+      {:ok, Task.Supervisor.async(task_sup, fun)}
+    else
+      :fallback
+    end
+  catch
+    :exit, {:noproc, _} -> :fallback
   end
 
   defp acquire(server, n) do

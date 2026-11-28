@@ -1,13 +1,21 @@
 defmodule Exnode.P2P.Listener do
   @moduledoc """
   Accepts inbound connections and starts one `Peer` per socket under the
-  peer supervisor, subject to `Connman.accept_inbound?/1`.
+  peer supervisor, subject to `Connman.accept_inbound?/3`.
 
   The listening socket is bound in `init/1`, so a bind failure fails the
   start and `port/1` answers as soon as the node is up; `port: 0` binds an
-  ephemeral port (tests). A linked acceptor process runs the accept loop
-  (any process may accept on a listening socket); either one exiting takes
-  the other down, and the supervisor restarts the pair.
+  ephemeral port (tests). A linked `:proc_lib` acceptor process runs the
+  accept loop (any process may accept on a listening socket); either one
+  exiting takes the other down, and the supervisor restarts the pair.
+
+  Calls into `Connman` (`accept_inbound?/3` and `register_inbound/4`) are
+  bounded by `@connman_timeout_ms` (default 5 s) so a stalled `Connman`
+  cannot wedge the accept loop indefinitely; timed-out or unregistered
+  connections are closed cleanly. Trade-off: if `Connman` is merely slow
+  (> 5 s) rather than dead, `accept_inbound?/3` still completes inside
+  `Connman` and may evict an existing inbound peer for a connection the
+  listener already closed on timeout.
 
   An accept error does not end the loop (Core AcceptConnection logs "socket
   error accept failed" and goes on): under fd exhaustion (`:emfile`,
@@ -24,6 +32,8 @@ defmodule Exnode.P2P.Listener do
   @backlog 4096
   # Pause after an accept error, so fd exhaustion is not a busy loop.
   @accept_backoff_ms 100
+  # Bound Connman handoff calls so a slow Connman cannot wedge the acceptor.
+  @connman_timeout_ms 5_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
@@ -48,12 +58,18 @@ defmodule Exnode.P2P.Listener do
 
     {:ok, bound} = :inet.port(lsock)
     Logger.info("listening for peers on port #{bound}")
-    acceptor = spawn_link(fn -> loop(lsock, opts) end)
+    {:ok, acceptor} = :proc_lib.start_link(__MODULE__, :init_acceptor, [self(), lsock, opts])
     {:ok, %{lsock: lsock, port: bound, acceptor: acceptor}}
   end
 
   @impl true
   def handle_call(:port, _from, st), do: {:reply, st.port, st}
+
+  @doc false
+  def init_acceptor(parent, lsock, opts) do
+    :proc_lib.init_ack(parent, {:ok, self()})
+    loop(lsock, opts)
+  end
 
   defp loop(lsock, opts) do
     accept = Keyword.get(opts, :accept, &:gen_tcp.accept/1)
@@ -75,6 +91,7 @@ defmodule Exnode.P2P.Listener do
 
   defp handle_accepted(sock, opts) do
     connman = Keyword.fetch!(opts, :connman)
+    timeout = Keyword.get(opts, :connman_timeout_ms, @connman_timeout_ms)
 
     target =
       case :inet.peername(sock) do
@@ -82,7 +99,7 @@ defmodule Exnode.P2P.Listener do
         _ -> nil
       end
 
-    if Connman.accept_inbound?(connman, target) do
+    if accept_inbound?(connman, target, timeout) do
       node = Map.put(Keyword.fetch!(opts, :node), :connman, connman)
       # Core CreateNodeFromAcceptedSocket: V2Transport whenever we signal
       # NODE_P2P_V2; it falls back to v1 when the peer speaks v1.
@@ -99,11 +116,11 @@ defmodule Exnode.P2P.Listener do
         {:ok, pid} ->
           case :gen_tcp.controlling_process(sock, pid) do
             :ok ->
-              if registered?(connman, pid, target) do
+              if registered?(connman, pid, target, timeout) do
                 send(pid, {:socket_ready, sock})
               else
-                # Connman is restarting: an untracked peer would escape the
-                # inbound limit and eviction. Refuse the connection.
+                # Connman is restarting or timed out: an untracked peer would
+                # escape the inbound limit and eviction. Refuse the connection.
                 :gen_tcp.close(sock)
                 Process.exit(pid, :kill)
               end
@@ -122,9 +139,25 @@ defmodule Exnode.P2P.Listener do
     end
   end
 
-  defp registered?(connman, pid, target) do
-    Connman.register_inbound(connman, pid, target) == :ok
+  defp accept_inbound?(connman, target, timeout) do
+    Connman.accept_inbound?(connman, target, timeout)
   catch
-    :exit, _ -> false
+    :exit, {:timeout, _} ->
+      Logger.warning("listener: Connman.accept_inbound? timed out after #{timeout} ms")
+      false
+
+    :exit, _ ->
+      false
+  end
+
+  defp registered?(connman, pid, target, timeout) do
+    Connman.register_inbound(connman, pid, target, timeout) == :ok
+  catch
+    :exit, {:timeout, _} ->
+      Logger.warning("listener: Connman.register_inbound timed out after #{timeout} ms")
+      false
+
+    :exit, _ ->
+      false
   end
 end

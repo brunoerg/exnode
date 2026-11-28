@@ -12,7 +12,9 @@ defmodule Exnode.Chain.QuarantineTest do
   5. A consensus-invalid block still fails as before (header invalidated).
   Peers never punish a `:crash` or `:quarantined` result.
   """
-  use Exnode.NodeCase, async: true
+  # Uses capture_log assertions (including `refute log =~ ...`), which capture
+  # global Logger output across concurrent tests; must run synchronously.
+  use Exnode.NodeCase, async: false
   import ExUnit.CaptureLog
 
   alias Exnode.ChainParams

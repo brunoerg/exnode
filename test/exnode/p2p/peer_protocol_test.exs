@@ -59,7 +59,8 @@ defmodule Exnode.P2P.PeerProtocolTest do
     {pid, sock, clock, ref}
   end
 
-  defp handshaked(pid), do: wait_until(fn -> :sys.get_state(pid).verack_received end)
+  defp peer_data(pid), do: elem(:sys.get_state(pid), 1)
+  defp handshaked(pid), do: wait_until(fn -> match?({{:ready, _}, _}, :sys.get_state(pid)) end)
 
   # Ticks every 5 min up to `deadline`, answering a ping each time, so only
   # the headers-sync deadline can end the peer.
@@ -178,7 +179,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
       :ok = FakePeer.send_msgs(out_sock, [{:version, FakePeer.version()}, :verack])
       wait_until(fn -> Registry.lookup(n.local_nonces, nonce) == [] end)
       {pid, ref} = self_conn.()
-      wait_until(fn -> :sys.get_state(pid).version != nil end)
+      wait_until(fn -> peer_data(pid).handshake.version != nil end)
       refute_received {:DOWN, ^ref, _, _, _}
     end
 
@@ -187,7 +188,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
       handshaked(pid)
       :ok = FakePeer.send_msgs(sock, {:version, FakePeer.version(user_agent: "/second/")})
       until_pong(sock, 41)
-      assert :sys.get_state(pid).version.user_agent == "/fake/"
+      assert peer_data(pid).handshake.version.user_agent == "/fake/"
     end
 
     test "a second verack is ignored: the verack replies are sent once", %{n: n} do
@@ -309,13 +310,13 @@ defmodule Exnode.P2P.PeerProtocolTest do
   defp announce_tip(n, pid, sock) do
     tip = Exnode.Chain.State.view_tip(Exnode.Chain.State.view(n.chain_state))
     :ok = FakePeer.send_msgs(sock, {:inv, [%{type: :block, hash: tip.hash}]})
-    wait_until(fn -> :sys.get_state(pid).best_known != nil end)
+    wait_until(fn -> peer_data(pid).proto.best_known != nil end)
   end
 
   describe "timeouts" do
     test "no handshake within 60 s", %{n: n} do
       {pid, _sock, clock, ref} = connect(n, handshake: false)
-      wait_until(fn -> :sys.get_state(pid).connected_at != nil end)
+      wait_until(fn -> peer_data(pid).handshake.connected_at != nil end)
       Clock.advance(clock, 60)
       :ok = Clock.tick(pid)
       assert Process.alive?(pid)
@@ -349,7 +350,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
       # deadline = now + 15 min + 1 ms per expected header) and registers
       # the peer as preferred with BlockDownload.
       :ok = Clock.tick(pid)
-      deadline = :sys.get_state(pid).headers_sync_timeout
+      deadline = peer_data(pid).proto.headers_sync_timeout
       assert is_integer(deadline)
 
       # Past the deadline, the only preferred peer: kept, deadline kept.
@@ -357,14 +358,14 @@ defmodule Exnode.P2P.PeerProtocolTest do
       Clock.advance(clock, deadline - Clock.now(clock) + 1)
       :ok = Clock.tick(pid)
       assert Process.alive?(pid)
-      assert :sys.get_state(pid).headers_sync_timeout == deadline
+      assert peer_data(pid).proto.headers_sync_timeout == deadline
 
       # A second outbound peer connects (not syncing: one sync at a time
       # while our best header is old): the next pass disconnects the first.
       {pid2, _sock2, _clock2, _ref2} = connect(n, node: bd)
       handshaked(pid2)
       :ok = Clock.tick(pid2)
-      refute :sys.get_state(pid2).sync_started
+      refute peer_data(pid2).proto.sync_started
       :ok = Clock.tick(pid)
       assert_stopped(ref, :headers_sync_timeout)
     end
@@ -373,7 +374,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
       {pid, sock, clock, _ref} = connect(n, node: %{block_download: n.block_download})
       handshaked(pid)
       :ok = Clock.tick(pid)
-      deadline = :sys.get_state(pid).headers_sync_timeout
+      deadline = peer_data(pid).proto.headers_sync_timeout
 
       # One header timed at the deadline makes our best header recent.
       {tip, ""} = Exnode.Codec.Header.decode(Exnode.Chain.Headers.best_header(n.headers).raw)
@@ -385,7 +386,7 @@ defmodule Exnode.P2P.PeerProtocolTest do
       Clock.advance(clock, deadline - Clock.now(clock) + 1)
       :ok = Clock.tick(pid)
       assert Process.alive?(pid)
-      assert :sys.get_state(pid).headers_sync_timeout == nil
+      assert peer_data(pid).proto.headers_sync_timeout == nil
     end
   end
 
@@ -426,28 +427,28 @@ defmodule Exnode.P2P.PeerProtocolTest do
       {pid, sock, clock, _ref} = connect(n, conn_type: :block_relay)
       handshaked(pid)
       :ok = Clock.tick(pid)
-      deadline = :sys.get_state(pid).chain_sync.timeout
+      deadline = peer_data(pid).proto.chain_sync.timeout
       responsive_until(pid, sock, clock, deadline)
       Clock.advance(clock, deadline - Clock.now(clock) + 1)
       :ok = Clock.tick(pid)
-      assert :sys.get_state(pid).chain_sync.sent_getheaders
+      assert peer_data(pid).proto.chain_sync.sent_getheaders
 
       announce_tip(n, pid, sock)
       Clock.advance(clock, 121)
       :ok = Clock.tick(pid)
       until_pong(sock, System.unique_integer([:positive]))
       assert Process.alive?(pid)
-      assert :sys.get_state(pid).chain_sync.timeout == nil
+      assert peer_data(pid).proto.chain_sync.timeout == nil
     end
 
     test "a manual peer is not checked", %{n: n} do
       {pid, sock, clock, _ref} = connect(n, conn_type: :manual)
       handshaked(pid)
       :ok = Clock.tick(pid)
-      assert :sys.get_state(pid).sync_started
-      assert :sys.get_state(pid).chain_sync.timeout == nil
+      assert peer_data(pid).proto.sync_started
+      assert peer_data(pid).proto.chain_sync.timeout == nil
       responsive_until(pid, sock, clock, Clock.now(clock) + 30 * 60)
-      assert :sys.get_state(pid).chain_sync.timeout == nil
+      assert peer_data(pid).proto.chain_sync.timeout == nil
     end
 
     test "at most 4 outbound full-relay peers with our tip's work are protected", %{n: n} do
@@ -459,11 +460,11 @@ defmodule Exnode.P2P.PeerProtocolTest do
           {pid, sock, _clock, _ref} = connect(n, conn_type: ct)
           handshaked(pid)
           :ok = FakePeer.send_msgs(sock, {:headers, [h]})
-          wait_until(fn -> :sys.get_state(pid).best_known != nil end)
+          wait_until(fn -> peer_data(pid).proto.best_known != nil end)
           {ct, pid}
         end
 
-      protected = for {ct, pid} <- peers, :sys.get_state(pid).chain_sync.protect, do: ct
+      protected = for {ct, pid} <- peers, peer_data(pid).proto.chain_sync.protect, do: ct
       assert protected == List.duplicate(:outbound_full_relay, 4)
     end
   end

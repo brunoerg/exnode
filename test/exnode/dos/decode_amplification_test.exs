@@ -197,15 +197,15 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
     head = binary_part(frame, 0, byte_size(frame) - 1)
     last = binary_part(frame, byte_size(frame), -1)
 
-    # One peer alone: the peak of one decode.
+    # One peer alone: the peak of one decode (peer + decode worker processes).
     [single] = connect(n, 1)
-    single_peak = release_and_measure([single], head, last)
+    single_peak = release_and_measure([single], n.decode_sup, head, last)
     IO.puts("one peer, one 4 MB witness-item block: peak #{div(single_peak, 1_000_000)} MB")
 
     # Several peers, each with the whole frame but its last byte buffered,
-    # released at once: the sum of their memory, sampled together.
+    # released at once: the sum of their memory (plus decode workers), sampled together.
     peers = connect(n, @attackers)
-    total_peak = release_and_measure(peers, head, last)
+    total_peak = release_and_measure(peers, n.decode_sup, head, last)
 
     IO.puts(
       "#{@attackers} peers released together: summed peak #{div(total_peak, 1_000_000)} MB " <>
@@ -228,16 +228,19 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
   # together; samples the sum of the peers' memory until every peer has
   # handled its block (each is then disconnected: the block's parent is
   # unknown). Returns the peak sum.
-  defp release_and_measure(peers, head, last) do
+  defp release_and_measure(peers, decode_sup, head, last) do
     for %{sock: s} <- peers, do: :ok = :gen_tcp.send(s, head)
     # Every peer holds its partial frame.
     for %{pid: p} <- peers do
-      wait_until(fn -> FrameBuffer.size(:sys.get_state(p).buf) == byte_size(head) end, 30_000)
+      wait_until(
+        fn -> FrameBuffer.size(elem(:sys.get_state(p), 1).conn.buf) == byte_size(head) end,
+        30_000
+      )
     end
 
     test = self()
     pids = for %{pid: p} <- peers, do: p
-    sampler = spawn(fn -> sample(pids, 0, test) end)
+    sampler = spawn(fn -> sample(pids, decode_sup, 0, test) end)
     for %{sock: s} <- peers, do: :gen_tcp.send(s, last)
 
     for %{ref: ref} <- peers do
@@ -250,14 +253,21 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
     peak
   end
 
-  defp sample(pids, peak, test) do
+  defp sample(pids, decode_sup, peak, test) do
     receive do
       :stop -> send(test, {:peak, peak})
     after
       1 ->
+        workers =
+          try do
+            Task.Supervisor.children(decode_sup)
+          catch
+            :exit, _ -> []
+          end
+
         total =
           Enum.sum(
-            for p <- pids do
+            for p <- pids ++ workers do
               case :erlang.process_info(p, :memory) do
                 {:memory, m} -> m
                 _ -> 0
@@ -265,7 +275,7 @@ defmodule Exnode.DoS.DecodeAmplificationTest do
             end
           )
 
-        sample(pids, max(total, peak), test)
+        sample(pids, decode_sup, max(total, peak), test)
     end
   end
 end

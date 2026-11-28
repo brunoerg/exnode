@@ -36,8 +36,14 @@ defmodule Exnode.P2P.RequestedBlockTest do
 
     {pid, sock} = FakePeer.connect_from(n, node: %{block_download: n.block_download})
     :erlang.trace_pattern({State, :check_block, 2}, true, [])
+    :erlang.trace(:new_processes, true, [:call])
     :erlang.trace(pid, true, [:call])
-    on_exit(fn -> :erlang.trace_pattern({State, :check_block, 2}, false, []) end)
+
+    on_exit(fn ->
+      :erlang.trace(:new_processes, false, [:call])
+      :erlang.trace_pattern({State, :check_block, 2}, false, [])
+    end)
+
     picked = BlockDownload.request(n.block_download, pid, List.last(more).header.hash)
     assert hd(picked) == at.(151).header.hash
     assert at.(441).header.hash in picked
@@ -51,8 +57,8 @@ defmodule Exnode.P2P.RequestedBlockTest do
     refute held?.(460)
     assert Process.alive?(pid)
     refute Map.has_key?(BlockDownload.in_flight(n.block_download), at.(441).header.hash)
-    assert_receive {:trace, ^pid, :call, {State, :check_block, [checked, _]}}
+    assert_receive {:trace, _worker_or_peer, :call, {State, :check_block, [checked, _]}}
     assert checked.header.hash == at.(441).header.hash
-    refute_receive {:trace, ^pid, :call, {State, :check_block, _}}, 50
+    refute_receive {:trace, _, :call, {State, :check_block, _}}, 50
   end
 end

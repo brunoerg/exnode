@@ -83,7 +83,12 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
       )
 
     send(pid, {:send, {:sendcmpct, %{announce: true, version: 2}}})
-    wait_until(fn -> :sys.get_state(pid).hb_selected and :sys.get_state(pid).provides_cmpct end)
+
+    wait_until(fn ->
+      {_, d} = :sys.get_state(pid)
+      d.proto != nil and d.proto.hb_selected and d.proto.provides_cmpct
+    end)
+
     {pid, sock, clock, ref}
   end
 
@@ -206,11 +211,15 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     # !fMayBan from mapBlockSource).
     rebuilt = :crypto.strong_rand_bytes(32)
     {pid, sock, _clock, ref} = hb_peer(n, bs)
-    :sys.replace_state(pid, &%{&1 | rebuilt_deferred: [rebuilt]})
+
+    :sys.replace_state(pid, fn {s, d} ->
+      {s, %{d | proto: %{d.proto | rebuilt_deferred: [rebuilt]}}}
+    end)
+
     send(pid, {:block_checked, rebuilt, {:error, {:consensus, "bad-cb-amount"}}})
     before_pong(sock)
     refute_received {:DOWN, ^ref, _, _, _}
-    assert :sys.get_state(pid).rebuilt_deferred == []
+    assert elem(:sys.get_state(pid), 1).proto.rebuilt_deferred == []
 
     send(
       pid,
@@ -302,7 +311,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     Clock.advance(clock, 1)
     :ok = Clock.tick(pid)
     assert getdata_block?(before_pong(sock), b.header.hash)
-    assert :sys.get_state(pid).partials == %{}
+    assert elem(:sys.get_state(pid), 1).proto.partials == %{}
   end
 
   test "a block that arrives another way ends its reconstruction without a request",
@@ -313,7 +322,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     {:ok, :connected} = State.submit_block(n.chain_state, b)
     Clock.advance(clock, 1)
     :ok = Clock.tick(pid)
-    assert :sys.get_state(pid).partials == %{}
+    assert elem(:sys.get_state(pid), 1).proto.partials == %{}
     refute getdata_block?(before_pong(sock), b.header.hash)
   end
 
@@ -323,7 +332,7 @@ defmodule Exnode.P2P.CompactBlockPeerTest do
     :ok = FakePeer.send_msgs(sock, cmpct(held))
     msgs = before_pong(sock)
     refute Enum.any?(msgs, &match?({:getdata, _}, &1))
-    assert :sys.get_state(pid).partials == %{}
+    assert elem(:sys.get_state(pid), 1).proto.partials == %{}
   end
 
   # Regression: a reconstruction was not registered with

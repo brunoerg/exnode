@@ -63,6 +63,8 @@ defmodule Exnode.P2P.TxRelay do
   # Core: m_tx_inventory_known_filter{50000, 0.000001} (net_processing.cpp).
   @known_cap 50_000
   @known_fp 1.0e-6
+  # Max concurrent async orphan reconsiderations in flight at once.
+  @max_orphan_in_flight 4
 
   @transient ["mempool busy", "tip-changed", "script-check-crashed"]
 
@@ -93,6 +95,15 @@ defmodule Exnode.P2P.TxRelay do
 
   @doc "A tx a peer sent: `ProcessTransaction` inline, as `inv/3` (`:ok`)."
   def received_tx(server, peer, tx), do: peer_call(server, {:tx, peer, tx}, :ok)
+
+  @doc """
+  Non-blocking tx submission from a `Peer`. `TxRelay` dispatches verification
+  asynchronously and sends `{:tx_done, ref}` back to `peer` when validation
+  completes (immediately if already known or rejected synchronously), plus
+  `:novel_tx` when accepted.
+  """
+  def submit_tx(server, peer, ref, tx),
+    do: GenServer.cast(server, {:submit_tx, peer, ref, tx})
 
   @doc """
   A peer's notfound tx items (Core ReceivedNotFound). A call, as `inv/3`: the
@@ -136,7 +147,13 @@ defmodule Exnode.P2P.TxRelay do
 
     base = %{
       mempool: Keyword.fetch!(opts, :mempool),
+      mempool_policies: Keyword.get(opts, :mempool_policies, false),
+      async_mempool: Keyword.get(opts, :async_mempool, false),
       peers: %{},
+      monitors: %{},
+      # ref => pending async mempool acceptance/package/orphan job
+      pending_jobs: %{},
+      orphan_in_flight: 0,
       ann: %{},
       ann_peers: %{},
       ann_seq: 0,
@@ -238,33 +255,45 @@ defmodule Exnode.P2P.TxRelay do
 
   @impl true
   def handle_cast({:connected, peer, info}, st) do
-    Process.monitor(peer)
-    now = st.now.()
-    st = refresh_our_feefilter(st, now)
-    relay_txs = Map.get(info, :relay_txs, false)
-    sent_rate = if relay_txs, do: st.our_feefilter, else: 0
+    if Map.has_key?(st.peers, peer) do
+      {:noreply, update_in(st.peers[peer], &Map.merge(&1, info))}
+    else
+      st =
+        if Map.has_key?(st.monitors, peer),
+          do: st,
+          else: %{st | monitors: Map.put(st.monitors, peer, Process.monitor(peer))}
 
-    p =
-      Map.merge(
-        %{
-          known: nil,
-          known_in: nil,
-          to_send: [],
-          feefilter: 0,
-          sent_feefilter: sent_rate,
-          next_feefilter_at: now + exp_delay(@feefilter_interval_ms),
-          next_inv_at: now + inv_delay(info),
-          last_inv_seq: 0
-        },
-        info
-      )
+      now = st.now.()
+      st = refresh_our_feefilter(st, now)
+      relay_txs = Map.get(info, :relay_txs, false)
+      sent_rate = if relay_txs, do: st.our_feefilter, else: 0
 
-    # Core SendMessages: send feefilter only to peers that relay transactions.
-    if relay_txs, do: send(peer, {:send, {:feefilter, sent_rate}})
-    {:noreply, %{st | peers: Map.put(st.peers, peer, p)}}
+      p =
+        Map.merge(
+          %{
+            known: nil,
+            known_in: nil,
+            to_send: [],
+            feefilter: 0,
+            sent_feefilter: sent_rate,
+            next_feefilter_at: now + exp_delay(@feefilter_interval_ms),
+            next_inv_at: now + inv_delay(info),
+            last_inv_seq: 0
+          },
+          info
+        )
+
+      # Core SendMessages: send feefilter only to peers that relay transactions.
+      if relay_txs, do: send(peer, {:send, {:feefilter, sent_rate}})
+      {:noreply, %{st | peers: Map.put(st.peers, peer, p)}}
+    end
   end
 
   def handle_cast({:announce, tx, source}, st), do: {:noreply, queue_announce(st, tx, source)}
+
+  def handle_cast({:submit_tx, peer, ref, tx}, st) do
+    {:noreply, start_received_tx(st, peer, tx, {:notify, peer, ref})}
+  end
 
   # --- calls ---------------------------------------------------------------------
 
@@ -328,7 +357,9 @@ defmodule Exnode.P2P.TxRelay do
     end
   end
 
-  def handle_call({:tx, peer, tx}, _from, st), do: {:reply, :ok, received_tx_impl(st, peer, tx)}
+  def handle_call({:tx, peer, tx}, from, st) do
+    {:noreply, start_received_tx(st, peer, tx, {:reply, from})}
+  end
 
   def handle_call({:notfound, peer, items}, _from, st) do
     rt =
@@ -427,19 +458,72 @@ defmodule Exnode.P2P.TxRelay do
     {:noreply, st |> orphan_work_step() |> schedule_orphan_work()}
   end
 
-  def handle_info({:DOWN, _, :process, peer, _}, st) do
+  def handle_info({{:tx_verdict, ref}, result}, st) do
+    case Map.pop(st.pending_jobs, ref) do
+      {nil, _} ->
+        {:noreply, st}
+
+      {job, jobs} ->
+        st = %{st | pending_jobs: jobs}
+        {:noreply, handle_verdict(st, job, result)}
+    end
+  end
+
+  def handle_info({{:pkg_verdict, ref}, result}, st) do
+    case Map.pop(st.pending_jobs, ref) do
+      {nil, _} ->
+        {:noreply, st}
+
+      {job, jobs} ->
+        st = %{st | pending_jobs: jobs}
+        {:noreply, handle_package_verdict(st, job, result)}
+    end
+  end
+
+  def handle_info({{:orphan_verdict, ref}, result}, st) do
+    case Map.pop(st.pending_jobs, ref) do
+      {nil, _} ->
+        {:noreply, st}
+
+      {job, jobs} ->
+        st = %{st | pending_jobs: jobs, orphan_in_flight: max(st.orphan_in_flight - 1, 0)}
+        {:noreply, handle_orphan_verdict(st, job, result)}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, peer, _}, st) do
+    case Map.get(st.monitors, peer) do
+      ^ref ->
+        drop_peer(st, peer)
+
+      nil ->
+        {:noreply, st}
+
+      other_ref ->
+        # A test may inject a synthetic {:DOWN, make_ref(), :process, peer, _}
+        # to simulate an ordered disconnect without killing the peer process.
+        if Map.has_key?(st.peers, peer) do
+          Process.demonitor(other_ref, [:flush])
+          drop_peer(st, peer)
+        else
+          {:noreply, st}
+        end
+    end
+  end
+
+  def handle_info(_msg, st), do: {:noreply, st}
+
+  defp drop_peer(st, peer) do
     orph = Orphanage.erase_for_peer(Orphanage.from_state(st), peer)
     rt = RequestTracker.drop_peer(RequestTracker.from_state(st), peer)
 
     st =
-      %{st | peers: Map.delete(st.peers, peer)}
+      %{st | peers: Map.delete(st.peers, peer), monitors: Map.delete(st.monitors, peer)}
       |> put_orphanage(orph)
       |> put_tracker(rt)
 
     {:noreply, st}
   end
-
-  def handle_info(_msg, st), do: {:noreply, st}
 
   # --- state adapters -----------------------------------------------------------
 
@@ -554,7 +638,16 @@ defmodule Exnode.P2P.TxRelay do
 
   # --- receiving a tx -----------------------------------------------------------
 
-  defp received_tx_impl(st, peer, tx) do
+  defp finish_tx_caller({:reply, from}), do: GenServer.reply(from, :ok)
+
+  defp finish_tx_caller({:notify, peer, ref}) do
+    if is_pid(peer), do: send(peer, {:tx_done, ref})
+    :ok
+  end
+
+  defp finish_tx_caller(:none), do: :ok
+
+  defp start_received_tx(st, peer, tx, caller) do
     st =
       update_tracker(st, fn rt ->
         rt |> RequestTracker.complete(peer, tx.txid) |> RequestTracker.complete(peer, tx.wtxid)
@@ -562,24 +655,48 @@ defmodule Exnode.P2P.TxRelay do
 
     cond do
       already_have?(st, {:wtxid, tx.wtxid}, false) ->
+        finish_tx_caller(caller)
         st
 
       f_has?(st.reconsiderable, tx.wtxid) ->
-        try_1p1c(st, tx, peer)
+        try_1p1c(st, tx, peer, caller)
 
       true ->
-        process_tx(st, peer, tx, true)
+        process_tx(st, peer, tx, true, caller)
     end
   end
 
-  defp process_tx(st, peer, tx, first_time) do
-    case Mempool.accept(st.mempool, tx) do
+  defp process_tx(%{async_mempool: true} = st, peer, tx, first_time, caller) do
+    ref = make_ref()
+
+    case Mempool.accept_async(st.mempool, tx, self(), {:tx_verdict, ref}) do
+      :ok ->
+        job = %{peer: peer, tx: tx, first_time: first_time, caller: caller}
+        %{st | pending_jobs: Map.put(st.pending_jobs, ref, job)}
+
+      {:error, e} ->
+        handle_verdict(
+          st,
+          %{peer: peer, tx: tx, first_time: first_time, caller: caller},
+          {:error, e}
+        )
+    end
+  end
+
+  defp process_tx(st, peer, tx, first_time, caller) do
+    result = Mempool.accept(st.mempool, tx)
+    handle_verdict(st, %{peer: peer, tx: tx, first_time: first_time, caller: caller}, result)
+  end
+
+  defp handle_verdict(st, %{peer: peer, tx: tx, first_time: first_time, caller: caller}, result) do
+    case result do
       {:ok, _res} ->
         if is_pid(peer), do: send(peer, :novel_tx)
+        finish_tx_caller(caller)
         accepted(st, tx, peer)
 
       {:error, e} ->
-        rejected(st, tx, e, peer, first_time)
+        rejected(st, tx, e, peer, first_time, caller)
     end
   end
 
@@ -605,6 +722,10 @@ defmodule Exnode.P2P.TxRelay do
     put_orphanage(st, orph)
   end
 
+  defp orphan_work_step(%{async_mempool: true, orphan_in_flight: n} = st)
+       when n >= @max_orphan_in_flight,
+       do: st
+
   defp orphan_work_step(st) do
     case Orphanage.pop_next_work_peer(Orphanage.from_state(st)) do
       {:empty, orph} ->
@@ -612,7 +733,14 @@ defmodule Exnode.P2P.TxRelay do
 
       {:ok, peer, orph} ->
         st = process_peer_orphan_work(put_orphanage(st, orph), peer)
-        update_orphanage(st, &Orphanage.requeue_work_peer(&1, peer))
+        st = update_orphanage(st, &Orphanage.requeue_work_peer(&1, peer))
+
+        if st.async_mempool and st.orphan_in_flight < @max_orphan_in_flight and
+             not :queue.is_empty(st.orphan_work_peers) do
+          orphan_work_step(st)
+        else
+          st
+        end
     end
   end
 
@@ -631,23 +759,26 @@ defmodule Exnode.P2P.TxRelay do
     end
   end
 
-  defp reconsider_orphan(st, w, peer) do
+  defp reconsider_orphan(%{async_mempool: true} = st, w, peer) do
     case st.orphans do
       %{^w => o} ->
         st = update_orphanage(st, &Orphanage.drop(&1, [w]))
+        ref = make_ref()
 
-        case Mempool.accept(st.mempool, o.tx) do
-          {:ok, _} ->
-            {:decisive, accepted(st, o.tx, peer)}
+        case Mempool.accept_async(st.mempool, o.tx, self(), {:orphan_verdict, ref}) do
+          :ok ->
+            job = %{peer: peer, w: w, orphan: o}
 
-          {:error, %{result: :missing_inputs}} ->
-            {:continue, update_orphanage(st, &Orphanage.put(&1, w, o))}
+            st = %{
+              st
+              | pending_jobs: Map.put(st.pending_jobs, ref, job),
+                orphan_in_flight: st.orphan_in_flight + 1
+            }
 
-          {:error, e} when e.result == :reconsiderable and e.reason in @transient ->
-            {:decisive, update_orphanage(st, &Orphanage.put(&1, w, o))}
+            {:decisive, st}
 
           {:error, e} ->
-            {:decisive, rejected(st, o.tx, e, peer, false)}
+            handle_orphan_result(st, w, o, peer, {:error, e})
         end
 
       _ ->
@@ -655,42 +786,91 @@ defmodule Exnode.P2P.TxRelay do
     end
   end
 
-  defp rejected(st, _tx, e, _peer, _first_time)
-       when e.result == :reconsiderable and e.reason in @transient,
-       do: st
+  defp reconsider_orphan(st, w, peer) do
+    case st.orphans do
+      %{^w => o} ->
+        st = update_orphanage(st, &Orphanage.drop(&1, [w]))
+        handle_orphan_result(st, w, o, peer, Mempool.accept(st.mempool, o.tx))
 
-  defp rejected(st, tx, %{reason: "txn-already-in-mempool"}, _peer, _first_time),
-    do: update_orphanage(st, &Orphanage.drop(&1, [tx.wtxid]))
+      _ ->
+        {:continue, st}
+    end
+  end
 
-  defp rejected(st, tx, e, peer, first_time) do
-    st =
-      case e.result do
-        :missing_inputs ->
-          if first_time and not f_has?(st.rejects, tx.wtxid),
-            do: add_orphan(st, tx, peer),
-            else: st
+  defp handle_orphan_verdict(st, %{peer: peer, w: w, orphan: o}, result) do
+    case handle_orphan_result(st, w, o, peer, result) do
+      {:decisive, st} ->
+        st |> orphan_work_step() |> schedule_orphan_work()
 
-        :witness_stripped ->
+      {:continue, st} ->
+        st |> process_peer_orphan_work(peer) |> orphan_work_step() |> schedule_orphan_work()
+    end
+  end
+
+  defp handle_orphan_result(st, w, o, peer, result) do
+    case result do
+      {:ok, _} ->
+        {:decisive, accepted(st, o.tx, peer)}
+
+      {:error, %{result: :missing_inputs}} ->
+        {:continue, update_orphanage(st, &Orphanage.put(&1, w, o))}
+
+      {:error, e} when e.result == :reconsiderable and e.reason in @transient ->
+        {:decisive, update_orphanage(st, &Orphanage.put(&1, w, o))}
+
+      {:error, e} ->
+        {:decisive, rejected(st, o.tx, e, peer, false, :none)}
+    end
+  end
+
+  defp rejected(st, _tx, e, _peer, _first_time, caller)
+       when e.result == :reconsiderable and e.reason in @transient do
+    finish_tx_caller(caller)
+    st
+  end
+
+  defp rejected(st, tx, %{reason: "txn-already-in-mempool"}, _peer, _first_time, caller) do
+    finish_tx_caller(caller)
+    update_orphanage(st, &Orphanage.drop(&1, [tx.wtxid]))
+  end
+
+  defp rejected(st, tx, e, peer, first_time, caller) do
+    case e.result do
+      :missing_inputs ->
+        finish_tx_caller(caller)
+
+        if first_time and not f_has?(st.rejects, tx.wtxid),
+          do: add_orphan(st, tx, peer),
+          else: st
+
+      :witness_stripped ->
+        finish_tx_caller(caller)
+        update_orphanage(st, &Orphanage.drop(&1, [tx.wtxid]))
+
+      :reconsiderable ->
+        st =
+          %{st | reconsiderable: f_insert(st.reconsiderable, tx.wtxid)}
+          |> update_orphanage(&Orphanage.drop(&1, [tx.wtxid]))
+
+        if first_time do
+          try_1p1c(st, tx, peer, caller)
+        else
+          finish_tx_caller(caller)
           st
+        end
 
-        :reconsiderable ->
-          st = %{st | reconsiderable: f_insert(st.reconsiderable, tx.wtxid)}
-          if first_time, do: try_1p1c(st, tx, peer), else: st
+      other ->
+        finish_tx_caller(caller)
+        rejects = f_insert(st.rejects, tx.wtxid)
 
-        other ->
-          rejects = f_insert(st.rejects, tx.wtxid)
+        rejects =
+          if other == :inputs_not_standard and tx.has_witness,
+            do: f_insert(rejects, tx.txid),
+            else: rejects
 
-          rejects =
-            if other == :inputs_not_standard and tx.has_witness,
-              do: f_insert(rejects, tx.txid),
-              else: rejects
-
-          %{st | rejects: rejects}
-      end
-
-    if e.result != :missing_inputs,
-      do: update_orphanage(st, &Orphanage.drop(&1, [tx.wtxid])),
-      else: st
+        %{st | rejects: rejects}
+        |> update_orphanage(&Orphanage.drop(&1, [tx.wtxid]))
+    end
   end
 
   defp add_orphan(st, tx, peer) do
@@ -724,7 +904,7 @@ defmodule Exnode.P2P.TxRelay do
     |> update_tracker(&RequestTracker.delete_hashes(&1, [tx.txid, tx.wtxid]))
   end
 
-  defp try_1p1c(st, parent, peer) do
+  defp try_1p1c(st, parent, peer, caller) do
     child =
       st
       |> Orphanage.from_state()
@@ -739,22 +919,44 @@ defmodule Exnode.P2P.TxRelay do
 
     case child do
       nil ->
+        finish_tx_caller(caller)
         st
 
       child ->
-        res = Mempool.submit_package(st.mempool, [parent, child])
-
-        if res.state == :ok do
-          st = update_orphanage(st, &Orphanage.drop(&1, [child.wtxid]))
-          st = accepted(st, parent, peer)
-          accepted(st, child, peer)
+        if st.async_mempool do
+          ref = make_ref()
+          Mempool.submit_package_async(st.mempool, [parent, child], self(), {:pkg_verdict, ref})
+          job = %{peer: peer, parent: parent, child: child, caller: caller}
+          %{st | pending_jobs: Map.put(st.pending_jobs, ref, job)}
         else
-          st = %{st | reconsiderable: f_insert(st.reconsiderable, package_hash([parent, child]))}
+          res = Mempool.submit_package(st.mempool, [parent, child])
 
-          st
-          |> package_tx_result(child, res.txs[child.wtxid], peer)
-          |> package_tx_result(parent, res.txs[parent.wtxid], peer)
+          handle_package_verdict(
+            st,
+            %{peer: peer, parent: parent, child: child, caller: caller},
+            res
+          )
         end
+    end
+  end
+
+  defp handle_package_verdict(
+         st,
+         %{peer: peer, parent: parent, child: child, caller: caller},
+         res
+       ) do
+    finish_tx_caller(caller)
+
+    if res.state == :ok do
+      st = update_orphanage(st, &Orphanage.drop(&1, [child.wtxid]))
+      st = accepted(st, parent, peer)
+      accepted(st, child, peer)
+    else
+      st = %{st | reconsiderable: f_insert(st.reconsiderable, package_hash([parent, child]))}
+
+      st
+      |> package_tx_result(child, res.txs[child.wtxid], peer)
+      |> package_tx_result(parent, res.txs[parent.wtxid], peer)
     end
   end
 
@@ -762,7 +964,7 @@ defmodule Exnode.P2P.TxRelay do
     do: accepted(update_orphanage(st, &Orphanage.drop(&1, [tx.wtxid])), tx, peer)
 
   defp package_tx_result(st, tx, {:invalid, %{result: r} = e}, peer) when r != :missing_inputs,
-    do: rejected(st, tx, e, peer, false)
+    do: rejected(st, tx, e, peer, false, :none)
 
   defp package_tx_result(st, _tx, _result, _peer), do: st
 
@@ -784,6 +986,8 @@ defmodule Exnode.P2P.TxRelay do
 
   # Core PeerManagerImpl::ReattemptInitialBroadcast: every 10..15 min on the
   # node clock, re-queue unbroadcast mempool txids for inv announcement.
+  defp maybe_rebroadcast(%{mempool_policies: false} = st, _now), do: st
+
   defp maybe_rebroadcast(st, now) do
     cond do
       # Clock moved backwards (e.g. setmocktime after node startup): rebase timer.
@@ -823,15 +1027,12 @@ defmodule Exnode.P2P.TxRelay do
   end
 
   defp fetch_unbroadcast_txids(mempool) do
-    if real_mempool?(mempool) do
-      try do
-        Mempool.unbroadcast_txids(mempool)
-      catch
-        :exit, _ -> []
-      end
-    else
-      []
+    case GenServer.call(mempool, :unbroadcast_txids, 5_000) do
+      txids when is_list(txids) -> txids
+      _ -> []
     end
+  catch
+    :exit, _ -> []
   end
 
   # Core BIP133 dynamic feefilter: update `relay_txs` peers when
@@ -874,30 +1075,21 @@ defmodule Exnode.P2P.TxRelay do
 
   defp material_feefilter_change?(rate, sent), do: 4 * rate < 3 * sent or 3 * rate > 4 * sent
 
+  defp refresh_our_feefilter(%{mempool_policies: false} = st, now),
+    do: %{st | last_feefilter_check: now}
+
   defp refresh_our_feefilter(st, now) do
     rate =
-      if real_mempool?(st.mempool) do
-        try do
-          {min_fee, opts} = Mempool.fee_info(st.mempool)
-          max(min_fee, opts.min_relay)
-        catch
-          :exit, _ -> st.our_feefilter
+      try do
+        case Mempool.fee_info(st.mempool) do
+          {min_fee, %{min_relay: min_relay}} -> max(min_fee, min_relay)
+          _ -> st.our_feefilter
         end
-      else
-        st.our_feefilter
+      catch
+        :exit, _ -> st.our_feefilter
       end
 
     %{st | our_feefilter: rate, last_feefilter_check: now}
-  end
-
-  defp real_mempool?(server) do
-    with pid when is_pid(pid) <- GenServer.whereis(server),
-         {:dictionary, dict} <- Process.info(pid, :dictionary),
-         {Exnode.Mempool, :init, 1} <- Keyword.get(dict, :"$initial_call") do
-      true
-    else
-      _ -> false
-    end
   end
 
   defp process_inv_backlog(st, now) do

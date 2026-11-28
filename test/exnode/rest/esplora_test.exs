@@ -355,7 +355,9 @@ defmodule Exnode.REST.EsploraTest do
   test "/utxo skips rows of blocks a reorg replaced before the index rewound", %{tmp_dir: dir} do
     n = start(dir)
     # The index stops following: its rows for 129 and 130 stay.
-    GenServer.stop(n.idx)
+    # Use stop_supervised! so ExUnit's test supervisor does not restart the
+    # permanent child and let it tick/rewind during the reorg.
+    :ok = stop_supervised!(n.ctx.scripthash_index)
     addr = "/address/#{Address.from_script(SpendChain.spk(), :regtest)}/utxo"
     {200, before} = req(Esplora, n.ctx, :get, addr)
 
