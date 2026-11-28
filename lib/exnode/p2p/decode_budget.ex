@@ -104,16 +104,20 @@ defmodule Exnode.P2P.DecodeBudget do
   end
 
   defp run_in_worker(task_sup, fun) do
+    case start_worker(task_sup, fun) do
+      {:ok, task} ->
+        {:ok, Task.await(task, :infinity)}
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp start_worker(task_sup, fun) do
     if GenServer.whereis(task_sup) != nil do
-      task = Task.Supervisor.async_nolink(task_sup, fun)
-
-      case Task.yield(task, :infinity) do
-        {:ok, result} ->
-          {:ok, result}
-
-        {:exit, reason} ->
-          exit(reason)
-      end
+      # Linked to the caller so if Peer dies (:kill, eviction, writer crash),
+      # the decode worker dies with it instead of outliving its budget grant.
+      {:ok, Task.Supervisor.async(task_sup, fun)}
     else
       :fallback
     end

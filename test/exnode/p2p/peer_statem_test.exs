@@ -375,6 +375,32 @@ defmodule Exnode.P2P.PeerStatemTest do
 
       assert_receive {:trace, ^runner, :call, {:erlang, :garbage_collect, []}}, 1_000
     end
+
+    test "killing caller mid-decode terminates linked DecodeSup worker", %{n: n} do
+      parent = self()
+
+      caller =
+        spawn(fn ->
+          Exnode.P2P.DecodeBudget.with_worker(
+            n.decode_budget,
+            n.decode_sup,
+            Exnode.P2P.DecodeBudget.min_bytes(),
+            fn ->
+              send(parent, {:worker_started, self()})
+              Process.sleep(:infinity)
+            end
+          )
+        end)
+
+      assert_receive {:worker_started, worker_pid}, 1_000
+      assert worker_pid != caller
+      worker_ref = Process.monitor(worker_pid)
+
+      Process.exit(caller, :kill)
+
+      assert_receive {:DOWN, ^worker_ref, :process, ^worker_pid, :killed}, 1_000
+      wait_until(fn -> Exnode.P2P.DecodeBudget.info(n.decode_budget).holders == 0 end)
+    end
   end
 
   describe "P2P.Listener bounded Connman handoff" do
