@@ -1,0 +1,38 @@
+--- a/c_src/erocksdb_iter.cc
++++ b/c_src/erocksdb_iter.cc
+@@ -386,6 +386,12 @@ IteratorMove(
+         if(ATOM_FIRST == action_or_target) itr->SeekToFirst();
+         if(ATOM_LAST == action_or_target) itr->SeekToLast();
+ 
++        rocksdb::Status pre_status = itr->status();
++        if(!pre_status.ok())
++        {
++            return error_tuple(env, ATOM_ERROR, pre_status);
++        }
++
+         if(!itr->Valid())
+         {
+             return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
+@@ -429,16 +435,16 @@ IteratorMove(
+         itr->Seek(key);
+     }
+ 
+-    if(!itr->Valid())
+-    {
+-        return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
+-    }
+-
+     rocksdb::Status status = itr->status();
+ 
+     if(!status.ok())
+     {
+         return error_tuple(env, ATOM_ERROR, status);
+     }
+ 
++    if(!itr->Valid())
++    {
++        return enif_make_tuple2(env, ATOM_ERROR, ATOM_INVALID_ITERATOR);
++    }
++
+     return enif_make_tuple3(env, ATOM_OK, slice_to_binary(env, itr->key()), slice_to_binary(env, itr->value()));
+ }   // erocksdb::IteratorMove

@@ -28,7 +28,8 @@ defmodule Exnode.P2P.PeerFile do
          :ok <- :file.write(f, data),
          :ok <- :file.sync(f),
          :ok <- :file.close(f),
-         :ok <- File.rename(tmp, path) do
+         :ok <- File.rename(tmp, path),
+         :ok <- Exnode.Store.Guard.sync_dir!(Path.dirname(path)) do
       :ok
     else
       err ->

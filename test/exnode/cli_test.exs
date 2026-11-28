@@ -79,4 +79,35 @@ defmodule Exnode.CLITest do
     assert code2 == 1
     assert out2 =~ "not enough file descriptors"
   end
+
+  test "restore reports already-clean stores and rejects unknown chains or missing datadirs", %{
+    tmp_dir: dir
+  } do
+    {out, code} =
+      run_cli(
+        ~s|'Elixir.Exnode.CLI':restore([<<"--chain">>, <<"notachain">>, <<"--datadir">>, <<"#{dir}">>])|
+      )
+
+    assert code == 1
+    assert out =~ "unknown chain notachain"
+
+    {out2, code2} =
+      run_cli(
+        ~s|'Elixir.Exnode.CLI':restore([<<"--chain">>, <<"regtest">>, <<"--datadir">>, <<"#{dir}">>])|
+      )
+
+    assert code2 == 1
+    assert out2 =~ "store directory does not exist"
+
+    chain_dir = Path.join(dir, "regtest")
+    File.mkdir_p!(chain_dir)
+
+    {out3, code3} =
+      run_cli(
+        ~s|'Elixir.Exnode.CLI':restore([<<"--chain">>, <<"regtest">>, <<"--datadir">>, <<"#{dir}">>])|
+      )
+
+    assert code3 == 0
+    assert out3 =~ "closed cleanly; nothing to restore"
+  end
 end

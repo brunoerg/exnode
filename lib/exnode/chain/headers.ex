@@ -1,16 +1,18 @@
 defmodule Exnode.Chain.Headers do
   @moduledoc """
   Owns the header tree. It is the single writer of the `HeaderIndex` ETS
-  tables and persists every accepted header to the RocksDB `headers` column
-  family, so a restart does not resync.
+  tables and persists accepted headers so restarts do not resync.
 
-  The KV writes go through `Headers.Writer`, so this process never waits on
-  RocksDB: the chain state's commit is one large write that a header write
-  would otherwise queue behind for seconds, stalling every peer delivering
-  headers. The ETS update and the reply happen at once; the put follows in
-  order. `invalidate/3` waits for its write (after everything queued before
-  it), so a `:failed` mark is never overtaken by an older put, and
-  `flush/1` waits for everything queued so far.
+  In split-store node mode (`staging_kv` provided):
+  * Authoritative headers (committed blocks and `:failed` invalidations) live
+    in canonical `kv` (`:headers` CF), written exclusively by `Chain.State`
+    inside synced canonical commits and verified by `"headers_count"` on load.
+  * Newly received ahead-of-tip P2P headers are written asynchronously by
+    `Headers.Writer` to ephemeral `staging_kv` (`:headers_cache` CF,
+    `sync: false`), with zero contention against canonical commits.
+
+  In standalone mode (`staging_kv` omitted, unit tests):
+  * `Headers.Writer` persists accepted headers directly to `kv` (`:headers` CF).
 
   Readers get the index with `index/1` and then read the ETS tables
   directly. For a registered server, `index/1` and `best_header/1` do not
@@ -30,10 +32,19 @@ defmodule Exnode.Chain.Headers do
   alias Exnode.Chain.Headers.Writer
   alias Exnode.Codec.Header
   alias Exnode.Node.Runtime
+  alias Exnode.StorageError
   alias Exnode.Store.KV
   alias Exnode.Validation.Header, as: HeaderRules
 
+  @headers_count_key "headers_count"
+
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+
+  @doc "Metadata key storing the canonical `:headers` row count."
+  def headers_count_key, do: @headers_count_key
+
+  @doc "Encodes header entries as canonical `:headers` KV put ops."
+  def canonical_ops(entries), do: for(e <- entries, do: {:put, :headers, e.hash, encode(e)})
 
   @doc """
   The index (ETS handles; `HeaderIndex.best/1` reads the best header). Safe
@@ -65,17 +76,24 @@ defmodule Exnode.Chain.Headers do
     do: GenServer.call(server, {:process, headers, opts}, :infinity)
 
   @doc """
-  Marks a block and its descendants invalid (persisted), recalculating the
-  best header (at least `fallback_hash`, the active tip) if it descended
-  from the block. Waits with no timeout: the chain state holds `cs_main` in
-  Core across this, and the descendant scan is O(index).
+  Marks a block and its descendants invalid, recalculating the best header
+  (at least `fallback_hash`, the active tip) if it descended from the block.
   """
-  def invalidate(server, hash, fallback_hash),
+  def invalidate(server, hash, fallback_hash) do
+    _ = invalidate_entries(server, hash, fallback_hash)
+    :ok
+  end
+
+  @doc """
+  Same as `invalidate/3`, returning the newly failed header entries so the
+  canonical writer (`Chain.State`) can persist them synchronously in split mode.
+  """
+  def invalidate_entries(server, hash, fallback_hash),
     do: GenServer.call(server, {:invalidate, hash, fallback_hash}, :infinity)
 
   @doc """
-  Waits until every header accepted so far is written to the KV (a no-op
-  without a KV). `process_headers/3` returns before its write lands.
+  Waits until every header accepted so far is written to the writer's KV
+  (a no-op without a writer).
   """
   def flush(server), do: GenServer.call(server, :flush, :infinity)
 
@@ -89,21 +107,42 @@ defmodule Exnode.Chain.Headers do
         :error -> if node_name = opts[:node_name], do: Runtime.kv(node_name), else: nil
       end
 
+    staging_kv =
+      case Keyword.fetch(opts, :staging_kv) do
+        {:ok, skv} -> skv
+        :error -> if node_name = opts[:node_name], do: Runtime.staging_kv(node_name), else: nil
+      end
+
+    split? = staging_kv != nil
+
     idx = Index.insert(Index.new(), Index.make_entry(p.genesis.header, nil))
-    idx = if kv, do: load(idx, kv), else: idx
+    idx = if kv, do: load_canonical(idx, kv), else: idx
+    idx = if split?, do: load_staging(idx, staging_kv), else: idx
 
     # Trapping exits so terminate/2 runs on a supervisor shutdown and drains
     # the writer before the store closes (Node.Runtime stops after this process).
+    writer_kv = if split?, do: staging_kv, else: kv
+    writer_cf = if split?, do: :headers_cache, else: :headers
+
     writer =
-      if kv do
+      if writer_kv do
         Process.flag(:trap_exit, true)
-        {:ok, w} = Writer.start_link(kv)
+        {:ok, w} = Writer.start_link(writer_kv)
         w
       end
 
     # Published only once loaded, so readers never see a half-loaded tree.
     if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, idx)
-    {:ok, %{params: p, idx: idx, writer: writer, now: Keyword.get(opts, :now)}}
+
+    {:ok,
+     %{
+       params: p,
+       idx: idx,
+       writer: writer,
+       writer_cf: writer_cf,
+       split?: split?,
+       now: Keyword.get(opts, :now)
+     }}
   end
 
   @impl true
@@ -117,10 +156,12 @@ defmodule Exnode.Chain.Headers do
 
   def handle_call({:invalidate, hash, fallback_hash}, _from, st) do
     {idx, failed} = Index.invalidate(st.idx, hash, Index.lookup(st.idx, fallback_hash))
-    # Waits: written after any queued put of the same headers, and in the
-    # KV (sync: false, as before) by the time the caller goes on.
-    if st.writer && failed != [], do: Writer.write_sync(st.writer, ops(failed))
-    {:reply, :ok, %{st | idx: idx}}
+
+    if st.writer && failed != [] do
+      Writer.write_sync(st.writer, ops(st.writer_cf, failed))
+    end
+
+    {:reply, failed, %{st | idx: idx}}
   end
 
   def handle_call({:process, headers, opts}, _from, st) do
@@ -148,7 +189,7 @@ defmodule Exnode.Chain.Headers do
             e != nil,
             do: e
 
-      if new_entries != [], do: Writer.write(st.writer, ops(new_entries))
+      if new_entries != [], do: Writer.write(st.writer, ops(st.writer_cf, new_entries))
     end
 
     {:reply, reply, %{st | idx: idx}}
@@ -172,17 +213,49 @@ defmodule Exnode.Chain.Headers do
   defp clock(%{now: f}) when is_function(f, 0), do: f.()
   defp clock(_), do: System.os_time(:second)
 
-  defp ops(entries), do: for(e <- entries, do: {:put, :headers, e.hash, encode(e)})
+  defp ops(cf, entries), do: for(e <- entries, do: {:put, cf, e.hash, encode(e)})
 
   defp encode(e), do: <<e.height::32, status_byte(e.status), e.raw::binary>>
   defp status_byte(:valid_header), do: 0
   defp status_byte(:failed), do: 1
 
-  defp load(idx, kv) do
-    kv
-    |> KV.fold_prefix(:headers, <<>>, [], fn {k, <<h::32, s, raw::binary-size(80)>>}, acc ->
-      [{h, s, k, raw} | acc]
-    end)
+  defp load_canonical(idx, kv) do
+    rows =
+      KV.fold_prefix(kv, :headers, <<>>, [], fn
+        {k, <<h::32, s, raw::binary-size(80)>>}, acc ->
+          [{h, s, k, raw} | acc]
+
+        {k, bad}, _acc ->
+          StorageError.raise_and_latch!(
+            kv.guard,
+            :headers,
+            {:corrupt_header_row, k, byte_size(bad)},
+            "header store corrupt: invalid header row length #{byte_size(bad)}"
+          )
+      end)
+
+    case KV.get(kv, :meta, @headers_count_key) do
+      {:ok, <<expected::32>>} when expected != length(rows) ->
+        StorageError.raise_and_latch!(
+          kv.guard,
+          :headers,
+          {:headers_count_mismatch, length(rows), expected},
+          "header store scan returned #{length(rows)} row(s), expected #{expected}"
+        )
+
+      {:ok, bad} when byte_size(bad) != 4 ->
+        StorageError.raise_and_latch!(
+          kv.guard,
+          :headers,
+          {:corrupt_headers_count, byte_size(bad)},
+          "corrupt headers_count metadata"
+        )
+
+      _ ->
+        :ok
+    end
+
+    rows
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.reduce(idx, fn {h, s, k, raw}, idx ->
       if Index.lookup(idx, k) do
@@ -192,10 +265,12 @@ defmodule Exnode.Chain.Headers do
         prev = Index.lookup(idx, hdr.prev_hash)
 
         if prev == nil do
-          raise Exnode.StorageError,
-            source: :headers,
-            reason: {:missing_parent, k, hdr.prev_hash},
-            message: "header store corrupt: missing parent for header at height #{h}"
+          StorageError.raise_and_latch!(
+            kv.guard,
+            :headers,
+            {:missing_parent, k, hdr.prev_hash},
+            "header store corrupt: missing parent for header at height #{h}"
+          )
         end
 
         e = Index.make_entry(hdr, prev)
@@ -203,6 +278,53 @@ defmodule Exnode.Chain.Headers do
         # is failed; failed entries never become the best header (insert/2).
         failed = s == 1 or prev.status == :failed
         Index.insert(idx, %{e | status: if(failed, do: :failed, else: :valid_header)})
+      end
+    end)
+  end
+
+  # Ephemeral ahead-of-tip headers cached in staging/: non-authoritative
+  # across crashes (staging/ is wiped on restore), durable across clean closes
+  # (staging WAL is fsynced before flush.lock is removed). Recomputes every
+  # header hash from the 80 raw bytes rather than trusting the key.
+  defp load_staging(idx, staging_kv) do
+    staging_kv
+    |> KV.fold_prefix(:headers_cache, <<>>, [], fn
+      {k, <<h::32, s, raw::binary-size(80)>>}, acc ->
+        [{h, s, k, raw} | acc]
+
+      {k, bad}, _acc ->
+        StorageError.raise_and_latch!(
+          staging_kv.guard,
+          :headers,
+          {:corrupt_staging_header_row, k, byte_size(bad)},
+          "staging header cache corrupt: invalid row length #{byte_size(bad)}"
+        )
+    end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce(idx, fn {_h, s, k, raw}, idx ->
+      if Index.lookup(idx, k) do
+        idx
+      else
+        {hdr, ""} = Header.decode(raw)
+
+        if hdr.hash != k do
+          StorageError.raise_and_latch!(
+            staging_kv.guard,
+            :headers,
+            {:corrupt_staging_header_hash, k, hdr.hash},
+            "staging header cache corrupt: stored key does not match header hash"
+          )
+        end
+
+        case Index.lookup(idx, hdr.prev_hash) do
+          nil ->
+            idx
+
+          prev ->
+            e = Index.make_entry(hdr, prev)
+            failed = s == 1 or prev.status == :failed
+            Index.insert(idx, %{e | status: if(failed, do: :failed, else: :valid_header)})
+        end
       end
     end)
   end

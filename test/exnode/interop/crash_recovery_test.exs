@@ -14,7 +14,7 @@ defmodule Exnode.Interop.CrashRecoveryTest do
   alias Exnode.ChainParams
   alias Exnode.Chain.{Headers, State}
   alias Exnode.Crypto.Hash
-  alias Exnode.Store.KV
+  alias Exnode.Store.{Guard, KV, Snapshot}
   alias Exnode.Test.BlockBuilder
 
   @moduletag :bitcoind
@@ -122,6 +122,8 @@ defmodule Exnode.Interop.CrashRecoveryTest do
 
     :rand.seed(:exsss, {1, 2, 3})
 
+    chain_dir = Path.join([dir, "ex", "regtest"])
+
     # Each round: restart, wait until the node is past the previous kill
     # point (actively syncing), change bitcoind's chain, kill at a random moment.
     {coins, kill_heights, _} =
@@ -140,6 +142,30 @@ defmodule Exnode.Interop.CrashRecoveryTest do
         Process.sleep(:rand.uniform(300))
         s = status(node)
         kill9(node)
+
+        # Invariant 2 & 4: crashed store MUST leave flush.lock on disk, refuse
+        # direct open, and restore cleanly to an exact prior quiescent snapshot.
+        assert {:dirty, _} = Guard.inspect_lock(chain_dir)
+
+        if i == 1 do
+          # Verify the CLI binary itself refuses to open a dirty store directly.
+          {out, code} =
+            System.cmd(
+              System.find_executable("mix"),
+              ["exnode.node", "--chain", "regtest", "--datadir", Path.join(dir, "ex")],
+              cd: @project,
+              env: [{"MIX_ENV", "dev"}],
+              stderr_to_stdout: true
+            )
+
+          assert code != 0
+          assert out =~ "did not close cleanly"
+        end
+
+        {:ok, restored} = Snapshot.restore!(chain_dir)
+        assert Guard.inspect_lock(chain_dir) == :clean
+        assert is_integer(restored.tip.height)
+
         h = s && s["tip_height"]
         {coins, [{h, s && s["committed_height"]} | acc], h || last}
       end)
@@ -160,17 +186,23 @@ defmodule Exnode.Interop.CrashRecoveryTest do
 
     _ = coins
 
-    # Reopen the datadir in this process (runs recovery again) and compare with bitcoind.
+    # Restore from the final snapshot after the final kill -9, then reopen cleanly.
+    {:ok, _} = Snapshot.restore!(chain_dir)
+    assert Guard.inspect_lock(chain_dir) == :clean
+
     p = ChainParams.get(:regtest)
-    {:ok, kv} = KV.open(Path.join([dir, "ex", "regtest", "index"]))
-    {:ok, hs} = Headers.start_link(params: p, kv: kv)
+    {:ok, kv} = KV.open(Path.join(chain_dir, "index"), mode: :canonical)
+    {:ok, stg} = KV.open(Path.join(chain_dir, "staging"), mode: :staging)
+    {:ok, hs} = Headers.start_link(params: p, kv: kv, staging_kv: stg)
 
     {:ok, cs} =
       State.start_link(
         params: p,
         headers: hs,
         kv: kv,
-        hot: Path.join([dir, "ex", "regtest", "archive"])
+        staging_kv: stg,
+        strict_clean: true,
+        hot: Path.join(chain_dir, "archive")
       )
 
     assert Hash.to_hex(State.tip(cs).hash) == btc_tip(btc)

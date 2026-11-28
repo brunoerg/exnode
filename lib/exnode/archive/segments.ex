@@ -28,28 +28,50 @@ defmodule Exnode.Archive.Segments do
 
   import Bitwise
 
+  alias Exnode.StorageError
+  alias Exnode.Store.Guard
+
   @max_segment_bytes 1 <<< 30
 
-  defstruct [:dir, :kind, :seg, :offset, :fd, max: @max_segment_bytes]
+  defstruct [:dir, :kind, :seg, :offset, :fd, :guard, max: @max_segment_bytes]
 
   @doc """
-  Opens the writer for `kind` under `root`. With `committed: {seg, offset}`
-  (an existing archive), the committed segment is checked first, before
-  any file or directory is created (see `truncate_to/2`).
+  Opens the writer for `kind` under `root`.
+
+  Options:
+  * `:committed` — `{seg, offset}` for an existing archive; all live segments
+    `min_seg..seg` are verified before any file or directory is created.
+  * `:min_seg` — lowest expected live segment (default `0`; for `:witness`,
+    `wpruned + 1`).
+  * `:strict_clean` — when `true` (clean open with no `flush.lock`), requires
+    exact segment size equality and no trailing segment files `> seg`.
+  * `:guard` — optional `Exnode.Store.Guard` for fault latching.
   """
   def open(root, kind, opts \\ []) do
+    guard = Keyword.get(opts, :guard)
+    Guard.check!(guard)
     dir = Path.join(root, Atom.to_string(kind))
-    if c = opts[:committed], do: check_committed!(dir, kind, c)
+    min_seg = Keyword.get(opts, :min_seg, 0)
+    strict? = Keyword.get(opts, :strict_clean, false)
+
+    if c = opts[:committed], do: check_committed!(dir, kind, c, min_seg, strict?, guard)
     new_dir = not File.dir?(dir)
     File.mkdir_p!(dir)
-    {seg, size} = last_segment(dir)
+    {seg, size} = last_segment(dir, guard)
     new_file = not File.exists?(path(dir, seg))
-    {:ok, fd} = :file.open(path(dir, seg), [:raw, :binary, :read, :write])
+
+    fd =
+      io_ok!(
+        guard,
+        {:open, kind, seg},
+        :file.open(path(dir, seg), [:raw, :binary, :read, :write])
+      )
+
     # First use: the new directory's entry (in its parent) and the first
     # segment's entry are made durable before anything is written.
-    if new_dir, do: sync_dir(Path.dirname(dir))
-    if new_file, do: sync_dir(dir)
-    {:ok, _} = :file.position(fd, :eof)
+    if new_dir, do: sync_dir(Path.dirname(dir), guard)
+    if new_file, do: sync_dir(dir, guard)
+    _ = io_ok!(guard, {:position, kind, seg}, :file.position(fd, :eof))
 
     %__MODULE__{
       dir: dir,
@@ -57,6 +79,7 @@ defmodule Exnode.Archive.Segments do
       seg: seg,
       offset: size,
       fd: fd,
+      guard: guard,
       max: Keyword.get(opts, :max, @max_segment_bytes)
     }
   end
@@ -66,14 +89,19 @@ defmodule Exnode.Archive.Segments do
   defp path(dir, seg),
     do: Path.join(dir, String.pad_leading(Integer.to_string(seg), 5, "0") <> ".seg")
 
-  defp last_segment(dir) do
-    case dir
-         |> File.ls!()
+  defp last_segment(dir, guard) do
+    entries = io_ok!(guard, {:ls, dir}, File.ls(dir))
+
+    case entries
          |> Enum.filter(&String.ends_with?(&1, ".seg"))
          |> Enum.sort()
          |> List.last() do
-      nil -> {0, 0}
-      f -> {f |> Path.rootname() |> String.to_integer(), File.stat!(Path.join(dir, f)).size}
+      nil ->
+        {0, 0}
+
+      f ->
+        stat = io_ok!(guard, {:stat, f}, File.stat(Path.join(dir, f)))
+        {f |> Path.rootname() |> String.to_integer(), stat.size}
     end
   end
 
@@ -126,8 +154,9 @@ defmodule Exnode.Archive.Segments do
   end
 
   defp write(st, records, total) do
+    Guard.check!(st.guard)
     t0 = System.monotonic_time(:microsecond)
-    :ok = :file.write(st.fd, records)
+    io_ok!(st.guard, {:write, st.kind, st.seg}, :file.write(st.fd, records))
     bump(:seg_writes, 1)
     bump(:seg_write_bytes, total)
     bump(:seg_write_us, System.monotonic_time(:microsecond) - t0)
@@ -143,48 +172,51 @@ defmodule Exnode.Archive.Segments do
   end
 
   defp do_roll(st) do
+    Guard.check!(st.guard)
     seg = st.seg + 1
     # Locations store the segment number in 16 bits: one more would wrap.
     if seg > 0xFFFF do
-      raise Exnode.StorageError,
-        source: :segments,
-        reason: {:segment_overflow, st.kind, st.seg},
-        message: "archive #{st.kind} has no segment number left after #{st.seg}"
+      StorageError.raise_and_latch!(
+        st.guard,
+        :segments,
+        {:segment_overflow, st.kind, st.seg},
+        "archive #{st.kind} has no segment number left after #{st.seg}"
+      )
     end
 
-    :ok = :file.sync(st.fd)
-    :ok = :file.close(st.fd)
-    {:ok, fd} = :file.open(path(st.dir, seg), [:raw, :binary, :read, :write])
+    io_ok!(st.guard, {:sync, st.kind, st.seg}, :file.sync(st.fd))
+    io_ok!(st.guard, {:close, st.kind, st.seg}, :file.close(st.fd))
+
+    fd =
+      io_ok!(
+        st.guard,
+        {:open, st.kind, seg},
+        :file.open(path(st.dir, seg), [:raw, :binary, :read, :write])
+      )
+
     # The new file's directory entry is durable before any record is written
     # to it, so a later commit never references a file a power loss can drop.
-    sync_dir(st.dir)
+    sync_dir(st.dir, st.guard)
     %{st | seg: seg, offset: 0, fd: fd}
   end
 
   # fsync of a directory (OTP 28 `:directory` mode; Linux fsyncs a read-only directory handle).
   # Failing is fatal: without it the archive's durability contract cannot hold.
-  defp sync_dir(dir) do
-    with {:ok, fd} <- :file.open(String.to_charlist(dir), [:read, :raw, :directory]),
-         :ok <- :file.sync(fd),
-         :ok <- :file.close(fd) do
-      :ok
-    else
-      err ->
-        raise Exnode.StorageError,
-          source: :segments,
-          reason: {:fsync_dir, dir, err},
-          message:
-            "cannot fsync directory #{dir} (#{inspect(err)}): the archive's durability contract needs it"
-    end
+  defp sync_dir(dir, guard) do
+    Guard.sync_dir!(dir, guard)
   end
 
-  def sync(%__MODULE__{fd: fd}), do: :file.sync(fd)
+  def sync(%__MODULE__{fd: fd, guard: guard, kind: kind, seg: seg}) do
+    Guard.check!(guard)
+    io_ok!(guard, {:sync, kind, seg}, :file.sync(fd))
+  end
 
   @doc """
   Deletes segment `seg` (witness pruning), closing this process's cached
   read handle for it. Never the segment being written.
   """
-  def remove(%__MODULE__{dir: dir, seg: current}, seg) when seg < current do
+  def remove(%__MODULE__{dir: dir, seg: current, guard: guard}, seg) when seg < current do
+    Guard.check!(guard)
     p = path(dir, seg)
 
     handles = handles()
@@ -200,67 +232,226 @@ defmodule Exnode.Archive.Segments do
 
     # Only an actual deletion needs its directory entry made durable (open/3
     # re-removes every already-pruned segment at each start).
-    if File.rm(p) == :ok, do: sync_dir(dir)
+    case File.rm(p) do
+      :ok -> sync_dir(dir, guard)
+      {:error, :enoent} -> :ok
+      {:error, reason} -> io_ok!(guard, {:remove, p}, {:error, reason})
+    end
+
     :ok
   end
 
   @doc """
-  Crash recovery: drops data written after the committed end `{seg, offset}`.
-  Later segment files are deleted and the committed segment is truncated.
-  Raises if the committed segment is missing or shorter than `offset`
-  (corruption; never recreated or zero-filled).
+  Deletes a pruned witness segment offline (during restore, when no writer is open).
   """
-  def truncate_to(%__MODULE__{} = st, {seg, offset}) do
-    :ok = :file.close(st.fd)
+  def remove_offline!(root, kind, seg) do
+    dir = Path.join(root, Atom.to_string(kind))
+    p = path(dir, seg)
 
-    for f <- File.ls!(st.dir),
-        String.ends_with?(f, ".seg"),
-        n = f |> Path.rootname() |> String.to_integer(),
-        n > seg,
-        do: File.rm!(Path.join(st.dir, f))
+    case File.rm(p) do
+      :ok -> Guard.sync_dir!(dir)
+      {:error, :enoent} -> :ok
+      {:error, reason} -> io_ok!(nil, {:remove, p}, {:error, reason})
+    end
+  end
+
+  @doc """
+  Crash recovery / restore: drops data written after the committed end
+  `{seg, offset}`. Later segment files are deleted (with directory fsync) and
+  the committed segment is truncated and fsynced. Raises if any live committed
+  segment is missing or if `seg` is shorter than `offset`.
+  """
+  def truncate_to(%__MODULE__{} = st, {seg, offset}, min_seg \\ 0) do
+    Guard.check!(st.guard)
+    io_ok!(st.guard, {:close, st.kind, st.seg}, :file.close(st.fd))
+    removed = remove_trailing_segments!(st.dir, seg, st.guard)
+    if removed > 0, do: sync_dir(st.dir, st.guard)
 
     # Check before opening for write: opening would create a missing file,
     # and truncating past the end would zero-extend it.
-    check_committed!(st.dir, st.kind, {seg, offset})
-    {:ok, fd} = :file.open(path(st.dir, seg), [:raw, :binary, :read, :write])
-    {:ok, _} = :file.position(fd, offset)
-    :ok = :file.truncate(fd)
-    :ok = :file.sync(fd)
+    check_committed!(st.dir, st.kind, {seg, offset}, min_seg, false, st.guard)
+
+    fd =
+      io_ok!(
+        st.guard,
+        {:open, st.kind, seg},
+        :file.open(path(st.dir, seg), [:raw, :binary, :read, :write])
+      )
+
+    _ = io_ok!(st.guard, {:position, st.kind, seg}, :file.position(fd, offset))
+    io_ok!(st.guard, {:truncate, st.kind, seg}, :file.truncate(fd))
+    io_ok!(st.guard, {:sync, st.kind, seg}, :file.sync(fd))
     %{st | seg: seg, offset: offset, fd: fd}
   end
 
-  defp check_committed!(dir, kind, {seg, offset}) do
+  @doc """
+  Offline verification and truncation of `<root>/<kind>` to `{seg, offset}`
+  (used by `Exnode.Store.Snapshot.restore!/2` without opening a writer).
+  """
+  def verify_committed_dir!(root, kind, {seg, offset}, min_seg \\ 0) do
+    dir = Path.join(root, Atom.to_string(kind))
+    check_committed!(dir, kind, {seg, offset}, min_seg, false, nil)
+  end
+
+  @doc """
+  Offline truncation of `<root>/<kind>` to `{seg, offset}` (used by snapshot
+  restore): removes trailing segments > `seg` with dir fsync, truncates `seg`
+  to `offset`, and fsyncs.
+  """
+  def truncate_dir!(root, kind, {seg, offset}, min_seg \\ 0) do
+    dir = Path.join(root, Atom.to_string(kind))
+    check_committed!(dir, kind, {seg, offset}, min_seg, false, nil)
+    removed = remove_trailing_segments!(dir, seg, nil)
+    if removed > 0, do: Guard.sync_dir!(dir)
+
+    fd =
+      io_ok!(nil, {:open, kind, seg}, :file.open(path(dir, seg), [:raw, :binary, :read, :write]))
+
+    try do
+      _ = io_ok!(nil, {:position, kind, seg}, :file.position(fd, offset))
+      io_ok!(nil, {:truncate, kind, seg}, :file.truncate(fd))
+      io_ok!(nil, {:sync, kind, seg}, :file.sync(fd))
+    after
+      :file.close(fd)
+    end
+
+    :ok
+  end
+
+  defp remove_trailing_segments!(dir, seg, guard) do
+    entries = io_ok!(guard, {:ls, dir}, File.ls(dir))
+
+    trailing =
+      for f <- entries,
+          String.ends_with?(f, ".seg"),
+          n = f |> Path.rootname() |> String.to_integer(),
+          n > seg,
+          do: f
+
+    for f <- trailing do
+      io_ok!(guard, {:remove, f}, File.rm(Path.join(dir, f)))
+    end
+
+    length(trailing)
+  end
+
+  defp check_committed!(dir, kind, {seg, offset}, min_seg, strict?, guard) do
+    # Verify every live intermediate segment exists and is non-empty.
+    for s <- min_seg..(seg - 1)//1 do
+      case File.stat(path(dir, s)) do
+        {:error, :enoent} ->
+          StorageError.raise_and_latch!(
+            guard,
+            :segments,
+            {:missing_segment, kind, s},
+            "archive #{kind} segment #{s} missing but committed state references up to #{seg}: " <>
+              "the archive is corrupt; restore or resync required"
+          )
+
+        {:error, reason} ->
+          io_ok!(guard, {:stat, kind, s}, {:error, reason})
+
+        {:ok, %{size: 0}} ->
+          StorageError.raise_and_latch!(
+            guard,
+            :segments,
+            {:empty_segment, kind, s},
+            "archive #{kind} segment #{s} is empty but committed state references up to #{seg}: " <>
+              "the archive is corrupt; restore or resync required"
+          )
+
+        {:ok, _} ->
+          :ok
+      end
+    end
+
+    # Verify the final committed segment.
     case File.stat(path(dir, seg)) do
       {:error, :enoent} ->
-        raise Exnode.StorageError,
-          source: :segments,
-          reason: {:missing_segment, kind, seg},
-          message:
-            "archive #{kind} segment #{seg} missing but committed state references it: " <>
-              "the archive is corrupt; resync required"
+        StorageError.raise_and_latch!(
+          guard,
+          :segments,
+          {:missing_segment, kind, seg},
+          "archive #{kind} segment #{seg} missing but committed state references it: " <>
+            "the archive is corrupt; resync required"
+        )
+
+      {:error, reason} ->
+        io_ok!(guard, {:stat, kind, seg}, {:error, reason})
 
       {:ok, %{size: size}} when size < offset ->
-        raise Exnode.StorageError,
-          source: :segments,
-          reason: {:short_segment, kind, seg, size, offset},
-          message:
-            "archive #{kind} segment #{seg} is shorter than the committed end (#{size} < #{offset}): " <>
-              "the archive is corrupt; resync required"
+        StorageError.raise_and_latch!(
+          guard,
+          :segments,
+          {:short_segment, kind, seg, size, offset},
+          "archive #{kind} segment #{seg} is shorter than the committed end (#{size} < #{offset}): " <>
+            "the archive is corrupt; resync required"
+        )
+
+      {:ok, %{size: size}} when strict? and size > offset ->
+        StorageError.raise_and_latch!(
+          guard,
+          :segments,
+          {:trailing_bytes_on_clean_open, kind, seg, size, offset},
+          "archive #{kind} segment #{seg} has unexpected trailing bytes on clean open (#{size} > #{offset}): " <>
+            "store does not match committed metadata; restore or resync required"
+        )
 
       {:ok, _} ->
         :ok
     end
+
+    if strict? do
+      entries = io_ok!(guard, {:ls, dir}, File.ls(dir))
+
+      extra =
+        for f <- entries,
+            String.ends_with?(f, ".seg"),
+            n = f |> Path.rootname() |> String.to_integer(),
+            n > seg,
+            do: n
+
+      if extra != [] do
+        StorageError.raise_and_latch!(
+          guard,
+          :segments,
+          {:trailing_segments_on_clean_open, kind, extra, seg},
+          "archive #{kind} has unexpected segment(s) #{inspect(extra)} past committed #{seg} on clean open"
+        )
+      end
+    end
+
+    :ok
+  end
+
+  defp io_ok!(_guard, _ctx, :ok), do: :ok
+  defp io_ok!(_guard, _ctx, {:ok, val}), do: val
+
+  defp io_ok!(guard, ctx, err) do
+    StorageError.raise_and_latch!(
+      guard,
+      :segments,
+      {:io_error, ctx, err},
+      "archive segment I/O failed (#{inspect(ctx)}): #{inspect(err)}"
+    )
   end
 
   # --- reading -----------------------------------------------------------------
 
   defmodule Reader do
     @moduledoc false
-    defstruct [:dir]
+    defstruct [:dir, :guard, :wpruned_live]
   end
 
-  def open_reader(%__MODULE__{dir: dir}), do: %Reader{dir: dir}
-  def open_reader(root, kind), do: %Reader{dir: Path.join(root, Atom.to_string(kind))}
+  def open_reader(%__MODULE__{dir: dir, guard: guard}),
+    do: %Reader{dir: dir, guard: guard}
+
+  def open_reader(root, kind, guard \\ nil, wpruned_live \\ nil),
+    do: %Reader{
+      dir: Path.join(root, Atom.to_string(kind)),
+      guard: guard,
+      wpruned_live: wpruned_live
+    }
 
   @doc """
   Reads at `{seg, offset}`, skips `n` records and returns the next one. Used
@@ -281,7 +472,8 @@ defmodule Exnode.Archive.Segments do
   When a read consumes a segment exactly to its end, it continues at offset 0
   of the next segment.
   """
-  def read_run(%Reader{} = r, {seg, offset}, skip, count, decode, chunk \\ 65_536) do
+  def read_run(%Reader{guard: guard} = r, {seg, offset}, skip, count, decode, chunk \\ 65_536) do
+    Guard.check!(guard)
     fd = fd(r, seg)
     bump(:preads, 1)
     bump(:pread_bytes, chunk)
@@ -290,11 +482,12 @@ defmodule Exnode.Archive.Segments do
       case :file.pread(fd, offset, chunk) do
         {:ok, d} -> d
         :eof -> <<>>
+        {:error, reason} -> io_ok!(guard, {:pread, r.dir, seg, offset}, {:error, reason})
       end
 
     eof = byte_size(data) < chunk
 
-    case take(data, skip, count, decode, []) do
+    case take(data, skip, count, decode, [], guard) do
       {:ok, recs} ->
         recs
 
@@ -304,24 +497,30 @@ defmodule Exnode.Archive.Segments do
         Enum.reverse(acc) ++ more
 
       {:more, _, _, _, _} when eof ->
-        raise Exnode.StorageError,
-          source: :segments,
-          reason: {:truncated_segment, seg, offset},
-          message: "archive segment truncated at #{seg}:#{offset}"
+        StorageError.raise_and_latch!(
+          guard,
+          :segments,
+          {:truncated_segment, seg, offset},
+          "archive segment truncated at #{seg}:#{offset}"
+        )
 
       {:more, _, _, _, _} ->
         read_run(r, {seg, offset}, skip, count, decode, chunk * 4)
     end
   end
 
-  defp take(_data, 0, 0, _decode, acc), do: {:ok, Enum.reverse(acc)}
+  defp take(_data, 0, 0, _decode, acc, _guard), do: {:ok, Enum.reverse(acc)}
 
-  defp take(data, skip, count, decode, acc) do
+  defp take(data, skip, count, decode, acc, guard) do
     case decode.(data) do
       :more -> {:more, skip, count, acc, data}
-      {_rec, rest} when skip > 0 -> take(rest, skip - 1, count, decode, acc)
-      {rec, rest} -> take(rest, 0, count - 1, decode, [rec | acc])
+      {_rec, rest} when skip > 0 -> take(rest, skip - 1, count, decode, acc, guard)
+      {rec, rest} -> take(rest, 0, count - 1, decode, [rec | acc], guard)
     end
+  rescue
+    e in Exnode.StorageError ->
+      Guard.latch_fault(guard, e.source || :archive, e.reason, Exception.message(e))
+      reraise e, __STACKTRACE__
   end
 
   @doc """
@@ -384,7 +583,7 @@ defmodule Exnode.Archive.Segments do
   # Raw read handles belong to the process that opened them, so they are
   # cached in that process's dictionary: path => {fd, last use}, at most
   # @read_handles of them.
-  defp fd(%Reader{} = r, seg) do
+  defp fd(%Reader{guard: guard} = r, seg) do
     p = path(r.dir, seg)
     handles = handles()
     tick = (Process.get({__MODULE__, :tick}) || 0) + 1
@@ -397,7 +596,27 @@ defmodule Exnode.Archive.Segments do
 
       _ ->
         handles = shrink(handles, cap() - 1)
-        {:ok, fd} = :file.open(p, [:raw, :binary, :read])
+
+        fd =
+          case :file.open(p, [:raw, :binary, :read]) do
+            {:ok, fd} ->
+              fd
+
+            {:error, :enoent}
+            when r.wpruned_live != nil ->
+              if seg <= :atomics.get(r.wpruned_live, 1) do
+                raise Exnode.StorageError,
+                  source: :segments,
+                  reason: {:witness_pruned, seg},
+                  message: "witness segment #{seg} was pruned"
+              else
+                io_ok!(guard, {:open_read, p}, {:error, :enoent})
+              end
+
+            err ->
+              io_ok!(guard, {:open_read, p}, err)
+          end
+
         bump(:read_opens, 1)
         Process.put({__MODULE__, :handles}, Map.put(handles, p, {fd, tick}))
         fd

@@ -11,8 +11,11 @@ defmodule Exnode.Store.KV do
   commits its index entries, spends and status in one batch.
   """
 
-  defstruct [:db, :cfs, :cf_ids, :path]
+  alias Exnode.Store.Guard
 
+  defstruct [:db, :cfs, :cf_ids, :path, :guard, mode: :legacy]
+
+  @type mode :: :canonical | :staging | :derived | :legacy
   @type t :: %__MODULE__{}
   @type op ::
           {:put, atom(), binary(), binary()}
@@ -20,7 +23,32 @@ defmodule Exnode.Store.KV do
           | {:merge, atom(), binary(), binary()}
           | {:put_packed, atom(), pos_integer(), non_neg_integer() | :var, binary()}
 
-  # poisoned: blocks quarantined after a validation crash (Chain.State).
+  # Canonical consensus-critical column families: single writer (Chain.State),
+  # strictly synced writes only, snapshotted via rotated checkpoints.
+  @canonical_cfs [
+    :txindex,
+    :spends,
+    :blocks,
+    :blockhash,
+    :locs,
+    :headers,
+    :meta,
+    :poisoned
+  ]
+
+  # Ephemeral download/header buffer: unsynced writes allowed; wiped on restore.
+  @staging_cfs [
+    :pending,
+    :headers_cache
+  ]
+
+  # Optional reconstructible query indexes: own clean-close lock + snapshots.
+  @derived_cfs [
+    :filters,
+    :scripthash
+  ]
+
+  # Legacy combined set (kept as default for standalone unit tests).
   @default_cfs [
     :txindex,
     :spends,
@@ -37,6 +65,15 @@ defmodule Exnode.Store.KV do
 
   @default_max_open_files 512
 
+  @doc "Canonical consensus-critical column families."
+  def canonical_cfs, do: @canonical_cfs
+
+  @doc "Ephemeral staging column families (`:pending`, `:headers_cache`)."
+  def staging_cfs, do: @staging_cfs
+
+  @doc "Derived query index column families (`:filters`, `:scripthash`)."
+  def derived_cfs, do: @derived_cfs
+
   # RocksDB refuses a second open of a store this VM already holds ("lock
   # hold by current process"). A closed handle can hold it a moment longer:
   # erlang-rocksdb frees the database when its last reference goes, and a
@@ -49,13 +86,17 @@ defmodule Exnode.Store.KV do
   def default_max_open_files, do: @default_max_open_files
 
   @doc "Opens (creating if needed) the store at `path` with the given column families
-  (`:max_open_files`: RocksDB's open table-file bound, default
+  (`:mode`: `:canonical | :staging | :derived | :legacy`, default `:legacy`;
+  `:guard`: optional `Exnode.Store.Guard` for fault latching;
+  `:max_open_files`: RocksDB's open table-file bound, default
   `default_max_open_files/0`; `:lock_wait_ms`: how long to wait for another
   handle in this VM to release the store, default 5 s)."
   @spec open(Path.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def open(path, opts \\ []) do
-    names = Keyword.get(opts, :column_families, @default_cfs)
+    mode = Keyword.get(opts, :mode, :legacy)
+    names = Keyword.get_lazy(opts, :column_families, fn -> default_cfs_for(mode) end)
     create? = Keyword.get(opts, :create_if_missing, true)
+    guard = Keyword.get(opts, :guard)
 
     if not create? and not File.dir?(path) do
       {:error, :enoent}
@@ -72,16 +113,17 @@ defmodule Exnode.Store.KV do
       # 920 descriptors on a mainnet store at 593k, past a 1,024 soft limit).
       # Bounded like Core's LevelDB max_open_files; the node sizes it from the
       # process's descriptor limit (Exnode.FdBudget).
-      db_opts = [
-        create_if_missing: create?,
-        create_missing_column_families: create?,
-        max_background_jobs: bg_jobs,
-        max_subcompactions: Keyword.get(opts, :max_subcompactions, 2),
-        compaction_readahead_size: 2 * 1024 * 1024,
-        enable_pipelined_write: true,
-        bytes_per_sync: 1024 * 1024,
-        max_open_files: Keyword.get(opts, :max_open_files, @default_max_open_files)
-      ]
+      db_opts =
+        [
+          create_if_missing: create?,
+          create_missing_column_families: create?,
+          max_background_jobs: bg_jobs,
+          max_subcompactions: Keyword.get(opts, :max_subcompactions, 2),
+          compaction_readahead_size: 2 * 1024 * 1024,
+          paranoid_checks: true,
+          bytes_per_sync: 1024 * 1024,
+          max_open_files: Keyword.get(opts, :max_open_files, @default_max_open_files)
+        ] ++ mode_db_opts(mode)
 
       cf_descs = [
         {~c"default", []} | Enum.map(names, &{Atom.to_charlist(&1), cf_options(&1, cache)})
@@ -97,7 +139,9 @@ defmodule Exnode.Store.KV do
              db: db,
              cfs: Map.new(Enum.zip(names, handles)),
              cf_ids: discover_cf_ids(names, handles),
-             path: path
+             path: path,
+             guard: guard,
+             mode: mode
            }}
 
         {:error, _} = err ->
@@ -105,6 +149,86 @@ defmodule Exnode.Store.KV do
       end
     end
   end
+
+  @doc """
+  Opens an existing store read-only (no LOCK created, no WAL replay mutations;
+  used to inspect and verify a snapshot before restoring).
+  """
+  @spec open_readonly(Path.t(), keyword()) :: {:ok, t()} | {:error, term()}
+  def open_readonly(path, opts \\ []) do
+    mode = Keyword.get(opts, :mode, :canonical)
+    names = Keyword.get_lazy(opts, :column_families, fn -> default_cfs_for(mode) end)
+
+    if not File.dir?(path) do
+      {:error, :enoent}
+    else
+      {:ok, cache} =
+        :rocksdb.new_cache(:lru, Keyword.get(opts, :block_cache_bytes, 16 * 1024 * 1024))
+
+      db_opts = [
+        paranoid_checks: true,
+        max_open_files: Keyword.get(opts, :max_open_files, @default_max_open_files)
+      ]
+
+      cf_descs = [
+        {~c"default", []} | Enum.map(names, &{Atom.to_charlist(&1), cf_options(&1, cache)})
+      ]
+
+      case :rocksdb.open_readonly(String.to_charlist(path), db_opts, cf_descs) do
+        {:ok, db, [_default | handles]} ->
+          {:ok,
+           %__MODULE__{
+             db: db,
+             cfs: Map.new(Enum.zip(names, handles)),
+             cf_ids: %{},
+             path: path,
+             guard: nil,
+             mode: mode
+           }}
+
+        {:error, _} = err ->
+          err
+      end
+    end
+  end
+
+  defp default_cfs_for(:canonical), do: @canonical_cfs
+  defp default_cfs_for(:staging), do: @staging_cfs
+  defp default_cfs_for(:derived), do: @derived_cfs
+  defp default_cfs_for(:legacy), do: @default_cfs
+
+  # Canonical and derived stores enforce fail-stop RocksDB invariants:
+  # fsync (not fdatasync), atomic cross-CF flush, and absolute WAL consistency
+  # (never silently truncating corrupt WAL records). Canonical is single-writer
+  # so pipelined writes are disabled.
+  defp mode_db_opts(:canonical) do
+    [
+      enable_pipelined_write: false,
+      use_fsync: true,
+      atomic_flush: true,
+      wal_recovery_mode: :absolute_consistency
+    ]
+  end
+
+  defp mode_db_opts(:derived) do
+    [
+      enable_pipelined_write: false,
+      use_fsync: true,
+      atomic_flush: true,
+      wal_recovery_mode: :absolute_consistency
+    ]
+  end
+
+  defp mode_db_opts(:staging) do
+    [
+      enable_pipelined_write: false,
+      use_fsync: true,
+      atomic_flush: true,
+      wal_recovery_mode: :absolute_consistency
+    ]
+  end
+
+  defp mode_db_opts(:legacy), do: [enable_pipelined_write: true]
 
   # Retries while this VM holds the store, until `deadline` (see @lock_wait_ms).
   defp open_db(path, db_opts, cf_descs, deadline) do
@@ -186,7 +310,7 @@ defmodule Exnode.Store.KV do
       end
 
     hit_opts =
-      if cf in [:txindex, :blockhash, :headers, :filters],
+      if cf in [:txindex, :blockhash, :headers, :headers_cache, :filters],
         do: [optimize_filters_for_hits: true],
         else: []
 
@@ -282,11 +406,55 @@ defmodule Exnode.Store.KV do
     end
   end
 
-  def close(%__MODULE__{db: db}) do
-    :rocksdb.close(db)
+  def close(%__MODULE__{db: db, guard: guard}) do
+    case :rocksdb.close(db) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Guard.latch_fault(guard, :kv, {:close, reason}, "store close failed: #{inspect(reason)}")
+        {:error, reason}
+    end
   rescue
     # Already closed: erlang-rocksdb raises badarg for a closing handle.
     ArgumentError -> :ok
+  end
+
+  @doc """
+  Flushes and fsyncs the WAL and DB directory so every prior `sync: false`
+  write is durable on disk before closing the store and releasing `flush.lock`.
+  Latches `guard` and raises `Exnode.Store.KV.Error` on failure.
+  """
+  @spec sync_wal!(t()) :: :ok
+  def sync_wal!(%__MODULE__{db: db, path: path, guard: guard}) do
+    Guard.check!(guard)
+
+    case :rocksdb.sync_wal(db) do
+      :ok ->
+        Guard.sync_dir!(path, guard)
+        :ok
+
+      {:error, reason} ->
+        fail!(guard, :sync_wal, :db, reason)
+    end
+  end
+
+  @doc """
+  Creates a quiescent RocksDB checkpoint at `target_dir` (must not exist).
+  Flushes memtables to immutable SSTs, hard-links SSTs, and copies MANIFEST/CURRENT
+  with fsync. Latches `guard` and raises `Exnode.Store.KV.Error` on failure.
+  """
+  @spec checkpoint(t(), Path.t()) :: :ok
+  def checkpoint(%__MODULE__{db: db, guard: guard}, target_dir) do
+    Guard.check!(guard)
+
+    case :rocksdb.checkpoint(db, String.to_charlist(target_dir)) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        fail!(guard, :checkpoint, :db, reason)
+    end
   end
 
   defmodule Error do
@@ -299,24 +467,35 @@ defmodule Exnode.Store.KV do
     def message(%{op: op, cf: cf, reason: r}), do: "store #{op} on #{cf} failed: #{inspect(r)}"
   end
 
-  @doc "Point lookup. A read error raises `Exnode.Store.KV.Error` (no caller can answer for it)."
+  defp fail!(guard, op, cf, reason) do
+    msg = "store #{op} on #{cf} failed: #{inspect(reason)}"
+    Guard.latch_fault(guard, :kv, {op, cf, reason}, msg)
+    raise Error, op: op, cf: cf, reason: reason
+  end
+
+  @doc "Point lookup. A read error latches the guard and raises `Exnode.Store.KV.Error`."
   @spec get(t(), atom(), binary()) :: {:ok, binary()} | :not_found
-  def get(%__MODULE__{db: db, cfs: cfs}, cf, key) do
-    case :rocksdb.get(db, Map.fetch!(cfs, cf), key, []) do
-      {:error, reason} -> raise Error, op: :get, cf: cf, reason: reason
+  def get(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf, key) do
+    Guard.check!(guard)
+
+    case :rocksdb.get(db, Map.fetch!(cfs, cf), key, verify_checksums: true) do
+      {:error, reason} -> fail!(guard, :get, cf, reason)
       found -> found
     end
   end
 
-  @doc "Batched lookup. Results are in key order: `{:ok, value} | :not_found`; a read error raises like `get/3`."
+  @doc "Batched lookup. Results are in key order: `{:ok, value} | :not_found`; a read error latches and raises like `get/3`."
   @spec multi_get(t(), atom(), [binary()]) :: [{:ok, binary()} | :not_found]
   def multi_get(_kv, _cf, []), do: []
 
-  def multi_get(%__MODULE__{db: db, cfs: cfs}, cf, keys) do
-    found = :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, async_io: true)
+  def multi_get(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf, keys) do
+    Guard.check!(guard)
+
+    found =
+      :rocksdb.multi_get(db, Map.fetch!(cfs, cf), keys, async_io: true, verify_checksums: true)
 
     case Enum.find(found, &match?({:error, _}, &1)) do
-      {:error, reason} -> raise Error, op: :multi_get, cf: cf, reason: reason
+      {:error, reason} -> fail!(guard, :multi_get, cf, reason)
       nil -> found
     end
   end
@@ -340,7 +519,14 @@ defmodule Exnode.Store.KV do
   (`batch_put`/`batch_delete` calls) is timed apart from `write_batch`.
   """
   @spec write(t(), [op()], keyword()) :: :ok | {:error, term()}
-  def write(%__MODULE__{db: db, cf_ids: cf_ids}, ops, opts \\ []) do
+  def write(%__MODULE__{db: db, cf_ids: cf_ids, guard: guard, mode: mode}, ops, opts \\ []) do
+    Guard.check!(guard)
+    sync? = Keyword.get(opts, :sync, true)
+
+    if mode == :canonical and not sync? do
+      raise ArgumentError, "unsynced write (sync: false) is forbidden on canonical KV store"
+    end
+
     stats = Keyword.get(opts, :stats, false)
     t0 = if stats, do: System.monotonic_time(:microsecond)
 
@@ -348,7 +534,15 @@ defmodule Exnode.Store.KV do
       encode_write_batch(ops, cf_ids, Keyword.get(opts, :sort_packed, false))
 
     t1 = if stats, do: System.monotonic_time(:microsecond)
-    result = :rocksdb.write_binary_update(db, wb, sync: Keyword.get(opts, :sync, true))
+    result = :rocksdb.write_binary_update(db, wb, sync: sync?)
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Guard.latch_fault(guard, :kv, {:write, reason}, "store write failed: #{inspect(reason)}")
+    end
 
     if stats do
       t2 = System.monotonic_time(:microsecond)
@@ -489,10 +683,15 @@ defmodule Exnode.Store.KV do
   ~5 µs in total order, with identical results (profile, 2026-11-03).
   Callers stop at the end of their prefix themselves.
   """
-  def iterator(%__MODULE__{db: db, cfs: cfs}, cf) do
-    case :rocksdb.iterator(db, Map.fetch!(cfs, cf), total_order_seek: true) do
+  def iterator(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf) do
+    Guard.check!(guard)
+
+    case :rocksdb.iterator(db, Map.fetch!(cfs, cf),
+           total_order_seek: true,
+           verify_checksums: true
+         ) do
       {:ok, it} -> it
-      {:error, reason} -> raise Error, op: :iterator, cf: cf, reason: reason
+      {:error, reason} -> fail!(guard, :iterator, cf, reason)
     end
   end
 
@@ -512,10 +711,15 @@ defmodule Exnode.Store.KV do
   true`), allowing RocksDB to consult prefix bloom filters when `cf` configures
   a `prefix_extractor`.
   """
-  def prefix_iterator(%__MODULE__{db: db, cfs: cfs}, cf) do
-    case :rocksdb.iterator(db, Map.fetch!(cfs, cf), prefix_same_as_start: true) do
+  def prefix_iterator(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf) do
+    Guard.check!(guard)
+
+    case :rocksdb.iterator(db, Map.fetch!(cfs, cf),
+           prefix_same_as_start: true,
+           verify_checksums: true
+         ) do
       {:ok, it} -> it
-      {:error, reason} -> raise Error, op: :iterator, cf: cf, reason: reason
+      {:error, reason} -> fail!(guard, :iterator, cf, reason)
     end
   end
 
@@ -532,23 +736,26 @@ defmodule Exnode.Store.KV do
 
   @doc """
   Moves iterator `it` on `cf`. Returns `{:ok, key, value}` or `:end` when the
-  iterator reaches the end; raises `Exnode.Store.KV.Error` on any other error
-  tuple (note: upstream erlang-rocksdb 3.1.2 checks `itr->Valid()` before
-  `itr->status()`, returning `:invalid_iterator` when an SST read invalidates
-  the iterator).
+  iterator reaches the end; latches `guard` and raises `Exnode.Store.KV.Error`
+  on any other error tuple (note: upstream erlang-rocksdb 3.1.2 checks
+  `itr->Valid()` before `itr->status()`, returning `:invalid_iterator` when an
+  SST read invalidates the iterator; see `contrib/patches/erlang-rocksdb-iterator-status.patch`,
+  and canonical full scans additionally cross-check exact row counts).
   """
-  def iter_move(it, cf, action) do
+  def iter_move(it, cf, action, guard \\ nil) do
+    Guard.check!(guard)
+
     case :rocksdb.iterator_move(it, action) do
       {:ok, k, v} -> {:ok, k, v}
       {:error, :invalid_iterator} -> :end
-      {:error, reason} -> raise Error, op: :iterator_move, cf: cf, reason: reason
+      {:error, reason} -> fail!(guard, :iterator_move, cf, reason)
     end
   end
 
   @doc "Folds over `{key, value}` pairs in `cf` whose key starts with `prefix`, in key order."
-  def fold_prefix(%__MODULE__{} = kv, cf, prefix, acc, fun) do
+  def fold_prefix(%__MODULE__{guard: guard} = kv, cf, prefix, acc, fun) do
     with_iterator(kv, cf, fn it ->
-      do_fold(it, cf, iter_move(it, cf, {:seek, prefix}), prefix, acc, fun)
+      do_fold(it, cf, iter_move(it, cf, {:seek, prefix}, guard), prefix, acc, fun, guard)
     end)
   end
 
@@ -558,20 +765,31 @@ defmodule Exnode.Store.KV do
   the iterator leaves a blob value unread until asked, and this never
   asks). Inline values are read with their keys as usual.
   """
-  def fold_keys(%__MODULE__{db: db, cfs: cfs}, cf, prefix, acc, fun) do
+  def fold_keys(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf, prefix, acc, fun) do
+    Guard.check!(guard)
+
     it =
       case :rocksdb.iterator(db, Map.fetch!(cfs, cf),
              total_order_seek: true,
-             allow_unprepared_value: true
+             allow_unprepared_value: true,
+             verify_checksums: true
            ) do
         {:ok, it} -> it
-        {:error, reason} -> raise Error, op: :iterator, cf: cf, reason: reason
+        {:error, reason} -> fail!(guard, :iterator, cf, reason)
       end
 
     try do
-      do_fold(it, cf, iter_move(it, cf, {:seek, prefix}), prefix, acc, fn {k, _v}, acc ->
-        fun.(k, acc)
-      end)
+      do_fold(
+        it,
+        cf,
+        iter_move(it, cf, {:seek, prefix}, guard),
+        prefix,
+        acc,
+        fn {k, _v}, acc ->
+          fun.(k, acc)
+        end,
+        guard
+      )
     after
       :rocksdb.iterator_close(it)
     end
@@ -579,16 +797,22 @@ defmodule Exnode.Store.KV do
 
   @doc false
   # Flushes `cf`'s memtable to disk (tests: puts the data in SST and blob files).
-  def flush(%__MODULE__{db: db, cfs: cfs}, cf),
-    do: :rocksdb.flush(db, Map.fetch!(cfs, cf), wait: true)
+  def flush(%__MODULE__{db: db, cfs: cfs, guard: guard}, cf) do
+    Guard.check!(guard)
 
-  defp do_fold(it, cf, {:ok, k, v}, prefix, acc, fun) do
+    case :rocksdb.flush(db, Map.fetch!(cfs, cf), wait: true) do
+      :ok -> :ok
+      {:error, reason} -> fail!(guard, :flush, cf, reason)
+    end
+  end
+
+  defp do_fold(it, cf, {:ok, k, v}, prefix, acc, fun, guard) do
     if :binary.longest_common_prefix([k, prefix]) == byte_size(prefix),
-      do: do_fold(it, cf, iter_move(it, cf, :next), prefix, fun.({k, v}, acc), fun),
+      do: do_fold(it, cf, iter_move(it, cf, :next, guard), prefix, fun.({k, v}, acc), fun, guard),
       else: acc
   end
 
-  defp do_fold(_it, _cf, :end, _prefix, acc, _fun), do: acc
+  defp do_fold(_it, _cf, :end, _prefix, acc, _fun, _guard), do: acc
 
   @doc """
   Folds over the `{key, value}` pairs in `cf` whose key starts with `prefix`,
@@ -596,31 +820,34 @@ defmodule Exnode.Store.KV do
   last key with `prefix`). `fun` returns `{:cont, acc}` or `{:halt, acc}`,
   so a page reads only the rows it uses.
   """
-  def fold_prefix_reverse(%__MODULE__{} = kv, cf, prefix, before, acc, fun) do
+  def fold_prefix_reverse(%__MODULE__{guard: guard} = kv, cf, prefix, before, acc, fun) do
     # Above every key with `prefix` (keys here are far shorter than this).
     target = before || prefix <> :binary.copy(<<0xFF>>, 256)
 
     with_iterator(kv, cf, fn it ->
       first =
-        case iter_move(it, cf, {:seek_for_prev, target}) do
-          {:ok, ^before, _} -> iter_move(it, cf, :prev)
+        case iter_move(it, cf, {:seek_for_prev, target}, guard) do
+          {:ok, ^before, _} -> iter_move(it, cf, :prev, guard)
           other -> other
         end
 
-      do_fold_reverse(it, cf, first, prefix, acc, fun)
+      do_fold_reverse(it, cf, first, prefix, acc, fun, guard)
     end)
   end
 
-  defp do_fold_reverse(it, cf, {:ok, k, v}, prefix, acc, fun) do
+  defp do_fold_reverse(it, cf, {:ok, k, v}, prefix, acc, fun, guard) do
     if :binary.longest_common_prefix([k, prefix]) == byte_size(prefix) do
       case fun.({k, v}, acc) do
-        {:cont, acc} -> do_fold_reverse(it, cf, iter_move(it, cf, :prev), prefix, acc, fun)
-        {:halt, acc} -> acc
+        {:cont, acc} ->
+          do_fold_reverse(it, cf, iter_move(it, cf, :prev, guard), prefix, acc, fun, guard)
+
+        {:halt, acc} ->
+          acc
       end
     else
       acc
     end
   end
 
-  defp do_fold_reverse(_it, _cf, :end, _prefix, acc, _fun), do: acc
+  defp do_fold_reverse(_it, _cf, :end, _prefix, acc, _fun, _guard), do: acc
 end

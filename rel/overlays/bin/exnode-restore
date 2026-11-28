@@ -1,0 +1,6 @@
+#!/bin/sh
+# Restores a dirty or faulted store from its latest quiescent snapshot:
+# the options of `mix exnode.restore`. Run it with the node stopped.
+set -e
+SELF=$(readlink -f "$0")
+exec "$(dirname "$SELF")/exnode" eval 'Exnode.CLI.restore(System.argv())' "$@"

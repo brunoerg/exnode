@@ -80,6 +80,7 @@ defmodule Exnode.Node do
   alias Exnode.Node.Runtime
   alias Exnode.P2P.BlockDownload
   alias Exnode.P2P.{AddrMan, Connman, Listener, SyncState}
+  alias Exnode.Store.Guard
 
   def start_link(opts),
     do: Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -262,13 +263,95 @@ defmodule Exnode.Node do
     Runtime.clear_stopping(name)
     datadir = Keyword.fetch!(opts, :datadir)
     budget = fd_budget!(opts)
+    chain_dir = Path.join(datadir, Atom.to_string(chain))
+    File.mkdir_p!(chain_dir)
 
-    kv_path = Path.join([datadir, Atom.to_string(chain), "index"])
+    want_filters? = Keyword.get(opts, :block_filter_index, false)
+    want_scripthash? = Keyword.get(opts, :index_scripthash, false)
+    derived_count = if(want_filters?, do: 1, else: 0) + if want_scripthash?, do: 1, else: 0
 
-    kv_opts = [
-      max_open_files: budget.table_files,
-      block_cache_bytes: Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
-    ]
+    # Acquire clean-close lock BEFORE opening RocksDB or any segment file.
+    # A dirty or faulted store is refused here and must be restored via
+    # `mix exnode.restore` (or resynced).
+    canonical_guard = Guard.acquire!(chain_dir, name: "canonical", require_clean_mark: true)
+
+    {canonical_fds, staging_fds, derived_fds} =
+      split_table_files(budget.table_files, derived_count)
+
+    kv_cache = Keyword.get(opts, :kv_cache_bytes, 256 * 1024 * 1024)
+
+    derived_cache = min(32 * 1024 * 1024, max(8 * 1024 * 1024, div(kv_cache, 8)))
+
+    {filters_store, filters_guard} =
+      if want_filters? do
+        dir = Path.join([chain_dir, "derived", "filters"])
+        {dir, acquire_derived_guard!(dir, :filters, [canonical_guard])}
+      else
+        {nil, nil}
+      end
+
+    {scripthash_store, scripthash_guard} =
+      if want_scripthash? do
+        dir = Path.join([chain_dir, "derived", "scripthash"])
+
+        {dir,
+         acquire_derived_guard!(
+           dir,
+           :scripthash,
+           Enum.reject([canonical_guard, filters_guard], &is_nil/1)
+         )}
+      else
+        {nil, nil}
+      end
+
+    stores =
+      [
+        {:kv, Path.join(chain_dir, "index"),
+         [
+           mode: :canonical,
+           guard: canonical_guard,
+           max_open_files: canonical_fds,
+           block_cache_bytes: kv_cache
+         ]},
+        {:staging_kv, Path.join(chain_dir, "staging"),
+         [
+           mode: :staging,
+           guard: canonical_guard,
+           max_open_files: staging_fds,
+           block_cache_bytes: min(16 * 1024 * 1024, max(4 * 1024 * 1024, div(kv_cache, 16)))
+         ]}
+      ] ++
+        if(want_filters?,
+          do: [
+            {:filters_kv, Path.join(filters_store, "index"),
+             [
+               mode: :derived,
+               column_families: [:filters],
+               guard: filters_guard,
+               max_open_files: derived_fds,
+               block_cache_bytes: derived_cache
+             ]}
+          ],
+          else: []
+        ) ++
+        if(want_scripthash?,
+          do: [
+            {:scripthash_kv, Path.join(scripthash_store, "index"),
+             [
+               mode: :derived,
+               column_families: [:scripthash],
+               guard: scripthash_guard,
+               max_open_files: derived_fds,
+               block_cache_bytes: derived_cache
+             ]}
+          ],
+          else: []
+        )
+
+    # Track whether Chain.State is opening the archive for the first time on
+    # this node boot (strict_clean: true) vs an in-process non-storage restart.
+    boot_open = :atomics.new(1, signed: false)
+    :atomics.put(boot_open, 1, 0)
 
     clock = Keyword.get_lazy(opts, :clock, &Exnode.Clock.new/0)
 
@@ -347,17 +430,23 @@ defmodule Exnode.Node do
       end
 
     indexes =
-      if(Keyword.get(opts, :block_filter_index, false),
+      if(want_filters?,
         do: [
           {Exnode.Index.BlockFilter,
-           name: n.filter_index, node_name: name, chain_state: n.chain_state}
+           name: n.filter_index,
+           node_name: name,
+           store_dir: filters_store,
+           chain_state: n.chain_state}
         ],
         else: []
       ) ++
-        if(Keyword.get(opts, :index_scripthash, false),
+        if(want_scripthash?,
           do: [
             {Exnode.Index.Scripthash,
-             name: n.scripthash_index, node_name: name, chain_state: n.chain_state}
+             name: n.scripthash_index,
+             node_name: name,
+             store_dir: scripthash_store,
+             chain_state: n.chain_state}
           ],
           else: []
         )
@@ -395,8 +484,9 @@ defmodule Exnode.Node do
       {Runtime,
        name: n.runtime,
        node_name: name,
-       kv_path: kv_path,
-       kv_opts: kv_opts,
+       node_pid: self(),
+       stores: stores,
+       guards: Enum.reject([canonical_guard, filters_guard, scripthash_guard], &is_nil/1),
        cleanup_keys: cleanup_keys}
 
     children =
@@ -430,6 +520,9 @@ defmodule Exnode.Node do
             node_name: name,
             params: params,
             headers: n.headers,
+            guard: canonical_guard,
+            chain_dir: chain_dir,
+            boot_open: boot_open,
             assume_valid: Keyword.get(opts, :assume_valid),
             prune_witness: Keyword.get(opts, :prune_witness, false),
             commit_at_tip: Keyword.get(opts, :commit_at_tip, true),
@@ -437,6 +530,7 @@ defmodule Exnode.Node do
               Keyword.get(opts, :batch_blocks, elem(ChainState.default_batch_limits(), 0)),
             batch_bytes:
               Keyword.get(opts, :batch_bytes, elem(ChainState.default_batch_limits(), 1)),
+            snapshot_every_commits: Keyword.get(opts, :snapshot_every_commits, 1),
             prefetch_depth:
               Keyword.get(opts, :prefetch_depth, Exnode.Chain.State.default_prefetch_depth()),
             mempool: n.mempool,
@@ -541,6 +635,40 @@ defmodule Exnode.Node do
 
       {:error, msg} ->
         raise ArgumentError, msg
+    end
+  end
+
+  defp split_table_files(total, 0) do
+    staging = min(64, max(16, div(total, 8)))
+    {max(32, total - staging), staging, 0}
+  end
+
+  defp split_table_files(total, n_derived) when n_derived > 0 do
+    staging = min(64, max(16, div(total, 8)))
+    derived_total = min(128, max(32 * n_derived, div(total, 4)))
+    per_derived = max(16, div(derived_total, n_derived))
+    {max(32, total - staging - per_derived * n_derived), staging, per_derived}
+  end
+
+  # Acquires the clean-close lock for a dedicated single-writer derived index
+  # store under `store_dir` (`store_dir/flush.lock`, `store_dir/index/`,
+  # `store_dir/snapshots/`). If acquiring the derived lock fails (dirty/faulted
+  # derived store), cleanly releases any already-acquired locks so clean stores
+  # stay clean.
+  defp acquire_derived_guard!(store_dir, cf, prior_guards) do
+    File.mkdir_p!(store_dir)
+    name = "derived:#{cf}"
+
+    try do
+      Guard.acquire!(store_dir, name: name, require_clean_mark: true)
+    rescue
+      e ->
+        for g <- prior_guards do
+          Guard.mark_clean_close!(g)
+          Guard.release_clean!(g)
+        end
+
+        reraise e, __STACKTRACE__
     end
   end
 end

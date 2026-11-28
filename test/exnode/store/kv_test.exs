@@ -181,6 +181,62 @@ defmodule Exnode.Store.KVTest do
 
     KV.close(kv)
   end
+
+  test "canonical mode rejects sync: false writes and supports checkpoint + readonly open", %{
+    tmp_dir: dir
+  } do
+    g = Exnode.Store.Guard.acquire!(dir, name: "canonical", require_clean_mark: false)
+    idx = Path.join(dir, "index")
+    {:ok, kv} = KV.open(idx, mode: :canonical, guard: g)
+
+    assert_raise ArgumentError, ~r/unsynced write .* forbidden on canonical/, fn ->
+      KV.write(kv, [{:put, :meta, "k", "v"}], sync: false)
+    end
+
+    :ok = KV.write(kv, [{:put, :meta, "k", "v1"}], sync: true)
+    ckpt = Path.join(dir, "ckpt")
+    :ok = KV.checkpoint(kv, ckpt)
+
+    # Further mutations to live DB do not affect the checkpoint.
+    :ok = KV.write(kv, [{:put, :meta, "k", "v2"}], sync: true)
+
+    {:ok, ro} = KV.open_readonly(ckpt, mode: :canonical)
+    assert KV.get(ro, :meta, "k") == {:ok, "v1"}
+    KV.close(ro)
+
+    assert KV.get(kv, :meta, "k") == {:ok, "v2"}
+    KV.close(kv)
+    :ok = Exnode.Store.Guard.release_clean!(g)
+  end
+
+  test "read error latches guard and blocks all subsequent KV operations", %{tmp_dir: dir} do
+    import ExUnit.CaptureLog
+
+    g = Exnode.Store.Guard.acquire!(dir, name: "test", require_clean_mark: false)
+    {:ok, kv} = KV.open(Path.join(dir, "db"), guard: g)
+    :ok = KV.write(kv, [{:put, :pending, "k", :crypto.strong_rand_bytes(100_000)}])
+    :ok = KV.write(kv, [{:put, :pending, "inline", "v"}])
+    :ok = KV.flush(kv, :pending)
+    Enum.each(Path.wildcard(Path.join([dir, "db", "*.blob"])), &File.rm!/1)
+
+    capture_log(fn ->
+      assert_raise KV.Error, fn -> KV.get(kv, :pending, "k") end
+    end)
+
+    assert Exnode.Store.Guard.faulted?(g)
+
+    # Even previously readable keys are now refused immediately.
+    assert_raise Exnode.StorageError, ~r/halted after latched storage fault/, fn ->
+      KV.get(kv, :pending, "inline")
+    end
+
+    assert_raise Exnode.StorageError, ~r/halted after latched storage fault/, fn ->
+      KV.write(kv, [{:put, :meta, "x", "y"}])
+    end
+
+    KV.close(kv)
+    Exnode.Store.Guard.abandon(g)
+  end
 end
 
 defmodule Exnode.Store.KVPackedTest do

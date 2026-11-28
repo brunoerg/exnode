@@ -30,6 +30,7 @@ defmodule Exnode.CLI do
     prefetch: :integer,
     batch_blocks: :integer,
     batch_mib: :integer,
+    snapshot_every: :integer,
     chain_state_heap_mib: :integer,
     decode_budget_mib: :integer,
     max_connections: :integer,
@@ -93,6 +94,12 @@ defmodule Exnode.CLI do
             do: opts[:batch_mib] * 1024 * 1024,
             else: elem(Exnode.Chain.State.default_batch_limits(), 1)
           ),
+        # IBD canonical snapshot cadence in commits (always 1 near tip and on clean shutdown).
+        snapshot_every_commits:
+          case Keyword.get(opts, :snapshot_every, 1) do
+            n when is_integer(n) and n >= 1 -> n
+            other -> fail("invalid --snapshot-every #{inspect(other)}; expected integer >= 1")
+          end,
         # The chain state's minimum heap, in words.
         chain_state_min_heap:
           if(opts[:chain_state_heap_mib],
@@ -283,6 +290,81 @@ defmodule Exnode.CLI do
     System.halt(1)
   end
 
+  @doc "`mix exnode.restore` and `bin/exnode-restore`."
+  def restore(argv) do
+    {opts, _args} =
+      OptionParser.parse!(argv,
+        strict: [
+          chain: :string,
+          datadir: :string,
+          datadir_cold: :string,
+          force_from_snapshot: :boolean,
+          force: :boolean
+        ]
+      )
+
+    name = Keyword.get(opts, :chain, "mainnet")
+
+    _chain =
+      Enum.find(Exnode.ChainParams.networks(), &(Atom.to_string(&1) == name)) ||
+        fail("unknown chain #{name}; expected one of #{inspect(Exnode.ChainParams.networks())}")
+
+    datadir = opts |> Keyword.get(:datadir, "~/.exnode") |> Path.expand()
+    chain_dir = Path.join(datadir, name)
+    hot = Path.join(chain_dir, "archive")
+
+    cold =
+      case opts[:datadir_cold] do
+        nil -> hot
+        dir -> Path.join([Path.expand(dir), name, "archive"])
+      end
+
+    if not File.dir?(chain_dir) do
+      fail("store directory does not exist: #{chain_dir}")
+    end
+
+    try do
+      case Exnode.Store.Snapshot.restore!(chain_dir,
+             hot: hot,
+             cold: cold,
+             force_from_snapshot: Keyword.get(opts, :force_from_snapshot, false),
+             force: Keyword.get(opts, :force, false)
+           ) do
+        {:ok, :already_clean} ->
+          IO.puts("store at #{chain_dir} closed cleanly; nothing to restore")
+
+        {:ok, %{canonical: :already_clean, derived: derived}} ->
+          IO.puts(
+            "canonical store at #{chain_dir} closed cleanly; derived indexes: #{format_derived_restore(derived)}"
+          )
+
+        {:ok, %{slot: slot, tip: tip} = res} ->
+          extra =
+            case format_derived_restore(Map.get(res, :derived, %{})) do
+              "" -> ""
+              s -> " (derived indexes: #{s})"
+            end
+
+          IO.puts(
+            "restored #{name} store from #{slot} snapshot to height #{tip.height} (#{Hash.to_hex(tip.hash)})#{extra}"
+          )
+      end
+    rescue
+      e in Exnode.StorageError ->
+        fail(Exception.message(e))
+    end
+  end
+
+  defp format_derived_restore(derived) when is_map(derived) do
+    derived
+    |> Enum.sort()
+    |> Enum.reject(fn {_name, status} -> status == :clean end)
+    |> Enum.map_join(", ", fn
+      {name, {:restored, slot}} -> "#{name}=restored(#{slot})"
+      {name, :wiped} -> "#{name}=wiped"
+    end)
+  end
+
   @doc "`mix exnode.reconsider` and `bin/exnode-reconsider`."
   def reconsider(argv) do
     {opts, args} =
@@ -297,31 +379,54 @@ defmodule Exnode.CLI do
         fail("unknown chain #{name}; expected one of #{inspect(Exnode.ChainParams.networks())}")
 
     datadir = opts |> Keyword.get(:datadir, "~/.exnode") |> Path.expand()
-    path = Path.join([datadir, name, "index"])
+    chain_dir = Path.join(datadir, name)
+    path = Path.join(chain_dir, "index")
 
-    kv =
-      case KV.open(path, create_if_missing: false) do
-        {:ok, kv} -> kv
-        {:error, reason} -> fail("cannot open store at #{path}: #{inspect(reason)}")
-      end
+    case Exnode.Store.Guard.inspect_lock(chain_dir) do
+      :clean ->
+        :ok
+
+      {:dirty, _} ->
+        fail(
+          "store at #{chain_dir} did not close cleanly (flush.lock present); " <>
+            "run `mix exnode.restore --chain #{name} --datadir #{datadir}` first"
+        )
+
+      {:faulted, info} ->
+        fail(
+          "store at #{chain_dir} halted after a storage fault (#{inspect(info[:reason])}); " <>
+            "investigate and restore before running reconsider"
+        )
+
+      {:corrupt_lock, reason} ->
+        fail("store lock at #{chain_dir} is corrupt (#{inspect(reason)}); restore first")
+    end
+
+    {kv, mode} = open_existing_store_for_reconsider(path)
 
     try do
       clear_halt? = Keyword.get(opts, :clear_halt, false)
+      mutated? = false
 
-      case Exnode.Chain.State.halt_mark(kv) do
-        nil ->
-          IO.puts("block connection not halted")
+      mutated? =
+        case Exnode.Chain.State.halt_mark(kv) do
+          nil ->
+            IO.puts("block connection not halted")
+            mutated?
 
-        m when clear_halt? ->
-          :ok = KV.write(kv, [{:delete, :meta, "halt"}], sync: true)
-          IO.puts("cleared halt: #{inspect(m.reason)} (height #{m.height})")
+          m when clear_halt? ->
+            :ok = KV.write(kv, [{:delete, :meta, "halt"}], sync: true)
+            IO.puts("cleared halt: #{inspect(m.reason)} (height #{m.height})")
+            true
 
-        m ->
-          IO.puts(
-            "HALTED since #{m.time} at height #{m.height} (#{Hash.to_hex(m.hash)}): #{inspect(m.reason)} " <>
-              "(clear with --clear-halt)"
-          )
-      end
+          m ->
+            IO.puts(
+              "HALTED since #{m.time} at height #{m.height} (#{Hash.to_hex(m.hash)}): #{inspect(m.reason)} " <>
+                "(clear with --clear-halt)"
+            )
+
+            mutated?
+        end
 
       marks =
         KV.fold_prefix(kv, :poisoned, <<>>, [], fn {k, v}, acc ->
@@ -335,17 +440,77 @@ defmodule Exnode.CLI do
           true -> []
         end
 
-      if targets == [] do
-        if marks == [] and not clear_halt?, do: IO.puts("no quarantined blocks")
+      mutated? =
+        if targets == [] do
+          if marks == [] and not clear_halt?, do: IO.puts("no quarantined blocks")
 
-        for {h, m} <- marks,
-            do: IO.puts("#{Hash.to_hex(h)} height #{m.height} at #{m.time}: #{m.error}")
-      else
-        :ok = KV.write(kv, for(h <- targets, do: {:delete, :poisoned, h}), sync: true)
-        for h <- targets, do: IO.puts("cleared #{Hash.to_hex(h)}")
+          for {h, m} <- marks,
+              do: IO.puts("#{Hash.to_hex(h)} height #{m.height} at #{m.time}: #{m.error}")
+
+          mutated?
+        else
+          remaining = max(0, length(marks) - length(targets))
+
+          ops =
+            for(h <- targets, do: {:delete, :poisoned, h}) ++
+              [{:put, :meta, "poisoned_count", <<remaining::32>>}]
+
+          :ok = KV.write(kv, ops, sync: true)
+          for h <- targets, do: IO.puts("cleared #{Hash.to_hex(h)}")
+          true
+        end
+
+      # Keep canonical snapshot aligned if reconsider mutated a snapshotted v2 store.
+      if mutated? and mode == :canonical and
+           match?(
+             {:ok, _, _, _},
+             Exnode.Store.Snapshot.latest_valid(Exnode.Store.Snapshot.snapshots_dir(chain_dir))
+           ) do
+        refresh_snapshot_after_reconsider!(kv, chain_dir)
       end
     after
       KV.close(kv)
+    end
+  end
+
+  defp open_existing_store_for_reconsider(path) do
+    if not File.dir?(path) do
+      fail("cannot open store at #{path}: :enoent")
+    end
+
+    mode =
+      case :rocksdb.list_column_families(String.to_charlist(path), []) do
+        {:ok, cfs} ->
+          if ~c"pending" in cfs, do: :legacy, else: :canonical
+
+        _ ->
+          :canonical
+      end
+
+    case KV.open(path, create_if_missing: false, mode: mode) do
+      {:ok, kv} -> {kv, mode}
+      {:error, reason} -> fail("cannot open store at #{path}: #{inspect(reason)}")
+    end
+  end
+
+  defp refresh_snapshot_after_reconsider!(kv, chain_dir) do
+    case KV.get(kv, :meta, "archive") do
+      {:ok, bin} ->
+        meta = :erlang.binary_to_term(bin)
+        {:ok, rec_bin} = KV.get(kv, :blocks, <<meta.tip::32>>)
+        rec = :erlang.binary_to_term(rec_bin)
+
+        {:ok, _} =
+          Exnode.Store.Snapshot.take_canonical!(kv, chain_dir, %{
+            tip: %{id: meta.tip, height: rec.height, hash: rec.hash},
+            ends: meta.ends,
+            wpruned: Map.get(meta, :wpruned, -1)
+          })
+
+        :ok
+
+      :not_found ->
+        :ok
     end
   end
 

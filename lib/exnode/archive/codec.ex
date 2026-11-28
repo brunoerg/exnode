@@ -112,10 +112,25 @@ defmodule Exnode.Archive.Codec do
   def encode_txindex(list),
     do: for({b, pos, o, n, i} <- list, into: <<>>, do: <<b::32, pos::24, n::24, o::48, i::48>>)
 
-  def decode_txindex(<<131, _::binary>> = bin), do: :erlang.binary_to_term(bin)
+  def decode_txindex(<<131, _::binary>> = bin) do
+    :erlang.binary_to_term(bin)
+  rescue
+    e in ArgumentError ->
+      raise Exnode.StorageError,
+        source: :archive,
+        reason: {:corrupt_txindex, e},
+        message: "corrupt legacy txindex term"
+  end
 
-  def decode_txindex(bin),
+  def decode_txindex(bin) when rem(byte_size(bin), 22) == 0,
     do: for(<<b::32, pos::24, n::24, o::48, i::48 <- bin>>, do: {b, pos, o, n, i})
+
+  def decode_txindex(bin) do
+    raise Exnode.StorageError,
+      source: :archive,
+      reason: {:corrupt_txindex_length, byte_size(bin)},
+      message: "corrupt txindex row length #{byte_size(bin)} (not a multiple of 22)"
+  end
 
   # --- sparse location keys & pointers -----------------------------------------
 
@@ -125,4 +140,11 @@ defmodule Exnode.Archive.Codec do
 
   def pack_loc({seg, off}), do: <<seg::16, off::48>>
   def unpack_loc(<<seg::16, off::48>>), do: {seg, off}
+
+  def unpack_loc(other) do
+    raise Exnode.StorageError,
+      source: :archive,
+      reason: {:corrupt_loc, byte_size(other)},
+      message: "corrupt sparse location value (#{byte_size(other)} bytes)"
+  end
 end

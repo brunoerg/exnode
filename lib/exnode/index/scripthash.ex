@@ -27,10 +27,11 @@ defmodule Exnode.Index.Scripthash do
   alias Exnode.Chain.State, as: ChainState
   alias Exnode.Index.Follower
   alias Exnode.Node.Runtime
-  alias Exnode.Store.KV
+  alias Exnode.Store.{Guard, KV, Snapshot}
 
   @cf :scripthash
   @tick_ms 200
+  @snapshot_interval_ms 60_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
@@ -44,11 +45,43 @@ defmodule Exnode.Index.Scripthash do
   a long history costs the caller only and never holds the index process.
   """
   def history(server, sh) do
-    server
-    |> kv()
-    |> KV.fold_prefix(@cf, sh, [], &[row(&1) | &2])
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reverse()
+    kv = kv(server)
+    tip1 = Follower.tip(kv, @cf)
+
+    rows =
+      kv
+      |> KV.fold_prefix(@cf, sh, [], &[row(&1) | &2])
+      |> Enum.reject(&is_nil/1)
+      |> Enum.reverse()
+
+    verify_scan_count!(kv, sh, tip1, length(rows))
+    rows
+  end
+
+  # Cross-check scanned row count against persisted per-script totals when
+  # the index tip did not advance concurrently (defense-in-depth against silent
+  # iterator truncation).
+  defp verify_scan_count!(kv, sh, tip1, scanned) do
+    if KV.get(kv, @cf, "totals") == {:ok, <<1>>} do
+      [funded, spent] =
+        kv
+        |> KV.multi_get(@cf, [total_key(sh, 0), total_key(sh, 2)])
+        |> Enum.map(fn
+          {:ok, v} -> :erlang.binary_to_term(v)
+          :not_found -> 0
+        end)
+
+      expected = funded + spent
+
+      if scanned != expected and Follower.tip(kv, @cf) == tip1 do
+        Exnode.StorageError.raise_and_latch!(
+          kv.guard,
+          :scripthash,
+          {:scripthash_scan_count_mismatch, scanned, expected},
+          "scripthash scan returned #{scanned} row(s), expected #{expected}"
+        )
+      end
+    end
   end
 
   @doc """
@@ -229,13 +262,29 @@ defmodule Exnode.Index.Scripthash do
     kv =
       case Keyword.fetch(opts, :kv) do
         {:ok, kv} -> kv
-        :error -> Runtime.kv(Keyword.fetch!(opts, :node_name))
+        :error -> Runtime.scripthash_kv(Keyword.fetch!(opts, :node_name))
       end
+
+    store_dir = Keyword.get(opts, :store_dir)
+
+    if store_dir != nil do
+      Process.flag(:trap_exit, true)
+      Guard.clear_clean_close!(kv.guard)
+    end
 
     # Readers scan in their own process (`history/2`).
     if name = opts[:name], do: Runtime.put_handle({__MODULE__, name}, kv)
 
-    {:ok, %{kv: kv, chain_state: Keyword.fetch!(opts, :chain_state), waiters: [], stats: %{}}}
+    {:ok,
+     %{
+       kv: kv,
+       store_dir: store_dir,
+       chain_state: Keyword.fetch!(opts, :chain_state),
+       waiters: [],
+       stats: %{},
+       dirty_since_snap: false,
+       last_snap_ms: System.monotonic_time(:millisecond)
+     }}
   end
 
   @impl true
@@ -256,17 +305,28 @@ defmodule Exnode.Index.Scripthash do
 
   @impl true
   def handle_info(:tick, st) do
-    result =
+    tip_before = Follower.tip(st.kv, @cf)
+
+    {result, backfilled?} =
       try do
-        backfill_totals(st.kv)
-        Follower.sync(st.kv, @cf, st.chain_state, &connect/3, &disconnect/3)
+        bf = backfill_totals(st.kv) == :wrote
+        {Follower.sync(st.kv, @cf, st.chain_state, &connect/3, &disconnect/3), bf}
+      rescue
+        e in [Exnode.StorageError, Exnode.Store.KV.Error] ->
+          reraise e, __STACKTRACE__
       catch
+        :exit, {:noproc, _} ->
+          {:done, false}
+
         kind, reason ->
           if ChainState.view(st.chain_state) != nil,
             do: Logger.warning("scripthash index: #{inspect(kind)} #{inspect(reason, limit: 5)}")
 
-          :done
+          {:done, false}
       end
+
+    wrote? = backfilled? or Follower.tip(st.kv, @cf) != tip_before
+    st = maybe_snapshot(%{st | dirty_since_snap: st.dirty_since_snap or wrote?}, result)
 
     waiters =
       Enum.reject(st.waiters, fn {h, from} ->
@@ -275,6 +335,55 @@ defmodule Exnode.Index.Scripthash do
 
     Process.send_after(self(), :tick, if(result == :more, do: 0, else: @tick_ms))
     {:noreply, take_work(%{st | waiters: waiters})}
+  end
+
+  def handle_info({:EXIT, _pid, reason}, st) do
+    if reason in [:normal, :shutdown], do: {:noreply, st}, else: {:stop, reason, st}
+  end
+
+  @impl true
+  def terminate(reason, %{store_dir: dir} = st) when dir != nil do
+    if reason in [:normal, :shutdown] and not Guard.faulted?(st.kv.guard) do
+      try do
+        :ok = KV.sync_wal!(st.kv)
+
+        if st.dirty_since_snap or
+             match?(
+               {:error, :no_valid_snapshot},
+               Snapshot.latest_valid(Snapshot.snapshots_dir(dir))
+             ) do
+          :ok = Snapshot.take_derived!(st.kv, dir)
+        end
+
+        Guard.mark_clean_close!(st.kv.guard)
+      catch
+        kind, err ->
+          Logger.warning(
+            "scripthash index clean close failed (retaining flush.lock): #{inspect(kind)} #{inspect(err, limit: 5)}"
+          )
+      end
+    end
+
+    :ok
+  end
+
+  def terminate(_reason, _st), do: :ok
+
+  # Sole writer of `derived/scripthash/`: take a quiescent snapshot between
+  # batches once caught up or after `@snapshot_interval_ms`.
+  defp maybe_snapshot(%{store_dir: nil} = st, _result), do: st
+  defp maybe_snapshot(%{dirty_since_snap: false} = st, _result), do: st
+
+  defp maybe_snapshot(%{store_dir: dir} = st, result) do
+    now = System.monotonic_time(:millisecond)
+
+    if result == :done or now - st.last_snap_ms >= @snapshot_interval_ms do
+      :ok = KV.sync_wal!(st.kv)
+      :ok = Snapshot.take_derived!(st.kv, dir)
+      %{st | dirty_since_snap: false, last_snap_ms: now}
+    else
+      st
+    end
   end
 
   @counters [:sh_blocks, :sh_outputs, :sh_undo, :sh_materialize_us, :sh_spent_us, :sh_rows_us]
@@ -376,6 +485,7 @@ defmodule Exnode.Index.Scripthash do
 
       Follower.tip(kv, @cf) == {-1, nil} ->
         :ok = KV.write(kv, [{:put, @cf, "totals", <<1>>}])
+        :wrote
 
       true ->
         Logger.info("scripthash index: computing per-script totals from the history (once)")
@@ -401,6 +511,8 @@ defmodule Exnode.Index.Scripthash do
         Logger.info(
           "scripthash index: totals for #{acc.scripts} scripts in #{System.monotonic_time(:millisecond) - t0} ms"
         )
+
+        :wrote
     end
   end
 
@@ -458,7 +570,12 @@ defmodule Exnode.Index.Scripthash do
           txs
 
         {:error, why} ->
-          raise ArgumentError, "block #{id} at #{height}: archive index facts: #{inspect(why)}"
+          Exnode.StorageError.raise_and_latch!(
+            reader.kv.guard,
+            :archive,
+            {:archive_integrity, id, why},
+            "block #{id} at #{height}: archive index facts: #{inspect(why)}"
+          )
       end
 
     t1 = System.monotonic_time(:microsecond)
