@@ -93,22 +93,25 @@ defmodule Exnode.P2P.Connman do
 
   @doc """
   May an inbound connection from `target` be accepted? May evict an inbound peer to make room.
-  Waits with no timeout, as Core's accept thread does on its locks (a busy
-  Connman must not kill the accept loop).
+  Defaults to `timeout: :infinity`; `Exnode.P2P.Listener` passes a bounded
+  timeout (`5_000` ms) so a stalled Connman cannot wedge the accept loop.
+  Note that if Connman is merely slow (rather than dead), an in-flight call
+  still runs to completion and may evict an existing inbound peer even after
+  the caller timed out and closed the new socket.
   """
-  def accept_inbound?(server, target \\ nil),
-    do: GenServer.call(server, {:accept_inbound?, target}, :infinity)
+  def accept_inbound?(server, target \\ nil, timeout \\ :infinity),
+    do: GenServer.call(server, {:accept_inbound?, target}, timeout)
 
   @doc """
   Tracks the inbound peer `pid`: `:ok`. A call, so the Listener knows the
   peer is tracked before it hands it the socket. As a cast it was dropped
   when Connman was restarting (its name unregistered while PeerSup was
   already back), and the peer ran untracked: outside the inbound limit and
-  eviction. Exits like any call if Connman is
-  not running; waits like `accept_inbound?/2`.
+  eviction. Exits like any call if Connman is not running; defaults to
+  `timeout: :infinity` (`Exnode.P2P.Listener` bounds it to `5_000` ms).
   """
-  def register_inbound(server, pid, target),
-    do: GenServer.call(server, {:register_inbound, pid, target}, :infinity)
+  def register_inbound(server, pid, target, timeout \\ :infinity),
+    do: GenServer.call(server, {:register_inbound, pid, target}, timeout)
 
   @doc """
   Core `MaybeDisconnectForTxRelayCapacity` for an inbound peer that relays
