@@ -223,10 +223,25 @@ defmodule Exnode.P2P.PeerStatemTest do
 
       wait_until(fn -> elem(:sys.get_state(pid), 0) == {:ready, :paused} end)
 
-      :ets.insert(gate, {:open, true})
-      got = FakePeer.recv(sock, ["block", "pong"], 11)
-      assert Enum.map(got, &elem(&1, 0)) == List.duplicate("block", 10) ++ ["pong"]
-      wait_until(fn -> elem(:sys.get_state(pid), 0) == {:ready, :active} end)
+      # Trace :continue_getdata handler transitions to confirm Peer passes
+      # through {:ready, :draining} on resume before returning to {:ready, :active}.
+      :erlang.trace(pid, true, [:call])
+      :erlang.trace_pattern({Exnode.P2P.Peer, :handle_event, 4}, true, [:local])
+
+      try do
+        :ets.insert(gate, {:open, true})
+        got = FakePeer.recv(sock, ["block", "pong"], 11)
+        assert Enum.map(got, &elem(&1, 0)) == List.duplicate("block", 10) ++ ["pong"]
+        wait_until(fn -> elem(:sys.get_state(pid), 0) == {:ready, :active} end)
+      after
+        :erlang.trace_pattern({Exnode.P2P.Peer, :handle_event, 4}, false, [:local])
+        :erlang.trace(pid, false, [:call])
+      end
+
+      assert_receive {:trace, ^pid, :call,
+                      {Exnode.P2P.Peer, :handle_event,
+                       [:info, :continue_getdata, {:ready, :draining}, _]}},
+                     1_000
     end
 
     test "fast terminate when send_failed occurs with unsent bytes queued (< 100 ms)", %{n: n} do

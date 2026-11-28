@@ -18,11 +18,14 @@ defmodule Exnode.P2P.Peer do
     * `:awaiting_version` — socket attached; accepts only `:version`.
     * `:awaiting_verack` — `:version` received; accepts `:wtxidrelay`,
       `:sendaddrv2`, `:verack`.
-    * `{:ready, :active}` — handshake complete; socket armed with `active: :once`.
-    * `{:ready, :draining}` — `getdata_queue` non-empty; drains one pass per
-      `:continue_getdata`, socket held unarmed until drained.
+    * `{:ready, :active}` — handshake complete, not paused and not draining;
+      socket armed with `active: :once`.
+    * `{:ready, :draining}` — draining `getdata_queue` (one pass per
+      `:continue_getdata`) or draining buffered frames / rearming after
+      unpausing; socket held unarmed until drained and rearmed.
     * `{:ready, :paused}` — send buffer over `max_send_buffer` or
-      `tx_in_flight >= max_tx_in_flight`; socket held unarmed until resumed.
+      `tx_in_flight >= max_tx_in_flight`; socket held unarmed until resumed
+      (transitions via `{:ready, :draining}` to drain and rearm).
 
   Isolation: protocol violations, malformed frames and decode failures end
   only this process. `Misbehaving` in v32.1 means disconnect and discourage
@@ -255,14 +258,19 @@ defmodule Exnode.P2P.Peer do
   # --- Writer accounting ({:sent, n}) ----------------------------------------
 
   def handle_event(:info, {:sent, n}, state, %Data{} = data) do
-    {resumed?, conn} = Conn.on_sent(data.conn, n, now(data))
+    was_paused = paused?(data)
+    {_conn_resumed?, conn} = Conn.on_sent(data.conn, n, now(data))
     data = %{data | conn: conn}
 
-    if resumed? do
+    if was_paused and not paused?(data) do
+      # Stay out of {:ready, :active} until :continue_getdata drains buffered
+      # frames and rearms active: :once.
       send(self(), :continue_getdata)
+      next = if match?({:ready, _}, state), do: {:ready, :draining}, else: state
+      transition(state, next, data, [])
+    else
+      transition(state, non_rearm_state(state, data), data, [])
     end
-
-    transition(state, flow_state(state, data), data, [])
   end
 
   # --- TCP incoming bytes (connected states) ---------------------------------
@@ -288,7 +296,7 @@ defmodule Exnode.P2P.Peer do
 
   # --- Getdata & pause resume ------------------------------------------------
 
-  def handle_event(:info, :continue_getdata, {:ready, _} = state, %Data{} = data) do
+  def handle_event(:info, :continue_getdata, {:ready, :draining} = state, %Data{} = data) do
     case Serving.process_getdata(data) do
       {:ok, data} ->
         if getdata_pending?(data) do
@@ -328,7 +336,7 @@ defmodule Exnode.P2P.Peer do
 
   def handle_event(:info, :request_blocks, {:ready, _} = state, %Data{} = data) do
     data = BlockSync.maybe_request_blocks(data)
-    transition(state, flow_state(state, data), data, [])
+    transition(state, non_rearm_state(state, data), data, [])
   end
 
   def handle_event(:info, :novel_tx, {:ready, _}, %Data{} = data) do
@@ -345,7 +353,7 @@ defmodule Exnode.P2P.Peer do
     data = %{data | proto: %{proto | rebuilt_deferred: List.delete(proto.rebuilt_deferred, hash)}}
 
     case BlockSync.maybe_punish_for_block(data, result, "invalid block: #{reason}", via_compact) do
-      {:ok, data} -> transition(state, flow_state(state, data), data, [])
+      {:ok, data} -> transition(state, non_rearm_state(state, data), data, [])
       {:stop, reason, data} -> {:stop, reason, data}
     end
   end
@@ -364,7 +372,7 @@ defmodule Exnode.P2P.Peer do
       |> Data.update_handshake(&%{&1 | pending_hb_selected: a})
       |> push(msg)
 
-    transition(state, flow_state(state, data), data, [])
+    transition(state, non_rearm_state(state, data), data, [])
   end
 
   def handle_event(
@@ -379,7 +387,7 @@ defmodule Exnode.P2P.Peer do
       |> Data.update_proto(&%{&1 | hb_selected: a})
       |> push(msg)
 
-    transition(state, flow_state(state, data), data, [])
+    transition(state, non_rearm_state(state, data), data, [])
   end
 
   def handle_event(
@@ -390,7 +398,7 @@ defmodule Exnode.P2P.Peer do
       )
       when s != nil do
     data = push(data, msg)
-    transition(state, flow_state(state, data), data, [])
+    transition(state, non_rearm_state(state, data), data, [])
   end
 
   def handle_event(:info, :tx_relay_resync, {:ready, _}, %Data{} = data) do
@@ -407,13 +415,13 @@ defmodule Exnode.P2P.Peer do
       ) do
     was_paused = paused?(data)
     data = %{data | proto: %{proto | tx_in_flight: max(proto.tx_in_flight - 1, 0)}}
-    next = flow_state(state, data)
 
     if was_paused and not paused?(data) do
       send(self(), :continue_getdata)
+      transition(state, {:ready, :draining}, data, [])
+    else
+      transition(state, non_rearm_state(state, data), data, [])
     end
-
-    transition(state, next, data, [])
   end
 
   def handle_event(:info, _msg, _state, _data) do
@@ -487,6 +495,19 @@ defmodule Exnode.P2P.Peer do
   end
 
   defp flow_state(state, _data), do: state
+
+  # Used by handlers that do not rearm active: :once so a peer in
+  # {:ready, :draining} cannot jump to {:ready, :active} before
+  # :continue_getdata finishes draining and rearming the socket.
+  defp non_rearm_state({:ready, _} = state, data) do
+    cond do
+      paused?(data) -> {:ready, :paused}
+      getdata_pending?(data) -> {:ready, :draining}
+      true -> state
+    end
+  end
+
+  defp non_rearm_state(state, _data), do: state
 
   @doc false
   def getdata_pending?(%Data{proto: nil}), do: false
@@ -1020,7 +1041,7 @@ defmodule Exnode.P2P.Peer do
           |> HeadersHandler.consider_eviction(t)
 
         case result do
-          {:ok, data} -> {:ok, flow_state(state, data), data}
+          {:ok, data} -> {:ok, non_rearm_state(state, data), data}
           {:stop, reason, data} -> {:stop, reason, data}
         end
     end
